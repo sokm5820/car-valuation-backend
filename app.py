@@ -2,36 +2,55 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
 import os
+import requests
+import io
 
 app = Flask(__name__)
 CORS(app)
 
 # -----------------------
-# LOAD DATA (OPTION 1 FIX)
+# LOAD DATA (GITHUB CSV SOURCE - SAFE VERSION)
 # -----------------------
-DATA_PATH = os.environ.get("DATA_PATH", "ads_base.csv")
-df = pd.read_csv(DATA_PATH)
+CSV_URL = "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/ads_base.csv"
+
+df = pd.DataFrame()  # safe default
+
+def load_data():
+    global df
+    try:
+        r = requests.get(CSV_URL, timeout=10)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        print("CSV loaded successfully")
+    except Exception as e:
+        print("CSV LOAD FAILED:", e)
+        df = pd.DataFrame()
+
+load_data()
 
 # -----------------------
 # TYPE CLEANING
 # -----------------------
-df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
-df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
-df["KM"] = pd.to_numeric(df["KM"], errors="coerce")
-df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+if not df.empty:
+    df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    df["KM"] = pd.to_numeric(df["KM"], errors="coerce")
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
 
-# -----------------------
-# NORMALISE TEXT FIELDS
-# -----------------------
-df["Brand"] = df["Brand"].astype(str).str.strip()
-df["Model"] = df["Model"].astype(str).str.strip()
-df["Category"] = df["Category"].astype(str).str.strip()
+    # -----------------------
+    # NORMALISE TEXT FIELDS
+    # -----------------------
+    df["Brand"] = df["Brand"].astype(str).str.strip()
+    df["Model"] = df["Model"].astype(str).str.strip()
+    df["Category"] = df["Category"].astype(str).str.strip()
 
 # =========================================================
 # YEARS
 # =========================================================
 @app.route("/years", methods=["GET"])
 def get_years():
+    if df.empty:
+        return jsonify([])
     years = sorted(df["Year"].dropna().astype(int).unique().tolist())
     return jsonify(years)
 
@@ -40,6 +59,9 @@ def get_years():
 # =========================================================
 @app.route("/brands", methods=["GET"])
 def get_brands():
+    if df.empty:
+        return jsonify([])
+
     year = request.args.get("year")
     filtered = df.copy()
 
@@ -57,6 +79,9 @@ def get_brands():
 # =========================================================
 @app.route("/models", methods=["GET"])
 def get_models():
+    if df.empty:
+        return jsonify([])
+
     year = request.args.get("year")
     brand = request.args.get("brand")
 
@@ -82,6 +107,9 @@ def get_models():
 # =========================================================
 @app.route("/categories", methods=["GET"])
 def get_categories():
+    if df.empty:
+        return jsonify([])
+
     year = request.args.get("year")
     brand = request.args.get("brand")
     model = request.args.get("model")
@@ -113,6 +141,14 @@ def get_categories():
 # VALUATION ENGINE
 # =========================================================
 def get_valuation(df, year, brand, model, category):
+    if df.empty:
+        return {
+            "median_price": None,
+            "min_price": None,
+            "max_price": None,
+            "scatter": []
+        }
+
     filtered = df.copy()
 
     if year not in [None, "", "null"]:
