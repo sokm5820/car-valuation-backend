@@ -18,7 +18,7 @@ df = pd.DataFrame()  # safe default
 def load_data():
     global df
     try:
-        r = requests.get(CSV_URL, timeout=10)
+        r = requests.get(CSV_URL, timeout=15)
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text))
         print("CSV loaded successfully")
@@ -31,25 +31,29 @@ load_data()
 # -----------------------
 # TYPE CLEANING
 # -----------------------
-if not df.empty:
+def safe_prepare_dataframe():
+    global df
+
+    if df is None or df.empty:
+        return
+
     df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
     df["KM"] = pd.to_numeric(df["KM"], errors="coerce")
     df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
 
-    # -----------------------
-    # NORMALISE TEXT FIELDS
-    # -----------------------
     df["Brand"] = df["Brand"].astype(str).str.strip()
     df["Model"] = df["Model"].astype(str).str.strip()
     df["Category"] = df["Category"].astype(str).str.strip()
+
+safe_prepare_dataframe()
 
 # =========================================================
 # YEARS
 # =========================================================
 @app.route("/years", methods=["GET"])
 def get_years():
-    if df.empty:
+    if df is None or df.empty:
         return jsonify([])
     years = sorted(df["Year"].dropna().astype(int).unique().tolist())
     return jsonify(years)
@@ -59,7 +63,7 @@ def get_years():
 # =========================================================
 @app.route("/brands", methods=["GET"])
 def get_brands():
-    if df.empty:
+    if df is None or df.empty:
         return jsonify([])
 
     year = request.args.get("year")
@@ -79,7 +83,7 @@ def get_brands():
 # =========================================================
 @app.route("/models", methods=["GET"])
 def get_models():
-    if df.empty:
+    if df is None or df.empty:
         return jsonify([])
 
     year = request.args.get("year")
@@ -107,7 +111,7 @@ def get_models():
 # =========================================================
 @app.route("/categories", methods=["GET"])
 def get_categories():
-    if df.empty:
+    if df is None or df.empty:
         return jsonify([])
 
     year = request.args.get("year")
@@ -141,7 +145,7 @@ def get_categories():
 # VALUATION ENGINE
 # =========================================================
 def get_valuation(df, year, brand, model, category):
-    if df.empty:
+    if df is None or df.empty:
         return {
             "median_price": None,
             "min_price": None,
