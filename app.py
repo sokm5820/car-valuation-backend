@@ -15,16 +15,21 @@ CSV_URL = "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main
 
 df = pd.DataFrame()  # safe default
 
+# 🔥 ADDED: readiness flag
+DATA_READY = False
+
 def load_data():
-    global df
+    global df, DATA_READY
     try:
         r = requests.get(CSV_URL, timeout=15)
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text))
+        DATA_READY = True
         print("CSV loaded successfully")
     except Exception as e:
         print("CSV LOAD FAILED:", e)
         df = pd.DataFrame()
+        DATA_READY = False
 
 load_data()
 
@@ -53,7 +58,7 @@ safe_prepare_dataframe()
 # =========================================================
 @app.route("/years", methods=["GET"])
 def get_years():
-    if df is None or df.empty:
+    if not DATA_READY or df is None or df.empty:
         return jsonify([])
     years = sorted(df["Year"].dropna().astype(int).unique().tolist())
     return jsonify(years)
@@ -63,7 +68,7 @@ def get_years():
 # =========================================================
 @app.route("/brands", methods=["GET"])
 def get_brands():
-    if df is None or df.empty:
+    if not DATA_READY or df is None or df.empty:
         return jsonify([])
 
     year = request.args.get("year")
@@ -83,7 +88,7 @@ def get_brands():
 # =========================================================
 @app.route("/models", methods=["GET"])
 def get_models():
-    if df is None or df.empty:
+    if not DATA_READY or df is None or df.empty:
         return jsonify([])
 
     year = request.args.get("year")
@@ -111,7 +116,7 @@ def get_models():
 # =========================================================
 @app.route("/categories", methods=["GET"])
 def get_categories():
-    if df is None or df.empty:
+    if not DATA_READY or df is None or df.empty:
         return jsonify([])
 
     year = request.args.get("year")
@@ -145,7 +150,7 @@ def get_categories():
 # VALUATION ENGINE
 # =========================================================
 def get_valuation(df, year, brand, model, category):
-    if df is None or df.empty:
+    if not DATA_READY or df is None or df.empty:
         return {
             "median_price": None,
             "min_price": None,
@@ -227,11 +232,19 @@ def valuation():
     return jsonify(result)
 
 # =========================================================
-# HEALTH CHECK
+# HEALTH CHECK (UPDATED - COLD START SAFE ENDPOINT)
 # =========================================================
 @app.route("/")
 def home():
     return "Car Valuation API is running"
+
+@app.route("/api/health")
+def health():
+    return {
+        "status": "ok" if DATA_READY else "loading",
+        "ready": DATA_READY,
+        "rows": len(df)
+    }
 
 # =========================================================
 # RUN SERVER
