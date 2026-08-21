@@ -4,9 +4,34 @@ import pandas as pd
 import os
 import requests
 import io
+import threading
+import time
+import json
+
+import gspread
+from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 CORS(app)
+
+# -----------------------
+# GOOGLE SHEETS CONNECTION
+# -----------------------
+
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets"
+]
+
+credentials = Credentials.from_service_account_info(
+    json.loads(GOOGLE_CREDENTIALS),
+    scopes=SCOPES
+)
+
+gc = gspread.authorize(credentials)
+
+sheet = gc.open("North Cyprus Vehicle Leads").sheet1
 
 # -----------------------
 # LOAD DATA (GITHUB CSV SOURCE - SAFE VERSION)
@@ -32,6 +57,17 @@ def load_data():
         DATA_READY = False
 
 load_data()
+
+# -----------------------
+# 🔥 ADDED: AUTO REFRESH EVERY 12 HOURS
+# -----------------------
+def refresh_data_loop():
+    while True:
+        time.sleep(12 * 60 * 60)  # 12 hours
+        print("Refreshing CSV data from GitHub...")
+        load_data()
+
+threading.Thread(target=refresh_data_loop, daemon=True).start()
 
 # -----------------------
 # TYPE CLEANING
