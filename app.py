@@ -35,29 +35,6 @@ gc = gspread.authorize(credentials)
 sheet = gc.open("North Cyprus Vehicle Leads").sheet1
 
 # -----------------------
-# TEMPORARY GOOGLE SHEETS TEST
-# -----------------------
-
-@app.route("/test_google_sheet")
-def test_google_sheet():
-    sheet.append_row([
-        "TEST",
-        "TEST",
-        "TEST",
-        "TEST",
-        "TEST",
-        "TEST",
-        "TEST",
-        "TEST",
-        "TEST",
-        "TEST",
-        "TEST",
-        "TEST"
-    ])
-
-    return {"status": "success", "message": "Test row added to Google Sheet"}
-
-# -----------------------
 # LOAD DATA (GITHUB CSV SOURCE - SAFE VERSION)
 # -----------------------
 CSV_URL = "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/ads_base.csv"
