@@ -269,6 +269,101 @@ def valuation():
     return jsonify(result)
 
 # =========================================================
+# LEAD SUBMISSION
+# =========================================================
+@app.route("/submit_lead", methods=["POST"])
+def submit_lead():
+    try:
+        data = request.json or {}
+
+        # -----------------------
+        # GET SUBMITTED DATA
+        # -----------------------
+        year = data.get("year")
+        brand = data.get("brand")
+        model = data.get("model")
+        category = data.get("category")
+
+        valuation = data.get("valuation")
+        min_price = data.get("min_price")
+        max_price = data.get("max_price")
+
+        name = str(data.get("name", "")).strip()
+        phone = str(data.get("phone", "")).strip()
+        consent = data.get("consent")
+
+        # -----------------------
+        # VALIDATION
+        # -----------------------
+
+        if not name:
+            return jsonify({
+                "success": False,
+                "error": "NAME_REQUIRED"
+            }), 400
+
+        if not phone:
+            return jsonify({
+                "success": False,
+                "error": "PHONE_REQUIRED"
+            }), 400
+
+        if consent is not True:
+            return jsonify({
+                "success": False,
+                "error": "CONSENT_REQUIRED"
+            }), 400
+
+        if not year or not brand or not model or not category:
+            return jsonify({
+                "success": False,
+                "error": "VEHICLE_INFO_INCOMPLETE"
+            }), 400
+
+        # -----------------------
+        # DATES
+        # -----------------------
+
+        submitted_at = pd.Timestamp.now()
+
+        expires_at = submitted_at + pd.Timedelta(days=90)
+
+        # -----------------------
+        # ADD LEAD TO GOOGLE SHEET
+        # -----------------------
+
+        sheet.append_row([
+            submitted_at.strftime("%Y-%m-%d %H:%M:%S"),
+            year,
+            brand,
+            model,
+            category,
+            valuation,
+            min_price,
+            max_price,
+            name,
+            phone,
+            "TRUE",
+            expires_at.strftime("%Y-%m-%d %H:%M:%S")
+        ])
+
+        # -----------------------
+        # SUCCESS
+        # -----------------------
+
+        return jsonify({
+            "success": True
+        })
+
+    except Exception as e:
+        print("LEAD SUBMISSION FAILED:", e)
+
+        return jsonify({
+            "success": False,
+            "error": "SUBMISSION_FAILED"
+        }), 500
+
+# =========================================================
 # HEALTH CHECK (UPDATED - COLD START SAFE ENDPOINT)
 # =========================================================
 @app.route("/")
