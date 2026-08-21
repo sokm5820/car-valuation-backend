@@ -21,7 +21,8 @@ CORS(app)
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets"
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly"
 ]
 
 credentials = Credentials.from_service_account_info(
