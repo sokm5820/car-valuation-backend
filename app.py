@@ -118,6 +118,7 @@ def load_market_data():
         required_columns = [
             "Brand",
             "Model",
+            "Category",
             "Year",
             "Price",
             "KM",
@@ -163,6 +164,7 @@ def load_market_data():
         text_columns = [
             "Brand",
             "Model",
+            "Category",
             "Company",
             "Location",
             "Transmission",
@@ -410,6 +412,8 @@ def market_search(
     exclude_brands=None,
     models=None,
     exclude_models=None,
+    categories=None,
+    exclude_categories=None,
     locations=None,
     exclude_locations=None,
     companies=None,
@@ -543,6 +547,26 @@ def market_search(
             )
         ]
 
+    # -----------------------
+    # CATEGORY / VARIANT
+    # -----------------------
+
+    if categories:
+        filtered = filtered[
+            contains_any(
+                filtered["Category"],
+                categories
+            )
+        ]
+
+    if exclude_categories:
+        filtered = filtered[
+            ~contains_any(
+                filtered["Category"],
+                exclude_categories
+            )
+        ]
+    
     # -----------------------
     # LOCATION
     # -----------------------
@@ -679,6 +703,7 @@ def market_search(
         results.append({
             "brand": row["Brand"],
             "model": row["Model"],
+            "category": row["Category"],
 
             "year": (
                 int(row["Year"])
@@ -733,6 +758,9 @@ def api_market_search():
 
             models=data.get("models"),
             exclude_models=data.get("exclude_models"),
+
+            categories=data.get("categories"),
+            exclude_categories=data.get("exclude_categories"),
 
             locations=data.get("locations"),
             exclude_locations=data.get("exclude_locations"),
