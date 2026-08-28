@@ -537,6 +537,13 @@ Important rules:
 - Do not turn subjective ideas such as reliable, sporty, economical,
   family-friendly, small, luxurious, or good value into unsupported hard
   filters. Put those concepts in "preferences".
+- Use short canonical preference tags whenever possible so they persist cleanly across turns:
+  vehicle_type:SUV, vehicle_type:crossover, vehicle_type:pickup, vehicle_type:small_car,
+  vehicle_type:motorcycle, use_case:commute, use_case:family, priority:economy,
+  priority:reliability, priority:performance.
+- If the user explicitly says they have no brand/model preference, add "any_brand_model".
+- If they explicitly say they have no year or mileage restriction, add "any_year_km".
+- If they explicitly say any vehicle type is fine, add "any_vehicle_type".
 - "preferences" is for useful soft intent that the deterministic filters
   cannot represent yet.
 - "needs_clarification" should only be true when the latest request cannot
@@ -1109,22 +1116,131 @@ def merge_preferences(previous_preferences, new_preferences):
     return merged
 
 
+def _preference_flags(preferences):
+    prefs = {str(p).strip().casefold() for p in (preferences or []) if str(p).strip()}
+    return {
+        "has_vehicle_type": any(p.startswith("vehicle_type:") for p in prefs) or "any_vehicle_type" in prefs,
+        "has_use_case": any(p.startswith("use_case:") for p in prefs),
+        "any_brand_model": "any_brand_model" in prefs,
+        "any_year_km": "any_year_km" in prefs,
+    }
+
+
+def guided_narrowing_question(filters, preferences, count, language="TR"):
+    """Ask at most one high-value buying question before recommending."""
+    flags = _preference_flags(preferences)
+
+    has_budget = filters.get("budget") not in [None, ""]
+    has_brand_model = bool(
+        filters.get("brands") or filters.get("models") or
+        filters.get("exclude_brands") or filters.get("exclude_models") or
+        flags["any_brand_model"]
+    )
+    has_age_mileage = bool(
+        filters.get("min_year") not in [None, ""] or
+        filters.get("max_year") not in [None, ""] or
+        filters.get("min_km") not in [None, ""] or
+        filters.get("max_km") not in [None, ""] or
+        flags["any_year_km"]
+    )
+    has_focus = has_brand_model or flags["has_vehicle_type"] or flags["has_use_case"]
+
+    questions = {
+        "TR": {
+            "budget": "Maksimum bütçeniz nedir?",
+            "focus": "Nasıl bir araç arıyorsunuz — örneğin küçük otomobil, SUV, crossover, pick-up veya motosiklet — ya da ağırlıklı kullanım amacınız nedir?",
+            "age_km": "Minimum model yılı veya maksimum kilometre sınırınız var mı?",
+            "type_or_brand": "Araç tipi veya marka/model konusunda özellikle istediğiniz ya da istemediğiniz bir şey var mı?",
+        },
+        "EN": {
+            "budget": "What's your maximum budget?",
+            "focus": "What kind of vehicle are you after — for example a small car, SUV, crossover, pickup or motorcycle — or what will you mainly use it for?",
+            "age_km": "Do you have a minimum year or maximum mileage in mind?",
+            "type_or_brand": "Any vehicle type, brand or model you particularly want or want to avoid?",
+        },
+        "RU": {
+            "budget": "Какой у вас максимальный бюджет?",
+            "focus": "Какой тип транспорта вы ищете — например компактный автомобиль, SUV, кроссовер, пикап или мотоцикл — и для чего в основном будете его использовать?",
+            "age_km": "Есть ли минимальный год выпуска или максимальный пробег?",
+            "type_or_brand": "Есть ли тип, марка или модель, которые вы особенно хотите или хотите исключить?",
+        },
+    }
+    q = questions.get(language, questions["TR"])
+
+    if not has_budget:
+        return q["budget"]
+
+    # Broad searches should first establish what the buyer actually needs.
+    if int(count or 0) > 80 and not has_focus:
+        return q["focus"]
+
+    # Once purpose/type is known, age/mileage usually narrows the market most usefully.
+    if int(count or 0) > 120 and not has_age_mileage:
+        return q["age_km"]
+
+    # If the market is still very broad, ask one final optional preference question.
+    if int(count or 0) > 220 and not has_brand_model and not flags["has_vehicle_type"]:
+        return q["type_or_brand"]
+
+    return None
+
+
+def _model_market_median(item):
+    """Return a robust same-brand/model market median where enough comparisons exist."""
+    if market_df is None or market_df.empty:
+        return None, 0
+
+    brand = str(item.get("brand") or "").strip().casefold()
+    model = str(item.get("model") or "").strip().casefold()
+    if not brand or not model:
+        return None, 0
+
+    comps = market_df[
+        market_df["Brand"].fillna("").astype(str).str.strip().str.casefold().eq(brand) &
+        market_df["Model"].fillna("").astype(str).str.strip().str.casefold().eq(model)
+    ]
+    prices = pd.to_numeric(comps["Price"], errors="coerce")
+    prices = prices[prices > 0].dropna()
+    if len(prices) < 3:
+        return None, len(prices)
+    return float(prices.median()), len(prices)
+
+
+def is_suspicious_recommendation_price(item):
+    """
+    Keep questionable listings searchable, but stop obvious price-normalisation
+    anomalies from being used as recommendation evidence.
+    """
+    try:
+        price = float(item.get("price"))
+    except (TypeError, ValueError):
+        return True
+
+    if price <= 0:
+        return True
+
+    median, n = _model_market_median(item)
+    if median and n >= 3 and median >= 2500:
+        # A listing at less than 40% of its own model's market median is too
+        # anomalous to use as recommendation evidence without verification.
+        if price < median * 0.40:
+            return True
+
+    return False
+
+
 def select_assistant_candidates(results, filters, max_candidates=24):
-    """Choose a representative AI sample without letting suspicious low-price clusters dominate."""
+    """Choose a representative recommendation sample from the full filtered market."""
     if not results:
         return []
 
-    budget = filters.get("budget")
-    try:
-        budget = float(budget) if budget not in [None, ""] else None
-    except (TypeError, ValueError):
-        budget = None
+    clean = [item for item in results if not is_suspicious_recommendation_price(item)]
+    if not clean:
+        clean = list(results)
 
-    # A common bad-data pattern is several unrelated listings from the same seller
-    # carrying the exact same very-low placeholder price. Keep those listings in
-    # search/counts, but don't use that cluster as recommendation evidence.
+    # Avoid exact same-price seller clusters dominating the sample as a second guard.
     cluster_counts = {}
-    for item in results:
+    for item in clean:
         company = str(item.get("company") or "").strip().casefold()
         try:
             price = float(item.get("price"))
@@ -1133,34 +1249,30 @@ def select_assistant_candidates(results, filters, max_candidates=24):
         key = (company, price)
         cluster_counts[key] = cluster_counts.get(key, 0) + 1
 
-    clean = []
-    for item in results:
+    de_clustered = []
+    for item in clean:
         company = str(item.get("company") or "").strip().casefold()
         try:
             price = float(item.get("price"))
         except (TypeError, ValueError):
             continue
-
-        repeated_cluster = cluster_counts.get((company, price), 0) >= 3
-        unusually_low_for_budget = budget is not None and price < (budget * 0.25)
-        if repeated_cluster and unusually_low_for_budget:
+        if cluster_counts.get((company, price), 0) >= 4 and price <= 4000:
             continue
-        clean.append(item)
+        de_clustered.append(item)
 
-    if not clean:
-        clean = list(results)
+    if de_clustered:
+        clean = de_clustered
 
-    # Spread candidates across the user's available price range rather than
-    # simply passing the cheapest rows to the model.
     clean = sorted(clean, key=lambda x: float(x.get("price") or 0))
     if len(clean) <= max_candidates:
         return clean
 
+    # Sample evenly across the whole filtered price distribution rather than
+    # handing the model only the cheapest rows.
     chosen = []
     seen = set()
-    steps = max_candidates
-    for i in range(steps):
-        idx = round(i * (len(clean) - 1) / max(steps - 1, 1))
+    for i in range(max_candidates):
+        idx = round(i * (len(clean) - 1) / max(max_candidates - 1, 1))
         item = clean[idx]
         identity = item.get("link") or (
             item.get("brand"), item.get("model"), item.get("year"), item.get("price")
@@ -1170,7 +1282,6 @@ def select_assistant_candidates(results, filters, max_candidates=24):
             seen.add(identity)
 
     return chosen[:max_candidates]
-
 
 def generate_grounded_market_answer(
     message,
@@ -1217,6 +1328,7 @@ STYLE — IMPORTANT:
 - Avoid generic purchase-checklist advice unless the user asks for it or it is essential to the answer.
 - Sound like a knowledgeable conversational assistant, not a database report.
 - If there are many matches, summarize and help narrow intelligently rather than enumerating results.
+- The application handles guided narrowing before this function is called, so when you are called, answer the buyer's latest need directly and concisely.
 - Do not call a vehicle "best value", "the best", or objectively superior merely because it is cheap.
 - Do not claim a specific listed vehicle is mechanically reliable, economical, safe, or in good condition.
 - supplied_results is a representative candidate sample, not necessarily the full matching set.
@@ -1309,6 +1421,8 @@ def api_ai_buying_assistant():
                 "interpretation": interpretation,
             })
 
+        # Pull the full filtered result set for candidate selection. The public
+        # response is still capped below so the frontend is not flooded with rows.
         search_result = market_search(
             budget=next_filters.get("budget"),
             min_budget=next_filters.get("min_budget"),
@@ -1328,11 +1442,34 @@ def api_ai_buying_assistant():
             max_year=next_filters.get("max_year"),
             min_km=next_filters.get("min_km"),
             max_km=next_filters.get("max_km"),
-            limit=100,
+            limit=5000,
         )
 
         if not search_result.get("success"):
             return jsonify(search_result), 503
+
+        # Guided buying flow: do not jump straight into recommendations while
+        # the search is still extremely broad. Ask one useful question per turn.
+        guide_question = guided_narrowing_question(
+            filters=next_filters,
+            preferences=next_preferences,
+            count=search_result.get("count", 0),
+            language=language,
+        )
+
+        if guide_question:
+            public_results = (search_result.get("results") or [])[:100]
+            return jsonify({
+                "success": True,
+                "answer": guide_question,
+                "filters": next_filters,
+                "preferences": next_preferences,
+                "count": search_result.get("count", 0),
+                "returned": len(public_results),
+                "results": public_results,
+                "interpretation": interpretation,
+                "stage": "narrowing",
+            })
 
         answer = generate_grounded_market_answer(
             message=message,
@@ -1342,15 +1479,17 @@ def api_ai_buying_assistant():
             search_result=search_result,
         )
 
+        public_results = (search_result.get("results") or [])[:100]
         return jsonify({
             "success": True,
             "answer": answer,
             "filters": next_filters,
             "preferences": next_preferences,
             "count": search_result.get("count", 0),
-            "returned": search_result.get("returned", 0),
-            "results": search_result.get("results", []),
+            "returned": len(public_results),
+            "results": public_results,
             "interpretation": interpretation,
+            "stage": "recommendation",
         })
 
     except requests.HTTPError as e:
