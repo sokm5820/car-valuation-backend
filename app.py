@@ -1055,6 +1055,301 @@ def market_search(
     }
 
 
+
+# =========================================================
+# AI BUYING ASSISTANT - CONVERSATION / GROUNDED RESPONSE
+# =========================================================
+
+def apply_interpretation_to_filters(previous_filters, interpretation):
+    """
+    Merge the AI's incremental filter changes into the current search state.
+    This mirrors the frontend behavior, but keeps the full assistant endpoint
+    self-contained and deterministic.
+    """
+    next_filters = dict(previous_filters or {})
+    incoming = sanitize_ai_filters(interpretation.get("filters", {}))
+
+    next_filters.update(incoming)
+
+    seller_mode = interpretation.get("seller_mode")
+
+    if seller_mode == "individual":
+        next_filters["companies"] = ["Bireysel"]
+        next_filters.pop("exclude_companies", None)
+
+    elif seller_mode == "gallery":
+        next_filters["exclude_companies"] = ["Bireysel"]
+        next_filters.pop("companies", None)
+
+    elif seller_mode == "both":
+        next_filters.pop("companies", None)
+        next_filters.pop("exclude_companies", None)
+
+    for key in interpretation.get("clear_filters", []) or []:
+        if key in AI_FILTER_KEYS:
+            next_filters.pop(key, None)
+
+    return next_filters
+
+
+def merge_preferences(previous_preferences, new_preferences):
+    """
+    Keep soft user preferences across turns without duplicating them.
+    """
+    merged = []
+
+    for value in list(previous_preferences or []) + list(new_preferences or []):
+        value = str(value).strip()
+
+        if value and value.casefold() not in {
+            existing.casefold() for existing in merged
+        }:
+            merged.append(value)
+
+    return merged
+
+
+def generate_grounded_market_answer(
+    message,
+    language,
+    filters,
+    preferences,
+    search_result,
+):
+    """
+    Generate a conversational answer grounded in the deterministic
+    market-search result. Current listings, prices, mileage, locations,
+    sellers, and counts may ONLY come from search_result.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY_NOT_CONFIGURED")
+
+    count = int(search_result.get("count", 0) or 0)
+    results = search_result.get("results", []) or []
+
+    if count == 0:
+        fallback = {
+            "TR": "Bu kriterlere uyan aktif ilan bulamadım. İsterseniz kriterlerden birini esnetebiliriz.",
+            "EN": "I couldn't find an active listing matching those criteria. We can loosen one of the filters if you like.",
+            "RU": "Я не нашёл активных объявлений по этим критериям. Можно немного ослабить один из фильтров.",
+        }
+
+        return fallback.get(language, fallback["TR"])
+
+    instructions = """
+You are the conversational intelligence layer for a North Cyprus car-buying assistant.
+
+You receive:
+1. the user's latest message,
+2. the active deterministic search filters,
+3. soft preferences that cannot be represented as hard database filters,
+4. the total number of matching listings,
+5. a sample of REAL matching listings returned by the application's own dataset.
+
+Your role is to help the user make sense of the market and decide what to do next.
+
+STRICT GROUNDING RULES:
+- The provided market results are the ONLY source of truth for current listings,
+  prices, mileage, locations, sellers, transmissions, and result counts.
+- NEVER invent a listing, price, mileage, seller, location, link, or market statistic.
+- NEVER imply that the sample contains every matching listing when total_count is
+  larger than the supplied sample.
+- Do not call a vehicle "best value", "the best", or objectively superior merely
+  because it is cheap.
+- Do not claim that a specific listed car is mechanically reliable, economical,
+  safe, or in good condition based only on this dataset.
+- If the user expresses a soft preference such as reliability, economy,
+  practicality, sportiness, or luxury, you MAY use general automotive knowledge
+  cautiously, but make clear that this is general model-level guidance rather
+  than something verified about the individual listing.
+- If the dataset does not contain evidence needed for a preference, say so briefly
+  rather than inventing evidence.
+- When mentioning a listing, copy its facts exactly from supplied_results.
+- Be useful and decisive without pretending to know more than the data supports.
+
+CONVERSATION STYLE:
+- Answer in the requested language.
+- Sound natural and knowledgeable, not like a database.
+- Do not repeatedly ask the same mechanical question.
+- Use the user's latest message and current filters to decide the most useful next step.
+- Keep the response concise: normally 2-5 sentences.
+- When useful, mention up to 3 concrete listings from supplied_results.
+- Plain text only. No markdown headings.
+"""
+
+    payload = {
+        "language": language,
+        "latest_message": message,
+        "active_filters": filters,
+        "soft_preferences": preferences,
+        "total_count": count,
+        "supplied_results": results[:40],
+        "important_note": (
+            "supplied_results is only a sample when total_count is larger "
+            "than the number of supplied results."
+        ),
+    }
+
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": OPENAI_MODEL,
+            "instructions": instructions,
+            "input": json.dumps(payload, ensure_ascii=False),
+        },
+        timeout=45,
+    )
+
+    response.raise_for_status()
+
+    response_payload = response.json()
+    answer = extract_response_text(response_payload).strip()
+
+    if not answer:
+        raise ValueError("AI_ASSISTANT_EMPTY_RESPONSE")
+
+    return answer
+
+
+@app.route("/api/assistant", methods=["POST"])
+def api_ai_buying_assistant():
+    try:
+        data = request.json or {}
+
+        message = str(data.get("message", "")).strip()
+        language = str(data.get("language", "TR")).upper()
+        current_filters = data.get("current_filters") or {}
+        current_preferences = data.get("current_preferences") or []
+
+        if not message:
+            return jsonify({
+                "success": False,
+                "error": "MESSAGE_REQUIRED"
+            }), 400
+
+        interpretation = interpret_market_query(
+            message=message,
+            current_filters=current_filters,
+            language=language,
+        )
+
+        next_filters = apply_interpretation_to_filters(
+            current_filters,
+            interpretation,
+        )
+
+        next_preferences = merge_preferences(
+            current_preferences,
+            interpretation.get("preferences", []),
+        )
+
+        if (
+            interpretation.get("needs_clarification")
+            and interpretation.get("clarification_question")
+        ):
+            return jsonify({
+                "success": True,
+                "answer": interpretation["clarification_question"],
+                "filters": next_filters,
+                "preferences": next_preferences,
+                "count": None,
+                "returned": 0,
+                "results": [],
+                "interpretation": interpretation,
+            })
+
+        search_result = market_search(
+            budget=next_filters.get("budget"),
+            min_budget=next_filters.get("min_budget"),
+            brands=next_filters.get("brands"),
+            exclude_brands=next_filters.get("exclude_brands"),
+            models=next_filters.get("models"),
+            exclude_models=next_filters.get("exclude_models"),
+            categories=next_filters.get("categories"),
+            exclude_categories=next_filters.get("exclude_categories"),
+            locations=next_filters.get("locations"),
+            exclude_locations=next_filters.get("exclude_locations"),
+            companies=next_filters.get("companies"),
+            exclude_companies=next_filters.get("exclude_companies"),
+            transmissions=next_filters.get("transmissions"),
+            colors=next_filters.get("colors"),
+            min_year=next_filters.get("min_year"),
+            max_year=next_filters.get("max_year"),
+            min_km=next_filters.get("min_km"),
+            max_km=next_filters.get("max_km"),
+            limit=40,
+        )
+
+        if not search_result.get("success"):
+            return jsonify(search_result), 503
+
+        answer = generate_grounded_market_answer(
+            message=message,
+            language=language,
+            filters=next_filters,
+            preferences=next_preferences,
+            search_result=search_result,
+        )
+
+        return jsonify({
+            "success": True,
+            "answer": answer,
+            "filters": next_filters,
+            "preferences": next_preferences,
+            "count": search_result.get("count", 0),
+            "returned": search_result.get("returned", 0),
+            "results": search_result.get("results", []),
+            "interpretation": interpretation,
+        })
+
+    except requests.HTTPError as e:
+        status_code = (
+            e.response.status_code
+            if e.response is not None
+            else None
+        )
+
+        response_text = (
+            e.response.text[:2000]
+            if e.response is not None
+            else ""
+        )
+
+        print(
+            "OPENAI ASSISTANT HTTP ERROR:",
+            status_code,
+            response_text,
+            flush=True
+        )
+
+        return jsonify({
+            "success": False,
+            "error": "AI_ASSISTANT_FAILED",
+            "openai_status": status_code,
+            "openai_message": response_text
+        }), 502
+
+    except RuntimeError as e:
+        print("AI ASSISTANT CONFIG ERROR:", e, flush=True)
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 503
+
+    except Exception as e:
+        print("AI ASSISTANT FAILED:", repr(e), flush=True)
+
+        return jsonify({
+            "success": False,
+            "error": "AI_ASSISTANT_FAILED"
+        }), 500
+
+
 # =========================================================
 # AI BUYING ASSISTANT - MARKET SEARCH API
 # =========================================================
