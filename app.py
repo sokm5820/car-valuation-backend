@@ -623,10 +623,7 @@ Important rules:
             "input": json.dumps(user_payload, ensure_ascii=False),
             "text": {
                 "format": {
-                    "type": "json_schema",
-                    "name": "vehicle_search_interpretation",
-                    "strict": True,
-                    "schema": schema,
+                    "type": "json_object"
                 }
             },
         },
