@@ -1109,6 +1109,69 @@ def merge_preferences(previous_preferences, new_preferences):
     return merged
 
 
+def select_assistant_candidates(results, filters, max_candidates=24):
+    """Choose a representative AI sample without letting suspicious low-price clusters dominate."""
+    if not results:
+        return []
+
+    budget = filters.get("budget")
+    try:
+        budget = float(budget) if budget not in [None, ""] else None
+    except (TypeError, ValueError):
+        budget = None
+
+    # A common bad-data pattern is several unrelated listings from the same seller
+    # carrying the exact same very-low placeholder price. Keep those listings in
+    # search/counts, but don't use that cluster as recommendation evidence.
+    cluster_counts = {}
+    for item in results:
+        company = str(item.get("company") or "").strip().casefold()
+        try:
+            price = float(item.get("price"))
+        except (TypeError, ValueError):
+            continue
+        key = (company, price)
+        cluster_counts[key] = cluster_counts.get(key, 0) + 1
+
+    clean = []
+    for item in results:
+        company = str(item.get("company") or "").strip().casefold()
+        try:
+            price = float(item.get("price"))
+        except (TypeError, ValueError):
+            continue
+
+        repeated_cluster = cluster_counts.get((company, price), 0) >= 3
+        unusually_low_for_budget = budget is not None and price < (budget * 0.25)
+        if repeated_cluster and unusually_low_for_budget:
+            continue
+        clean.append(item)
+
+    if not clean:
+        clean = list(results)
+
+    # Spread candidates across the user's available price range rather than
+    # simply passing the cheapest rows to the model.
+    clean = sorted(clean, key=lambda x: float(x.get("price") or 0))
+    if len(clean) <= max_candidates:
+        return clean
+
+    chosen = []
+    seen = set()
+    steps = max_candidates
+    for i in range(steps):
+        idx = round(i * (len(clean) - 1) / max(steps - 1, 1))
+        item = clean[idx]
+        identity = item.get("link") or (
+            item.get("brand"), item.get("model"), item.get("year"), item.get("price")
+        )
+        if identity not in seen:
+            chosen.append(item)
+            seen.add(identity)
+
+    return chosen[:max_candidates]
+
+
 def generate_grounded_market_answer(
     message,
     language,
@@ -1126,6 +1189,7 @@ def generate_grounded_market_answer(
 
     count = int(search_result.get("count", 0) or 0)
     results = search_result.get("results", []) or []
+    candidates = select_assistant_candidates(results, filters)
 
     if count == 0:
         fallback = {
@@ -1137,44 +1201,27 @@ def generate_grounded_market_answer(
         return fallback.get(language, fallback["TR"])
 
     instructions = """
-You are the conversational intelligence layer for a North Cyprus car-buying assistant.
+You are the conversational intelligence layer for a North Cyprus vehicle-buying assistant.
 
-You receive:
-1. the user's latest message,
-2. the active deterministic search filters,
-3. soft preferences that cannot be represented as hard database filters,
-4. the total number of matching listings,
-5. a sample of REAL matching listings returned by the application's own dataset.
+Use the supplied deterministic market data as the only source of truth for current listings,
+prices, mileage, locations, sellers, transmissions and result counts. Never invent listing facts.
+General model-level automotive knowledge may be used cautiously for soft preferences such as
+economy or reliability, but never present it as verified condition or performance of an individual listing.
 
-Your role is to help the user make sense of the market and decide what to do next.
-
-STRICT GROUNDING RULES:
-- The provided market results are the ONLY source of truth for current listings,
-  prices, mileage, locations, sellers, transmissions, and result counts.
-- NEVER invent a listing, price, mileage, seller, location, link, or market statistic.
-- NEVER imply that the sample contains every matching listing when total_count is
-  larger than the supplied sample.
-- Do not call a vehicle "best value", "the best", or objectively superior merely
-  because it is cheap.
-- Do not claim that a specific listed car is mechanically reliable, economical,
-  safe, or in good condition based only on this dataset.
-- If the user expresses a soft preference such as reliability, economy,
-  practicality, sportiness, or luxury, you MAY use general automotive knowledge
-  cautiously, but make clear that this is general model-level guidance rather
-  than something verified about the individual listing.
-- If the dataset does not contain evidence needed for a preference, say so briefly
-  rather than inventing evidence.
-- When mentioning a listing, copy its facts exactly from supplied_results.
-- Be useful and decisive without pretending to know more than the data supports.
-
-CONVERSATION STYLE:
+STYLE — IMPORTANT:
 - Answer in the requested language.
-- Sound natural and knowledgeable, not like a database.
-- Do not repeatedly ask the same mechanical question.
-- Use the user's latest message and current filters to decide the most useful next step.
-- Keep the response concise: normally 2-5 sentences.
-- When useful, mention up to 3 concrete listings from supplied_results.
-- Plain text only. No markdown headings.
+- Be brief: normally 1-3 short sentences. Only expand if the user asks for detail.
+- Do NOT output URLs, links, markdown links, or raw listing URLs. Links are UI data only.
+- Do NOT dump a list of listings just because matches exist.
+- Mention at most 3 models/listings, and only when doing so genuinely helps answer the latest question.
+- Avoid generic purchase-checklist advice unless the user asks for it or it is essential to the answer.
+- Sound like a knowledgeable conversational assistant, not a database report.
+- If there are many matches, summarize and help narrow intelligently rather than enumerating results.
+- Do not call a vehicle "best value", "the best", or objectively superior merely because it is cheap.
+- Do not claim a specific listed vehicle is mechanically reliable, economical, safe, or in good condition.
+- supplied_results is a representative candidate sample, not necessarily the full matching set.
+- Prices in supplied_results can contain seller-entry/data-normalisation anomalies. Treat implausibly low prices cautiously;
+  never build a recommendation around a suspicious price simply because it is the cheapest.
 """
 
     payload = {
@@ -1183,10 +1230,10 @@ CONVERSATION STYLE:
         "active_filters": filters,
         "soft_preferences": preferences,
         "total_count": count,
-        "supplied_results": results[:40],
+        "supplied_results": candidates,
         "important_note": (
-            "supplied_results is only a sample when total_count is larger "
-            "than the number of supplied results."
+            "supplied_results is a selected representative sample when total_count is larger "
+            "than the number of supplied results. Raw listing URLs must never be printed."
         ),
     }
 
@@ -1281,7 +1328,7 @@ def api_ai_buying_assistant():
             max_year=next_filters.get("max_year"),
             min_km=next_filters.get("min_km"),
             max_km=next_filters.get("max_km"),
-            limit=40,
+            limit=100,
         )
 
         if not search_result.get("success"):
