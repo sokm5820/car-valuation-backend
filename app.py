@@ -8,6 +8,10 @@ import threading
 import time
 import json
 
+# AI interpreter configuration
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
+
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -400,6 +404,323 @@ def valuation():
     )
 
     return jsonify(result)
+
+
+# =========================================================
+# AI BUYING ASSISTANT - NATURAL LANGUAGE INTERPRETER
+# =========================================================
+
+AI_FILTER_KEYS = {
+    "budget",
+    "min_budget",
+    "brands",
+    "exclude_brands",
+    "models",
+    "exclude_models",
+    "categories",
+    "exclude_categories",
+    "locations",
+    "exclude_locations",
+    "companies",
+    "exclude_companies",
+    "transmissions",
+    "colors",
+    "min_year",
+    "max_year",
+    "min_km",
+    "max_km",
+}
+
+
+def compact_market_context():
+    """
+    Give the model enough live vocabulary to map user language onto
+    values that actually exist in market_base.csv without sending the
+    entire dataset to the model.
+    """
+    if not MARKET_READY or market_df is None or market_df.empty:
+        return {}
+
+    def unique_values(column, limit=None):
+        values = sorted(
+            market_df[column]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .loc[lambda s: s != ""]
+            .unique()
+            .tolist()
+        )
+
+        return values[:limit] if limit else values
+
+    return {
+        "brands": unique_values("Brand"),
+        "locations": unique_values("Location"),
+        "transmissions": unique_values("Transmission"),
+        "companies": unique_values("Company", 250),
+    }
+
+
+def extract_response_text(payload):
+    """
+    Extract the text returned by the Responses API without requiring
+    the OpenAI Python package.
+    """
+    for item in payload.get("output", []):
+        for content in item.get("content", []):
+            if content.get("type") == "output_text":
+                return content.get("text", "")
+
+    return ""
+
+
+def sanitize_ai_filters(raw_filters):
+    """
+    Never trust model output directly. Only allow fields supported by
+    market_search and normalize empty values away.
+    """
+    if not isinstance(raw_filters, dict):
+        return {}
+
+    clean = {}
+
+    for key, value in raw_filters.items():
+        if key not in AI_FILTER_KEYS:
+            continue
+
+        if value in [None, "", [], {}]:
+            continue
+
+        clean[key] = value
+
+    return clean
+
+
+def interpret_market_query(message, current_filters=None, language="TR"):
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY_NOT_CONFIGURED")
+
+    current_filters = current_filters or {}
+    market_context = compact_market_context()
+
+    instructions = """
+You are the query interpreter for a North Cyprus vehicle-market assistant.
+
+Your job is NOT to answer the user and NOT to invent listings.
+Convert the user's latest message into structured changes to a vehicle search.
+
+The deterministic search engine supports ONLY these filter fields:
+budget, min_budget, brands, exclude_brands, models, exclude_models,
+categories, exclude_categories, locations, exclude_locations,
+companies, exclude_companies, transmissions, colors,
+min_year, max_year, min_km, max_km.
+
+Important rules:
+- Return JSON only.
+- "filters" must contain ONLY constraints expressed or clearly modified
+  by the latest user message.
+- Do not repeat old filters merely because they appear in current_filters.
+- Use null/empty omission rather than guessing.
+- Prices are GBP.
+- Convert "15k", "15 bin", "15 thousand" to 15000.
+- Convert mileage expressions similarly.
+- "Bireysel" means a private/individual seller.
+- If the user wants galleries/dealers, set exclude_companies to ["Bireysel"].
+- If the user wants private sellers, set companies to ["Bireysel"].
+- If the user says either/both seller types are fine, put
+  "seller_mode": "both" so the application can clear the prior seller filter.
+- If the user explicitly removes a previous constraint, put its field name
+  in "clear_filters".
+- Preserve real market spellings when they are supplied in market_context.
+- Do not translate brand/model names.
+- Do not turn subjective ideas such as reliable, sporty, economical,
+  family-friendly, small, luxurious, or good value into unsupported hard
+  filters. Put those concepts in "preferences".
+- "preferences" is for useful soft intent that the deterministic filters
+  cannot represent yet.
+- "needs_clarification" should only be true when the latest request cannot
+  safely be represented without asking the user something.
+- "clarification_question" should be short and in the user's language.
+"""
+
+    user_payload = {
+        "language": language,
+        "latest_message": message,
+        "current_filters": current_filters,
+        "market_context": market_context,
+    }
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "filters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "budget": {"type": ["number", "null"]},
+                    "min_budget": {"type": ["number", "null"]},
+                    "brands": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "exclude_brands": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "models": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "exclude_models": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "categories": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "exclude_categories": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "locations": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "exclude_locations": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "companies": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "exclude_companies": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "transmissions": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "colors": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "min_year": {"type": ["integer", "null"]},
+                    "max_year": {"type": ["integer", "null"]},
+                    "min_km": {"type": ["number", "null"]},
+                    "max_km": {"type": ["number", "null"]},
+                },
+                "required": [
+                    "budget", "min_budget", "brands", "exclude_brands",
+                    "models", "exclude_models", "categories", "exclude_categories",
+                    "locations", "exclude_locations", "companies", "exclude_companies",
+                    "transmissions", "colors", "min_year", "max_year",
+                    "min_km", "max_km"
+                ],
+            },
+            "clear_filters": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "seller_mode": {
+                "type": ["string", "null"],
+                "enum": ["individual", "gallery", "both", None],
+            },
+            "preferences": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "needs_clarification": {"type": "boolean"},
+            "clarification_question": {"type": ["string", "null"]},
+        },
+        "required": [
+            "filters",
+            "clear_filters",
+            "seller_mode",
+            "preferences",
+            "needs_clarification",
+            "clarification_question",
+        ],
+        "additionalProperties": False,
+    }
+
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": OPENAI_MODEL,
+            "instructions": instructions,
+            "input": json.dumps(user_payload, ensure_ascii=False),
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "vehicle_search_interpretation",
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    response_payload = response.json()
+    response_text = extract_response_text(response_payload)
+
+    if not response_text:
+        raise ValueError("AI_INTERPRETER_EMPTY_RESPONSE")
+
+    interpreted = json.loads(response_text)
+    interpreted["filters"] = sanitize_ai_filters(
+        interpreted.get("filters", {})
+    )
+
+    # Remove null values emitted because the strict schema requires every
+    # filter property to be present.
+    interpreted["filters"] = {
+        key: value
+        for key, value in interpreted["filters"].items()
+        if value is not None
+    }
+
+    return interpreted
+
+
+@app.route("/api/interpret", methods=["POST"])
+def api_interpret_market_query():
+    try:
+        data = request.json or {}
+
+        message = str(data.get("message", "")).strip()
+
+        if not message:
+            return jsonify({
+                "success": False,
+                "error": "MESSAGE_REQUIRED"
+            }), 400
+
+        result = interpret_market_query(
+            message=message,
+            current_filters=data.get("current_filters") or {},
+            language=str(data.get("language", "TR")).upper(),
+        )
+
+        return jsonify({
+            "success": True,
+            **result
+        })
+
+    except requests.HTTPError as e:
+        status_code = (
+            e.response.status_code
+            if e.response is not None
+            else None
+        )
+
+        response_text = (
+            e.response.text[:1000]
+            if e.response is not None
+            else ""
+        )
+
+        print(
+            "OPENAI INTERPRETER HTTP ERROR:",
+            status_code,
+            response_text
+        )
+
+        return jsonify({
+            "success": False,
+            "error": "AI_INTERPRETER_FAILED"
+        }), 502
+
+    except RuntimeError as e:
+        print("AI INTERPRETER CONFIG ERROR:", e)
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 503
+
+    except Exception as e:
+        print("AI INTERPRETER FAILED:", e)
+
+        return jsonify({
+            "success": False,
+            "error": "AI_INTERPRETER_FAILED"
+        }), 500
+
 
 # =========================================================
 # AI BUYING ASSISTANT - MARKET SEARCH ENGINE
