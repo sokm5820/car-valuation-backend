@@ -681,7 +681,7 @@ def api_interpret_market_query():
         )
 
         response_text = (
-            e.response.text[:1000]
+            e.response.text[:2000]
             if e.response is not None
             else ""
         )
@@ -689,16 +689,19 @@ def api_interpret_market_query():
         print(
             "OPENAI INTERPRETER HTTP ERROR:",
             status_code,
-            response_text
+            response_text,
+            flush=True
         )
 
         return jsonify({
             "success": False,
-            "error": "AI_INTERPRETER_FAILED"
+            "error": "AI_INTERPRETER_FAILED",
+            "openai_status": status_code,
+            "openai_message": response_text
         }), 502
 
     except RuntimeError as e:
-        print("AI INTERPRETER CONFIG ERROR:", e)
+        print("AI INTERPRETER CONFIG ERROR:", e, flush=True)
 
         return jsonify({
             "success": False,
@@ -706,7 +709,7 @@ def api_interpret_market_query():
         }), 503
 
     except Exception as e:
-        print("AI INTERPRETER FAILED:", e)
+        print("AI INTERPRETER FAILED:", repr(e), flush=True)
 
         return jsonify({
             "success": False,
