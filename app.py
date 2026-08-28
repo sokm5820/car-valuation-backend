@@ -621,11 +621,6 @@ Important rules:
             "model": OPENAI_MODEL,
             "instructions": instructions,
             "input": json.dumps(user_payload, ensure_ascii=False),
-            "text": {
-                "format": {
-                    "type": "json_object"
-                }
-            },
         },
         timeout=30,
     )
