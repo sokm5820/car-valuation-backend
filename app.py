@@ -804,6 +804,85 @@ def api_market_search():
             "results": []
         }), 500
 
+# =========================================================
+# AI BUYING ASSISTANT - MARKET OPTIONS
+# =========================================================
+
+@app.route("/api/market_options", methods=["GET"])
+def market_options():
+    if not MARKET_READY or market_df is None or market_df.empty:
+        return jsonify({
+            "success": False,
+            "error": "MARKET_DATA_NOT_READY"
+        }), 503
+
+    try:
+        brands = sorted(
+            market_df["Brand"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .loc[lambda s: s != ""]
+            .unique()
+            .tolist()
+        )
+
+        models = sorted(
+            market_df["Model"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .loc[lambda s: s != ""]
+            .unique()
+            .tolist()
+        )
+
+        locations = sorted(
+            market_df["Location"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .loc[lambda s: s != ""]
+            .unique()
+            .tolist()
+        )
+
+        transmissions = sorted(
+            market_df["Transmission"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .loc[lambda s: s != ""]
+            .unique()
+            .tolist()
+        )
+
+        companies = sorted(
+            market_df["Company"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .loc[lambda s: s != ""]
+            .unique()
+            .tolist()
+        )
+
+        return jsonify({
+            "success": True,
+            "brands": brands,
+            "models": models,
+            "locations": locations,
+            "transmissions": transmissions,
+            "companies": companies
+        })
+
+    except Exception as e:
+        print("MARKET OPTIONS FAILED:", e)
+
+        return jsonify({
+            "success": False,
+            "error": "MARKET_OPTIONS_FAILED"
+        }), 500
 
 # =========================================================
 # AI BUYING ASSISTANT - HEALTH CHECK
