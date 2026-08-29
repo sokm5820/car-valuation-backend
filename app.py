@@ -537,6 +537,11 @@ Important rules:
 - Do not turn subjective ideas such as reliable, sporty, economical,
   family-friendly, small, luxurious, or good value into unsupported hard
   filters. Put those concepts in "preferences".
+- IMPORTANT: vehicle body/type requests such as SUV, crossover, pick-up, small car,
+  normal car/automobile, motorcycle or scooter are SOFT preferences, not Category filters.
+  Put them in "preferences" using the canonical vehicle_type tags below. Never place
+  SUV/pick-up/motorcycle/etc. into categories unless that exact value is explicitly
+  confirmed as a real market Category value.
 - Use short canonical preference tags whenever possible so they persist cleanly across turns:
   vehicle_type:SUV, vehicle_type:crossover, vehicle_type:pickup, vehicle_type:small_car,
   vehicle_type:motorcycle, use_case:commute, use_case:family, priority:economy,
@@ -546,8 +551,12 @@ Important rules:
 - If they explicitly say any vehicle type is fine, add "any_vehicle_type".
 - "preferences" is for useful soft intent that the deterministic filters
   cannot represent yet.
-- "needs_clarification" should only be true when the latest request cannot
-  safely be represented without asking the user something.
+- "needs_clarification" should only be true when the latest message itself is genuinely
+  ambiguous (for example an unclear number/unit or an unclear brand/model reference).
+- A broad request such as "recommend me a car" is NOT an ambiguity. Set
+  needs_clarification=false and let the application's guided narrowing flow handle it.
+- Do not use clarification_question merely to ask for budget, year, vehicle type, brand,
+  model or mileage because the guided narrowing flow handles those choices.
 - "clarification_question" should be short and in the user's language.
 """
 
@@ -1127,148 +1136,112 @@ def _preference_flags(preferences):
 
 
 def guided_narrowing_question(filters, preferences, count, language="TR"):
-    """Ask at most one high-value buying question before recommending."""
+    """Guide broad searches in two stages without turning the chat into a questionnaire."""
     flags = _preference_flags(preferences)
+    count = int(count or 0)
 
     has_budget = filters.get("budget") not in [None, ""]
+    has_year = bool(
+        filters.get("min_year") not in [None, ""] or
+        filters.get("max_year") not in [None, ""] or
+        flags["any_year_km"]
+    )
+    has_vehicle_type = flags["has_vehicle_type"]
     has_brand_model = bool(
         filters.get("brands") or filters.get("models") or
         filters.get("exclude_brands") or filters.get("exclude_models") or
         flags["any_brand_model"]
     )
-    has_age_mileage = bool(
-        filters.get("min_year") not in [None, ""] or
-        filters.get("max_year") not in [None, ""] or
-        filters.get("min_km") not in [None, ""] or
+    has_max_km = bool(
         filters.get("max_km") not in [None, ""] or
         flags["any_year_km"]
     )
-    has_focus = has_brand_model or flags["has_vehicle_type"] or flags["has_use_case"]
 
-    questions = {
+    copy = {
         "TR": {
-            "budget": "Maksimum bütçeniz nedir?",
-            "focus": "Nasıl bir araç arıyorsunuz — örneğin küçük otomobil, SUV, crossover, pick-up veya motosiklet — ya da ağırlıklı kullanım amacınız nedir?",
-            "age_km": "Minimum model yılı veya maksimum kilometre sınırınız var mı?",
-            "type_or_brand": "Araç tipi veya marka/model konusunda özellikle istediğiniz ya da istemediğiniz bir şey var mı?",
+            "intro": "Size daha isabetli öneriler sunabilmem için aramanızı biraz daraltmanızı öneririm.",
+            "budget": "maksimum bütçenizi",
+            "year": "minimum model yılı beklentinizi",
+            "type": "araç tipini (ör. SUV, pick-up, otomobil veya motosiklet)",
+            "secondary_intro": "Hâlâ oldukça fazla seçenek var. Aramayı biraz daha daraltabiliriz.",
+            "brand": "ilgilendiğiniz veya istemediğiniz marka/model",
+            "km": "maksimum kilometre",
         },
         "EN": {
-            "budget": "What's your maximum budget?",
-            "focus": "What kind of vehicle are you after — for example a small car, SUV, crossover, pickup or motorcycle — or what will you mainly use it for?",
-            "age_km": "Do you have a minimum year or maximum mileage in mind?",
-            "type_or_brand": "Any vehicle type, brand or model you particularly want or want to avoid?",
+            "intro": "To give you more relevant recommendations, I'd suggest narrowing the search a little.",
+            "budget": "your maximum budget",
+            "year": "your minimum year requirement",
+            "type": "vehicle type (e.g. SUV, pickup, car or motorcycle)",
+            "secondary_intro": "There are still quite a lot of options. We can narrow the search a little further.",
+            "brand": "brands/models you are interested in or want to avoid",
+            "km": "maximum mileage",
         },
         "RU": {
-            "budget": "Какой у вас максимальный бюджет?",
-            "focus": "Какой тип транспорта вы ищете — например компактный автомобиль, SUV, кроссовер, пикап или мотоцикл — и для чего в основном будете его использовать?",
-            "age_km": "Есть ли минимальный год выпуска или максимальный пробег?",
-            "type_or_brand": "Есть ли тип, марка или модель, которые вы особенно хотите или хотите исключить?",
+            "intro": "Чтобы дать более точные рекомендации, я бы предложил немного сузить поиск.",
+            "budget": "максимальный бюджет",
+            "year": "минимальный год выпуска",
+            "type": "тип транспорта (например SUV, пикап, автомобиль или мотоцикл)",
+            "secondary_intro": "Вариантов всё ещё довольно много. Можно немного сузить поиск.",
+            "brand": "интересующие или нежелательные марки/модели",
+            "km": "максимальный пробег",
         },
     }
-    q = questions.get(language, questions["TR"])
+    t = copy.get(language, copy["TR"])
 
+    # Stage 1: on a broad search, present the main missing dimensions together.
+    primary_missing = []
     if not has_budget:
-        return q["budget"]
+        primary_missing.append(t["budget"])
+    if not has_year:
+        primary_missing.append(t["year"])
+    if not has_vehicle_type:
+        primary_missing.append(t["type"])
 
-    # Broad searches should first establish what the buyer actually needs.
-    if int(count or 0) > 80 and not has_focus:
-        return q["focus"]
+    # Do this not only when the raw count is huge, but whenever the buyer has
+    # supplied fewer than two of the three primary dimensions.
+    primary_supplied = 3 - len(primary_missing)
+    if primary_missing and (count > 120 or primary_supplied < 2):
+        if language == "TR":
+            return f'{t["intro"]} ' + ", ".join(primary_missing) + " belirtebilirsiniz; bunlardan biri veya birkaçı yeterli olabilir."
+        if language == "RU":
+            return f'{t["intro"]} ' + ", ".join(primary_missing) + ". Можно указать один или несколько из этих параметров."
+        return f'{t["intro"]} You can add ' + ", ".join(primary_missing) + "; one or more of these may be enough."
 
-    # Once purpose/type is known, age/mileage usually narrows the market most usefully.
-    if int(count or 0) > 120 and not has_age_mileage:
-        return q["age_km"]
+    # Stage 2: if the market is still broad, offer secondary refinements together.
+    secondary_missing = []
+    if not has_brand_model:
+        secondary_missing.append(t["brand"])
+    if not has_max_km:
+        secondary_missing.append(t["km"])
 
-    # If the market is still very broad, ask one final optional preference question.
-    if int(count or 0) > 220 and not has_brand_model and not flags["has_vehicle_type"]:
-        return q["type_or_brand"]
+    if count > 80 and secondary_missing:
+        if language == "TR":
+            return f'{t["secondary_intro"]} ' + " veya ".join(secondary_missing) + " gibi tercihlerinizi belirtebilirsiniz."
+        if language == "RU":
+            return f'{t["secondary_intro"]} ' + " или ".join(secondary_missing) + "."
+        return f'{t["secondary_intro"]} You can add ' + " or ".join(secondary_missing) + "."
 
     return None
 
 
-def _model_market_median(item):
-    """Return a robust same-brand/model market median where enough comparisons exist."""
-    if market_df is None or market_df.empty:
-        return None, 0
-
-    brand = str(item.get("brand") or "").strip().casefold()
-    model = str(item.get("model") or "").strip().casefold()
-    if not brand or not model:
-        return None, 0
-
-    comps = market_df[
-        market_df["Brand"].fillna("").astype(str).str.strip().str.casefold().eq(brand) &
-        market_df["Model"].fillna("").astype(str).str.strip().str.casefold().eq(model)
-    ]
-    prices = pd.to_numeric(comps["Price"], errors="coerce")
-    prices = prices[prices > 0].dropna()
-    if len(prices) < 3:
-        return None, len(prices)
-    return float(prices.median()), len(prices)
-
-
-def is_suspicious_recommendation_price(item):
-    """
-    Keep questionable listings searchable, but stop obvious price-normalisation
-    anomalies from being used as recommendation evidence.
-    """
-    try:
-        price = float(item.get("price"))
-    except (TypeError, ValueError):
-        return True
-
-    if price <= 0:
-        return True
-
-    median, n = _model_market_median(item)
-    if median and n >= 3 and median >= 2500:
-        # A listing at less than 40% of its own model's market median is too
-        # anomalous to use as recommendation evidence without verification.
-        if price < median * 0.40:
-            return True
-
-    return False
-
-
 def select_assistant_candidates(results, filters, max_candidates=24):
-    """Choose a representative recommendation sample from the full filtered market."""
+    """Choose a representative sample from the deterministic filtered market."""
     if not results:
         return []
 
-    clean = [item for item in results if not is_suspicious_recommendation_price(item)]
-    if not clean:
-        clean = list(results)
+    clean = sorted(
+        list(results),
+        key=lambda x: (
+            float(x.get("price") or 0),
+            -(int(x.get("year") or 0)),
+        )
+    )
 
-    # Avoid exact same-price seller clusters dominating the sample as a second guard.
-    cluster_counts = {}
-    for item in clean:
-        company = str(item.get("company") or "").strip().casefold()
-        try:
-            price = float(item.get("price"))
-        except (TypeError, ValueError):
-            continue
-        key = (company, price)
-        cluster_counts[key] = cluster_counts.get(key, 0) + 1
-
-    de_clustered = []
-    for item in clean:
-        company = str(item.get("company") or "").strip().casefold()
-        try:
-            price = float(item.get("price"))
-        except (TypeError, ValueError):
-            continue
-        if cluster_counts.get((company, price), 0) >= 4 and price <= 4000:
-            continue
-        de_clustered.append(item)
-
-    if de_clustered:
-        clean = de_clustered
-
-    clean = sorted(clean, key=lambda x: float(x.get("price") or 0))
     if len(clean) <= max_candidates:
         return clean
 
-    # Sample evenly across the whole filtered price distribution rather than
-    # handing the model only the cheapest rows.
+    # Sample evenly across the filtered price distribution rather than handing
+    # the model only the cheapest rows.
     chosen = []
     seen = set()
     for i in range(max_candidates):
@@ -1282,6 +1255,7 @@ def select_assistant_candidates(results, filters, max_candidates=24):
             seen.add(identity)
 
     return chosen[:max_candidates]
+
 
 def generate_grounded_market_answer(
     message,
@@ -1409,6 +1383,7 @@ def api_ai_buying_assistant():
         if (
             interpretation.get("needs_clarification")
             and interpretation.get("clarification_question")
+            and (interpretation.get("filters") or interpretation.get("clear_filters"))
         ):
             return jsonify({
                 "success": True,
@@ -1448,8 +1423,8 @@ def api_ai_buying_assistant():
         if not search_result.get("success"):
             return jsonify(search_result), 503
 
-        # Guided buying flow: do not jump straight into recommendations while
-        # the search is still extremely broad. Ask one useful question per turn.
+        # Guided buying flow: broad searches get a compact group of useful
+        # narrowing dimensions; only later do we offer secondary refinements.
         guide_question = guided_narrowing_question(
             filters=next_filters,
             preferences=next_preferences,
