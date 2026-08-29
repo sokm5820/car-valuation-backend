@@ -433,6 +433,88 @@ AI_FILTER_KEYS = {
     "max_km",
 }
 
+def detect_conversation_language(message, requested_language="TR"):
+    """
+    Follow the language the user actually typed.
+
+    The UI language remains a fallback, but an English or Russian message should
+    receive an English or Russian answer even if the frontend is currently set to TR.
+    """
+    text = str(message or "").strip()
+    if not text:
+        return str(requested_language or "TR").upper()
+
+    low = text.casefold()
+
+    # Cyrillic is an unambiguous Russian signal.
+    if re.search(r"[\u0400-\u04FF]", text):
+        return "RU"
+
+    # Turkish-specific characters/very common function words are strong TR signals.
+    if re.search(r"[çğıöşüÇĞİÖŞÜ]", text) or re.search(
+        r"\b(istiyorum|olsun|bakıyorum|bütçe|araç|araba|motosiklet|hangisi|hepsine|evet|hayır|yok|var mı|şart değil)\b",
+        low,
+    ):
+        return "TR"
+
+    # Common English conversational vocabulary. This intentionally catches short
+    # follow-ups such as "yes", "all of them", "what about Mercedes?" and "GLA".
+    if re.search(
+        r"\b(i|want|buy|suv|what|can|i get|are there|more|options|yes|no|all|them|"
+        r"what about|show|compare|cheaper|newer|which|mercedes|please|under|budget)\b",
+        low,
+    ):
+        return "EN"
+
+    return str(requested_language or "TR").upper()
+
+
+def normalize_assistant_format(answer):
+    """
+    Enforce one consistent premium chat rhythm:
+    intro paragraph
+    model/listing lines with NO blank lines between them
+    final paragraph
+
+    The model is still responsible for wording; this only normalizes whitespace.
+    """
+    text = str(answer or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return text
+
+    raw = [line.strip() for line in text.split("\n")]
+    nonempty = [line for line in raw if line]
+    if len(nonempty) <= 2:
+        return "\n\n".join(nonempty)
+
+    def looks_like_option(line):
+        # Vehicle/listing lines normally contain an em dash and a price/year fact.
+        return "—" in line and (
+            "£" in line
+            or re.search(r"\b(19|20)\d{2}\b", line)
+        )
+
+    first_option = next((i for i, line in enumerate(nonempty) if looks_like_option(line)), None)
+    if first_option is None:
+        return "\n\n".join(nonempty)
+
+    last_option = first_option
+    while last_option + 1 < len(nonempty) and looks_like_option(nonempty[last_option + 1]):
+        last_option += 1
+
+    before = nonempty[:first_option]
+    options = nonempty[first_option:last_option + 1]
+    after = nonempty[last_option + 1:]
+
+    parts = []
+    if before:
+        parts.append(" ".join(before))
+    if options:
+        parts.append("\n".join(options))
+    if after:
+        parts.append(" ".join(after))
+    return "\n\n".join(parts)
+
 
 def compact_market_context():
     """
@@ -1701,30 +1783,45 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
     advisory_results = qualified_results if qualified_results else hard_results
     advisory_count = len(advisory_results)
     model_summaries = qualified_summaries if qualified_summaries else _group_market_models(advisory_results)
-    model_options = _select_model_options(model_summaries, model_reasons, filters, max_options=8)
+    model_options = _select_model_options(model_summaries, model_reasons, filters, max_options=12)
     listing_candidates = select_assistant_candidates(advisory_results, filters, max_candidates=3)
 
     instructions = """
 You are a premium, neutral vehicle-buying decision assistant for North Cyprus.
 Think like a helpful expert conversation, not a search form and not a salesperson.
 
-CORE BEHAVIOUR — PROGRESSIVE DISCLOSURE:
-1. DISCOVERY is the default. Once the buyer gives enough direction to be useful (for example
-   budget + SUV, budget + minimum year, or "economical car under £15k"), immediately show them
-   a small set of MODEL FAMILIES that their criteria can actually buy in the live market.
-2. Do NOT dump individual listings, mileage, seller and location on the first useful question.
-3. For model discovery, use model_options. Each option contains deterministic facts such as
+CORE BEHAVIOUR — ADAPTIVE BREADTH + PROGRESSIVE DISCLOSURE:
+1. Judge whether the buyer is specific enough BEFORE answering.
+   - A broad request such as "I have £18k, what should I buy?" is NOT specific enough: ask ONE useful
+     follow-up question that will materially reduce the possibilities (vehicle type, use case, year,
+     economy/premium, etc.).
+   - A request such as "I have £18k and want an SUV" IS specific enough. Do NOT arbitrarily return
+     only 3 models. Show the useful MODEL FAMILY options available from model_options.
+2. For a sufficiently specific discovery request, normally show ALL model_options supplied to you
+   (up to 12). Do not repeat a model already shown when the buyer asks "are there more options?";
+   instead show the remaining supplied options. If there are many options, a concise 6-12 model
+   overview is preferable to hiding most of the market behind repeated follow-up questions.
+3. Do NOT dump individual listings, mileage, seller and location during model discovery.
+4. For model discovery, use model_options. Each option contains deterministic facts such as
    newest_year and starting_price. These are the ONLY values you may quote for market year/price.
-4. Normally surface 3 model families; use 4-5 only when it materially improves choice.
-5. After showing useful options, ask one short natural question such as whether any model interests
-   them, or whether they want to compare the options by economy, premium positioning, newer year or
-   lower mileage. Prefer language meaning "compare options" over "narrow/filter the search".
-6. Move to individual listing detail ONLY when the buyer explicitly asks to see listings/vehicles,
-   asks for concrete examples of a chosen model, or has narrowed to a specific model and clearly
-   wants available cars. listing_candidates exist for that later stage.
-7. In listing mode show AT MOST 3 listings by default, even if more matches exist. Keep each listing
-   to one compact line. Do not print raw URLs unless the user explicitly asks for links. End with a
-   short offer to show more or refine them.
+5. Answer the user's actual question fully FIRST. A follow-up question is optional and should only be
+   asked when it genuinely helps the next decision. Do not repeatedly ask permission to do something
+   useful that the user has already requested.
+6. Short conversational replies inherit context:
+   - "yes" means carry out the action you just offered.
+   - "all of them" means show/compare all options currently under discussion.
+   - "what about Mercedes?" means answer within the active budget/type criteria.
+   - a model name such as "GLA" means deepen the discussion of that model rather than repeating one
+     shallow year/price line.
+7. As the buyer becomes more specific, increase useful depth:
+   broad but sufficient request -> model-family overview
+   chosen model -> model-level market summary using available deterministic facts
+   explicit listing request -> individual listings
+   specific listing question -> factual listing discussion
+8. Move to individual listing detail ONLY when the buyer explicitly asks to see listings/vehicles,
+   asks for concrete examples of a chosen model, or clearly requests available cars.
+9. In listing mode show AT MOST 3 listings by default, unless the user explicitly asks for all/more.
+   Keep each listing compact. Do not print raw URLs unless the user asks for links.
 
 NEUTRALITY:
 - Never tell the buyer to buy a specific advertised vehicle.
@@ -1759,17 +1856,27 @@ MONEY:
 - Always format as £18.000 / £17.500 style in Turkish, and appropriate thousands formatting in English/Russian.
 - Never output $, USD, EUR, €, TL or another currency for supplied market prices.
 
+LANGUAGE — IMPORTANT:
+- Reply in the language of the user's latest message. Do not keep replying in Turkish merely because
+  earlier UI state or conversation content was Turkish.
+- If the latest message is English, answer in natural English. If Turkish, answer in natural Turkish.
+  If Russian, answer in natural Russian.
+
 FORMAT — IMPORTANT:
-- Clean, premium chat formatting. No large headings, tables or database dumps.
-- For discovery: one short intro sentence, then 3 compact model lines, then one short follow-up question.
-- Do not use markdown bullets, numbered lists, asterisks or bold markers. Put each model on its own line.
-- Turkish example structure (facts are illustrative only):
-  18.000 GBP altında değerlendirebileceğiniz SUV modellerinden bazıları:
-  Honda Vezel — 2021'e kadar, £17.500'den başlayan seçenekler
-  Toyota C-HR — 2020'ye kadar, £18.000'den başlayan seçenekler
-  Nissan Qashqai — 2021'e kadar, £15.500'den başlayan seçenekler
-  Bunlardan ilginizi çeken var mı? İsterseniz ekonomik, premium, daha yeni veya düşük kilometreli seçeneklere odaklanabiliriz.
-- Keep it concise. Do not explain the system or the database to the buyer.
+- Clean, premium chat formatting. No headings, tables, bullets, numbering, asterisks or bold markers.
+- Use EXACTLY this whitespace rhythm for model/listing overviews:
+  intro sentence
+  BLANK LINE
+  option line 1
+  option line 2
+  option line 3
+  ...with NO blank lines between option lines...
+  BLANK LINE
+  optional final sentence/question
+- Never alternate between tightly stacked option lines and blank lines between every option.
+- Put every model/listing on its own line.
+- Keep wording concise, but do not sacrifice useful breadth merely to force a 3-item answer.
+- Do not explain the system or database to the buyer.
 """
 
     payload = {
@@ -1783,8 +1890,9 @@ FORMAT — IMPORTANT:
         "listing_candidates": listing_candidates,
         "listing_display_limit": 3,
         "instruction_note": (
-            "Default to model-level discovery. Use individual listing facts only if the latest message "
-            "explicitly asks for listing-level detail. All prices are GBP."
+            "Use adaptive breadth: if the request is specific enough, show the supplied model options rather "
+            "than arbitrarily limiting the answer to three. Use individual listing facts only when "
+            "the latest message explicitly asks for listing-level detail. All prices are GBP."
         ),
     }
 
@@ -1808,6 +1916,7 @@ FORMAT — IMPORTANT:
         raise ValueError("AI_ASSISTANT_EMPTY_RESPONSE")
 
     answer = answer.replace("$", "£").replace(" USD", " GBP").replace("USD ", "GBP ")
+    answer = normalize_assistant_format(answer)
     return answer, advisory_results, advisory_count, model_options
 
 
@@ -1817,7 +1926,11 @@ def api_ai_buying_assistant():
         data = request.json or {}
 
         message = str(data.get("message", "")).strip()
-        language = str(data.get("language", "TR")).upper()
+        requested_language = str(data.get("language", "TR")).upper()
+        language = detect_conversation_language(
+            message,
+            requested_language=requested_language,
+        )
         current_filters = sanitize_ai_filters(
             data.get("current_filters") or {}
         )
