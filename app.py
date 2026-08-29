@@ -434,41 +434,74 @@ AI_FILTER_KEYS = {
     "max_km",
 }
 
-def detect_conversation_language(message, requested_language="TR"):
-    """
-    Follow the language the user actually typed.
+def sanitize_conversation_history(history, max_messages=16):
+    """Keep only a compact, safe recent chat context for interpretation/response quality."""
+    if not isinstance(history, list):
+        return []
 
-    The UI language remains a fallback, but an English or Russian message should
-    receive an English or Russian answer even if the frontend is currently set to TR.
-    """
-    text = str(message or "").strip()
+    cleaned = []
+    for item in history[-max_messages:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        text = str(item.get("text") or item.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not text:
+            continue
+        cleaned.append({
+            "role": role,
+            "text": text[:2500],
+        })
+    return cleaned
+
+
+def _detect_message_language(text):
+    text = str(text or "").strip()
     if not text:
-        return str(requested_language or "TR").upper()
+        return None
 
     low = text.casefold()
 
-    # Cyrillic is an unambiguous Russian signal.
     if re.search(r"[\u0400-\u04FF]", text):
         return "RU"
 
-    # Turkish-specific characters/very common function words are strong TR signals.
     if re.search(r"[çğıöşüÇĞİÖŞÜ]", text) or re.search(
-        r"\b(istiyorum|olsun|bakıyorum|bütçe|araç|araba|motosiklet|hangisi|hepsine|evet|hayır|yok|var mı|şart değil)\b",
+        r"\b(istiyorum|olsun|bakıyorum|bütçe|araç|araba|motosiklet|hangisi|hepsine|"
+        r"evet|hayır|yok|var mı|şart değil|istemiyorum|karşılaştır|göster)\b",
         low,
     ):
         return "TR"
 
-    # Common English conversational vocabulary. This intentionally catches short
-    # follow-ups such as "yes", "all of them", "what about Mercedes?" and "GLA".
     if re.search(
-        r"\b(i|want|buy|suv|what|can|i get|are there|more|options|yes|no|all|them|"
-        r"what about|show|compare|cheaper|newer|which|mercedes|please|under|budget)\b",
+        r"\b(i|want|buy|suv|what|can|could|get|are|there|more|options|yes|no|all|them|"
+        r"what about|show|compare|cheaper|newer|which|please|under|budget|available|"
+        r"have|with|without|looking|find|tell|me|cars?|vehicles?)\b",
         low,
     ):
         return "EN"
 
-    return str(requested_language or "TR").upper()
+    return None
 
+
+def detect_conversation_language(message, requested_language="TR", conversation_history=None):
+    """
+    Follow the language the buyer is actually using.
+
+    Short follow-ups such as "GLA", "yes" or a bare brand inherit the most recent
+    detectable user language instead of snapping back to the UI default.
+    """
+    current = _detect_message_language(message)
+    if current:
+        return current
+
+    for item in reversed(conversation_history or []):
+        if str(item.get("role") or "").lower() != "user":
+            continue
+        detected = _detect_message_language(item.get("text"))
+        if detected:
+            return detected
+
+    requested = str(requested_language or "TR").upper()
+    return requested if requested in {"TR", "EN", "RU"} else "TR"
 
 def normalize_assistant_format(answer):
     """
@@ -633,7 +666,7 @@ def sanitize_ai_filters(raw_filters):
     return clean
 
 
-def interpret_market_query(message, current_filters=None, language="TR"):
+def interpret_market_query(message, current_filters=None, language="TR", conversation_history=None):
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY_NOT_CONFIGURED")
 
@@ -701,12 +734,23 @@ Important rules:
 - Do not use clarification_question merely to ask for budget, year, vehicle type, brand,
   model or mileage because the guided narrowing flow handles those choices.
 - "clarification_question" should be short and in the user's language.
+- Use recent_conversation ONLY to resolve terse follow-ups/corrections such as "yes", "all of them",
+  "more?", "Mercedes?", "No Mercedes", "GLA", "cheaper" or "newer". Do not re-create old hard
+  filters from prose history; current_filters is the authoritative persisted hard state.
+- A short bare brand/model availability challenge such as "Mercedes?", "No Mercedes", "no BMW?",
+  "Mercedes yok mu?" means "are there any?" unless the user clearly expresses exclusion intent.
+  Treat it as an INCLUDE/query for that brand/model, preserving the other active criteria.
+- Only exclude a brand when intent is explicit, e.g. "I don't want Mercedes", "exclude Mercedes",
+  "without Mercedes", "Mercedes istemiyorum", "Mercedes olmasın", "Mercedes hariç".
+- If the user corrects a misunderstanding ("No, I meant is there not Mercedes"), prefer the corrected
+  availability intent and clear any contradictory brand exclusion introduced by the prior turn.
 """
 
     user_payload = {
         "language": language,
         "latest_message": message,
         "current_filters": current_filters,
+        "recent_conversation": sanitize_conversation_history(conversation_history),
         "market_context": market_context,
     }
 
@@ -1410,22 +1454,32 @@ def _group_market_models(results, max_groups=350):
             "count": 0,
             "prices": [],
             "years": [],
+            "year_prices": {},
             "kms": [],
             "transmissions": set(),
             "locations": set(),
         })
         bucket["count"] += 1
 
+        parsed_price = None
+        parsed_year = None
+
         try:
             if item.get("price") is not None:
-                bucket["prices"].append(float(item["price"]))
+                parsed_price = float(item["price"])
+                bucket["prices"].append(parsed_price)
         except (TypeError, ValueError):
-            pass
+            parsed_price = None
+
         try:
             if item.get("year") is not None:
-                bucket["years"].append(int(item["year"]))
+                parsed_year = int(item["year"])
+                bucket["years"].append(parsed_year)
         except (TypeError, ValueError):
-            pass
+            parsed_year = None
+
+        if parsed_price is not None and parsed_year is not None:
+            bucket["year_prices"].setdefault(parsed_year, []).append(parsed_price)
         try:
             if item.get("km") is not None:
                 bucket["kms"].append(int(item["km"]))
@@ -1443,6 +1497,7 @@ def _group_market_models(results, max_groups=350):
     for bucket in grouped.values():
         prices = bucket.pop("prices")
         years = bucket.pop("years")
+        year_prices = bucket.pop("year_prices")
         kms = bucket.pop("kms")
         bucket["transmissions"] = sorted(bucket["transmissions"])
         bucket["locations"] = sorted(bucket["locations"])
@@ -1450,6 +1505,23 @@ def _group_market_models(results, max_groups=350):
         bucket["highest_price"] = max(prices) if prices else None
         bucket["oldest_year"] = min(years) if years else None
         bucket["newest_year"] = max(years) if years else None
+
+        newest_year = bucket["newest_year"]
+        newest_prices = year_prices.get(newest_year, []) if newest_year is not None else []
+        bucket["newest_year_starting_price"] = min(newest_prices) if newest_prices else None
+        bucket["newest_year_highest_price"] = max(newest_prices) if newest_prices else None
+        bucket["newest_year_count"] = len(newest_prices)
+
+        if prices and years and year_prices:
+            overall_start = bucket["starting_price"]
+            cheapest_years = [
+                year for year, vals in year_prices.items()
+                if vals and min(vals) == overall_start
+            ]
+            bucket["starting_price_year"] = max(cheapest_years) if cheapest_years else None
+        else:
+            bucket["starting_price_year"] = None
+
         bucket["lowest_km"] = min(kms) if kms else None
         bucket["highest_km"] = max(kms) if kms else None
         summaries.append(bucket)
@@ -1477,6 +1549,7 @@ def _qualification_cache_key(filters, preferences, model_market):
             str(m.get("model") or "").casefold(),
             int(m.get("count") or 0),
             int(m.get("newest_year") or 0),
+            float(m.get("newest_year_starting_price") or 0),
             float(m.get("starting_price") or 0),
         )
         for m in model_market
@@ -1744,7 +1817,7 @@ def select_assistant_candidates(results, filters, max_candidates=3):
     return chosen[:max_candidates]
 
 
-def generate_grounded_market_answer(message, language, filters, preferences, search_result):
+def generate_grounded_market_answer(message, language, filters, preferences, search_result, conversation_history=None):
     """Progressive-disclosure buying advice grounded in deterministic market data."""
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY_NOT_CONFIGURED")
@@ -1784,45 +1857,43 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
     advisory_results = qualified_results if qualified_results else hard_results
     advisory_count = len(advisory_results)
     model_summaries = qualified_summaries if qualified_summaries else _group_market_models(advisory_results)
-    model_options = _select_model_options(model_summaries, model_reasons, filters, max_options=12)
+    model_options = _select_model_options(model_summaries, model_reasons, filters, max_options=20)
     listing_candidates = select_assistant_candidates(advisory_results, filters, max_candidates=3)
 
     instructions = """
 You are a premium, neutral vehicle-buying decision assistant for North Cyprus.
 Think like a helpful expert conversation, not a search form and not a salesperson.
 
-CORE BEHAVIOUR — ADAPTIVE BREADTH + PROGRESSIVE DISCLOSURE:
-1. Judge whether the buyer is specific enough BEFORE answering.
-   - A broad request such as "I have £18k, what should I buy?" is NOT specific enough: ask ONE useful
-     follow-up question that will materially reduce the possibilities (vehicle type, use case, year,
-     economy/premium, etc.).
-   - A request such as "I have £18k and want an SUV" IS specific enough. Do NOT arbitrarily return
-     only 3 models. Show the useful MODEL FAMILY options available from model_options.
-2. For a sufficiently specific discovery request, normally show ALL model_options supplied to you
-   (up to 12). Do not repeat a model already shown when the buyer asks "are there more options?";
-   instead show the remaining supplied options. If there are many options, a concise 6-12 model
-   overview is preferable to hiding most of the market behind repeated follow-up questions.
-3. Do NOT dump individual listings, mileage, seller and location during model discovery.
-4. For model discovery, use model_options. Each option contains deterministic facts such as
-   newest_year and starting_price. These are the ONLY values you may quote for market year/price.
-5. Answer the user's actual question fully FIRST. A follow-up question is optional and should only be
-   asked when it genuinely helps the next decision. Do not repeatedly ask permission to do something
-   useful that the user has already requested.
-6. Short conversational replies inherit context:
-   - "yes" means carry out the action you just offered.
-   - "all of them" means show/compare all options currently under discussion.
-   - "what about Mercedes?" means answer within the active budget/type criteria.
-   - a model name such as "GLA" means deepen the discussion of that model rather than repeating one
-     shallow year/price line.
-7. As the buyer becomes more specific, increase useful depth:
-   broad but sufficient request -> model-family overview
-   chosen model -> model-level market summary using available deterministic facts
-   explicit listing request -> individual listings
+CORE BEHAVIOUR — PREMIUM DECISION ASSISTANT:
+1. Decide whether the buyer has supplied enough information to make a useful answer.
+   - Too broad: "I have £18k, what should I buy?" -> ask ONE high-value follow-up question.
+   - Specific enough: "I have £18k and want an SUV" -> answer now with a substantial market overview.
+   Never ask a follow-up merely to reduce an already-useful answer to an arbitrary 3 models.
+2. When specific enough, surface a BROAD, useful set of model families from model_options.
+   - Normally show 8-12 options when that many exist.
+   - If the buyer explicitly asks for ALL options, show all supplied model_options (up to 20).
+   - If the buyer asks "more?", use recent_conversation to avoid repeating models already shown and
+     show additional supplied options. If none remain, say so plainly.
+3. Answer the user's actual question FIRST. Follow-up questions are optional, not mandatory.
+   Do not create permission loops ("shall I...?", "would you like...?") when the user has already
+   asked for the action.
+4. Short replies inherit conversational meaning from recent_conversation:
+   - "yes" executes the action just offered.
+   - "all of them" means all currently relevant options.
+   - "Mercedes?" / "No Mercedes?" means check Mercedes within active criteria, not exclude it.
+   - a model name such as "GLA" means deepen into that model's current market.
+5. Progressive depth:
+   broad insufficient request -> one clarifying question
+   sufficient request -> broad model-family overview
+   chosen brand/model -> useful model-market summary
+   explicit listing request -> concrete listings
    specific listing question -> factual listing discussion
-8. Move to individual listing detail ONLY when the buyer explicitly asks to see listings/vehicles,
-   asks for concrete examples of a chosen model, or clearly requests available cars.
-9. In listing mode show AT MOST 3 listings by default, unless the user explicitly asks for all/more.
-   Keep each listing compact. Do not print raw URLs unless the user asks for links.
+6. For a chosen model, give genuinely useful market context from the supplied facts: matching count,
+   newest matching year, price of the cheapest listing IN THAT NEWEST YEAR, overall asking-price
+   floor/range, mileage range if available, and transmissions if available. Do not merely repeat one
+   shallow "newest year + overall starting price" line.
+7. Individual listing mode is for explicit listing requests. Show up to 3 by default; show more/all
+   only when the user explicitly asks. Never print raw URLs unless requested.
 
 NEUTRALITY:
 - Never tell the buyer to buy a specific advertised vehicle.
@@ -1847,9 +1918,16 @@ GROUNDING:
 - model_options and listing_candidates come from the live deterministic market search.
 - Never invent a model, price, year, mileage, seller, location, transmission or count.
 - Never mention a model that is not in model_options during discovery.
-- "starting_price" means the lowest current asking price among matching listings for that model.
-- "newest_year" means the newest model year among matching listings for that model.
-- Do NOT imply the starting-price vehicle is also the newest-year vehicle; they are aggregate facts.
+- "starting_price" is the lowest asking price across ALL matching listings for that model.
+- "starting_price_year" is the model year attached to that overall cheapest asking-price level.
+- "newest_year" is the newest matching model year.
+- "newest_year_starting_price" is the cheapest asking price specifically among listings of newest_year.
+- These facts are intentionally separate. NEVER write "up to 2021, starting from £11,000" when
+  £11,000 belongs to an older year. That wording falsely implies a 2021 can be bought for £11,000.
+- Preferred concise model line in English:
+  Mazda CX-3 — newest: 2021 from £X · overall from £Y · N listings
+  Omit any component whose supplied value is null.
+- Equivalent natural phrasing should be used in Turkish/Russian.
 - If a requested vehicle type is present, all surfaced models must satisfy it.
 
 MONEY:
@@ -1864,25 +1942,23 @@ LANGUAGE — IMPORTANT:
   If Russian, answer in natural Russian.
 
 FORMAT — IMPORTANT:
-- Clean, premium chat formatting. No headings, tables, bullets, numbering, asterisks or bold markers.
-- Use EXACTLY this whitespace rhythm for model/listing overviews:
-  intro sentence
+- Clean, premium chat formatting. No markdown bullets, numbering, asterisks or bold markers.
+- For an option overview use exactly:
+  one concise intro paragraph
   BLANK LINE
-  option line 1
-  option line 2
-  option line 3
-  ...with NO blank lines between option lines...
+  one model per line, with NO blank lines between model lines
   BLANK LINE
-  optional final sentence/question
-- Never alternate between tightly stacked option lines and blank lines between every option.
-- Put every model/listing on its own line.
-- Keep wording concise, but do not sacrifice useful breadth merely to force a 3-item answer.
+  one concise synthesis/next-step paragraph only when it adds value
+- Keep terminology stable inside one conversation. Prefer "newest" + "overall from" consistently in
+  English rather than alternating among "up to", "newest year" and "starting from".
+- Do not hide useful options merely to make the answer shorter.
 - Do not explain the system or database to the buyer.
 """
 
     payload = {
         "language": language,
         "latest_message": message,
+        "recent_conversation": sanitize_conversation_history(conversation_history),
         "active_hard_filters": filters,
         "soft_preferences": preferences,
         "hard_filter_count": hard_count,
@@ -1927,10 +2003,14 @@ def api_ai_buying_assistant():
         data = request.json or {}
 
         message = str(data.get("message", "")).strip()
+        conversation_history = sanitize_conversation_history(
+            data.get("conversation_history") or []
+        )
         requested_language = str(data.get("language", "TR")).upper()
         language = detect_conversation_language(
             message,
             requested_language=requested_language,
+            conversation_history=conversation_history,
         )
         current_filters = sanitize_ai_filters(
             data.get("current_filters") or {}
@@ -1947,6 +2027,7 @@ def api_ai_buying_assistant():
             message=message,
             current_filters=current_filters,
             language=language,
+            conversation_history=conversation_history,
         )
 
         next_filters = apply_interpretation_to_filters(
@@ -2032,6 +2113,7 @@ def api_ai_buying_assistant():
             filters=next_filters,
             preferences=next_preferences,
             search_result=search_result,
+            conversation_history=conversation_history,
         )
 
         public_results = (advisory_results or search_result.get("results") or [])[:100]
