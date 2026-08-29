@@ -1174,12 +1174,19 @@ def guided_narrowing_question(filters, preferences, count, language="TR"):
 
     # Once the buyer has provided two meaningful dimensions, start helping with
     # real market options instead of automatically asking another question.
+    # A genuine buying preference (economy, luxury, practicality, family use, etc.)
+    # counts as a dimension too: "£15k economical" is already useful enough.
+    has_soft_priority = any(
+        str(p).strip().casefold().startswith(("priority:", "use_case:"))
+        for p in (preferences or [])
+    )
     supplied = sum([
         bool(has_budget),
         bool(has_year),
         bool(has_vehicle_type),
         bool(has_brand_model),
         bool(has_other_hard_constraint),
+        bool(has_soft_priority),
     ])
     if supplied >= 2:
         return None
@@ -1466,7 +1473,7 @@ def _select_model_options(model_summaries, reasons, filters, max_options=8):
     return chosen[:max_options]
 
 
-def select_assistant_candidates(results, filters, max_candidates=24):
+def select_assistant_candidates(results, filters, max_candidates=3):
     """Choose factual listing rows only for explicit listing-level follow-up."""
     if not results:
         return []
@@ -1543,7 +1550,7 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
     advisory_count = len(advisory_results)
     model_summaries = qualified_summaries if qualified_summaries else _group_market_models(advisory_results)
     model_options = _select_model_options(model_summaries, model_reasons, filters, max_options=8)
-    listing_candidates = select_assistant_candidates(advisory_results, filters, max_candidates=18)
+    listing_candidates = select_assistant_candidates(advisory_results, filters, max_candidates=3)
 
     instructions = """
 You are a premium, neutral vehicle-buying decision assistant for North Cyprus.
@@ -1558,18 +1565,30 @@ CORE BEHAVIOUR — PROGRESSIVE DISCLOSURE:
    newest_year and starting_price. These are the ONLY values you may quote for market year/price.
 4. Normally surface 3 model families; use 4-5 only when it materially improves choice.
 5. After showing useful options, ask one short natural question such as whether any model interests
-   them, or whether they want to prioritise economy, premium feel, newer year or lower mileage.
+   them, or whether they want to compare the options by economy, premium positioning, newer year or
+   lower mileage. Prefer language meaning "compare options" over "narrow/filter the search".
 6. Move to individual listing detail ONLY when the buyer explicitly asks to see listings/vehicles,
    asks for concrete examples of a chosen model, or has narrowed to a specific model and clearly
    wants available cars. listing_candidates exist for that later stage.
+7. In listing mode show AT MOST 3 listings by default, even if more matches exist. Keep each listing
+   to one compact line. Do not print raw URLs unless the user explicitly asks for links. End with a
+   short offer to show more or refine them.
 
 NEUTRALITY:
 - Never tell the buyer to buy a specific advertised vehicle.
 - Never call a listing good, safe, reliable, problem-free, high-quality, best value or mechanically sound.
 - Do not rank individual listings as "best".
-- Model-level positioning may be discussed cautiously: economical, premium/luxury, practical,
-  sporty, compact, family-oriented, etc. Make clear this is general model-level context, not a
-  verified property of a specific advertised vehicle.
+- If asked which vehicle/model is definitely reliable, problem-free, safe, guaranteed, or which one
+  they should definitely buy, DO NOT substitute different models based on general reputation and do
+  not endorse one. Explain briefly that listing data cannot verify condition/history, then offer to
+  compare the models already under discussion on objective market facts. Mention inspection/service
+  history only as a sensible verification step, not as proof of condition.
+- Model-level positioning may be discussed cautiously when the buyer asks for comparison or a
+  soft preference such as economical, premium/luxury, practical, sporty or family-oriented.
+- During initial discovery, keep model lines factual: model name, newest matching year and starting
+  asking price. Do not append sales-like adjectives such as balanced, quality, comfortable, best,
+  low ownership cost, good choice or driving-focused unless the buyer explicitly asks to compare
+  characteristics and the statement is clearly model-level general context.
 - If the buyer says "economic/economical/ekonomik", help identify suitable real model families.
 - If they say "luxury/premium/lüks", help identify premium-positioned real model families.
 - Hard facts about the current market always override general automotive knowledge.
@@ -1610,6 +1629,7 @@ FORMAT — IMPORTANT:
         "preference_qualified_count": advisory_count if qualified_results else None,
         "model_options": model_options,
         "listing_candidates": listing_candidates,
+        "listing_display_limit": 3,
         "instruction_note": (
             "Default to model-level discovery. Use individual listing facts only if the latest message "
             "explicitly asks for listing-level detail. All prices are GBP."
