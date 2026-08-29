@@ -550,6 +550,9 @@ Important rules:
 - Treat words such as economical/economic/ekonomik/fuel-efficient/az yakan as priority:economy.
 - Treat luxury/premium/lüks as priority:luxury.
 - Treat comfortable/konforlu as priority:comfort and practical/pratik as priority:practicality.
+- Treat sporty/sportif/performance/performance-oriented/performans as priority:performance.
+- When the latest message changes vehicle type (for example SUV -> motorcycle or SUV -> small car), return only the NEW vehicle_type tag; the application will replace the previous vehicle_type preference.
+- When the user says a previous vehicle type is no longer required (for example "SUV olmasına gerek yok"), add any_vehicle_type unless they also specify a replacement vehicle type in the same message.
 - If the user explicitly says they have no brand/model preference, add "any_brand_model".
 - If they explicitly say they have no year or mileage restriction, add "any_year_km".
 - If they explicitly say any vehicle type is fine, add "any_vehicle_type".
@@ -1122,17 +1125,38 @@ def apply_interpretation_to_filters(previous_filters, interpretation):
 
 def merge_preferences(previous_preferences, new_preferences):
     """
-    Keep soft user preferences across turns without duplicating them.
+    Keep soft preferences across turns, but treat vehicle type as a replaceable
+    conversational state rather than an accumulating tag.
     """
+    previous = [str(v).strip() for v in (previous_preferences or []) if str(v).strip()]
+    incoming = [str(v).strip() for v in (new_preferences or []) if str(v).strip()]
+    incoming_cf = [v.casefold() for v in incoming]
+
+    incoming_vehicle_types = [
+        v for v in incoming if v.casefold().startswith("vehicle_type:")
+    ]
+    incoming_any_vehicle = "any_vehicle_type" in incoming_cf
+
+    # A new explicit vehicle type replaces the old one. "Any vehicle type"
+    # clears all old vehicle-type restrictions.
+    if incoming_vehicle_types or incoming_any_vehicle:
+        previous = [
+            v for v in previous
+            if not v.casefold().startswith("vehicle_type:")
+            and v.casefold() != "any_vehicle_type"
+        ]
+
+    # If a concrete new type is supplied, do not retain any_vehicle_type.
+    if incoming_vehicle_types:
+        incoming = [v for v in incoming if v.casefold() != "any_vehicle_type"]
+
     merged = []
-
-    for value in list(previous_preferences or []) + list(new_preferences or []):
-        value = str(value).strip()
-
-        if value and value.casefold() not in {
-            existing.casefold() for existing in merged
-        }:
+    seen = set()
+    for value in previous + incoming:
+        key = value.casefold()
+        if key not in seen:
             merged.append(value)
+            seen.add(key)
 
     return merged
 
@@ -1304,6 +1328,32 @@ def _group_market_models(results, max_groups=350):
     return summaries[:max_groups]
 
 
+_MODEL_QUALIFICATION_CACHE = {}
+_MODEL_QUALIFICATION_CACHE_MAX = 200
+
+
+def _qualification_cache_key(filters, preferences, model_market):
+    # Includes the actual market families/aggregates, so a refreshed market naturally
+    # produces a different key without coupling this cache to the valuation dataset.
+    market_signature = tuple(
+        (
+            str(m.get("brand") or "").casefold(),
+            str(m.get("model") or "").casefold(),
+            int(m.get("count") or 0),
+            int(m.get("newest_year") or 0),
+            float(m.get("starting_price") or 0),
+        )
+        for m in model_market
+    )
+    relevant_prefs = tuple(sorted(
+        str(p).strip().casefold()
+        for p in (preferences or [])
+        if str(p).strip().casefold().startswith(("vehicle_type:", "priority:", "use_case:"))
+    ))
+    hard_signature = json.dumps(filters or {}, ensure_ascii=False, sort_keys=True, default=str)
+    return (hard_signature, relevant_prefs, market_signature)
+
+
 def shortlist_models_for_preferences(message, language, filters, preferences, results):
     """Qualify/rank only real model families against soft intent and vehicle type."""
     preferences = list(preferences or [])
@@ -1315,6 +1365,20 @@ def shortlist_models_for_preferences(message, language, filters, preferences, re
     model_market = _group_market_models(results)
     if not model_market:
         return [], [], []
+
+    cache_key = _qualification_cache_key(filters, preferences, model_market)
+    cached = _MODEL_QUALIFICATION_CACHE.get(cache_key)
+    if cached is not None:
+        selected_keys, reasons, selected_summaries = cached
+        selected_set = set(selected_keys)
+        qualified = [
+            item for item in (results or [])
+            if (
+                str(item.get("brand") or "").strip().casefold(),
+                str(item.get("model") or "").strip().casefold(),
+            ) in selected_set
+        ]
+        return qualified, list(reasons), list(selected_summaries)
 
     # If there is no soft preference, every hard-filtered model family remains eligible.
     if not relevant_preferences:
@@ -1352,26 +1416,40 @@ Rules:
         "model_market": model_market,
     }
 
-    response = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": OPENAI_MODEL,
-            "instructions": instructions,
-            "input": json.dumps(payload, ensure_ascii=False),
-        },
-        timeout=45,
-    )
-    response.raise_for_status()
-    text = extract_response_text(response.json()).strip()
-    if not text:
+    response = None
+    last_error = None
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                "https://api.openai.com/v1/responses",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": OPENAI_MODEL,
+                    "instructions": instructions,
+                    "input": json.dumps(payload, ensure_ascii=False),
+                },
+                timeout=45,
+            )
+            response.raise_for_status()
+            break
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(0.6)
+
+    if response is None or not response.ok:
+        print(f"Model qualification request failed: {last_error}")
+        return [], [], []
+
+    response_text = extract_response_text(response.json()).strip()
+    if not response_text:
         return [], [], []
 
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(response_text)
         selected = parsed.get("models", []) if isinstance(parsed, dict) else []
     except Exception:
         return [], [], []
@@ -1412,6 +1490,17 @@ Rules:
             str(item.get("model") or "").strip().casefold(),
         ) in selected_set
     ]
+
+    # Cache the qualification for identical market/filter/preference state so the same
+    # buyer request does not produce a different eligible model universe on every turn.
+    if len(_MODEL_QUALIFICATION_CACHE) >= _MODEL_QUALIFICATION_CACHE_MAX:
+        _MODEL_QUALIFICATION_CACHE.pop(next(iter(_MODEL_QUALIFICATION_CACHE)))
+    _MODEL_QUALIFICATION_CACHE[cache_key] = (
+        tuple(selected_keys),
+        tuple(reasons),
+        tuple(selected_summaries),
+    )
+
     return qualified, reasons, selected_summaries
 
 
@@ -1434,13 +1523,23 @@ def _select_model_options(model_summaries, reasons, filters, max_options=8):
         )
         enriched.append(item)
 
-    # Preserve AI relevance ordering when soft preferences qualified the models.
+    # AI qualifies soft concepts; deterministic Python ordering decides what is surfaced.
+    # This makes identical market/filter state stable and favours newer options rather than
+    # allowing model ordering to vary from one generation call to another.
     if reasons:
-        order = {
-            (str(x.get("brand") or "").casefold(), str(x.get("model") or "").casefold()): i
-            for i, x in enumerate(reasons)
-        }
-        enriched.sort(key=lambda x: order.get((x["brand"].casefold(), x["model"].casefold()), 9999))
+        budget = filters.get("budget")
+        try:
+            ceiling = float(budget) if budget not in [None, ""] else None
+        except (TypeError, ValueError):
+            ceiling = None
+
+        def qualified_rank(x):
+            newest = int(x.get("newest_year") or 0)
+            start = float(x.get("starting_price") or 10**12)
+            budget_distance = abs(ceiling - start) if ceiling is not None else start
+            return (-newest, budget_distance, -int(x.get("count") or 0), x["brand"].casefold(), x["model"].casefold())
+
+        enriched.sort(key=qualified_rank)
         return enriched[:max_options]
 
     # Without a soft preference, provide a useful spread: represented, newest, and near budget.
@@ -1580,9 +1679,9 @@ NEUTRALITY:
 - Do not rank individual listings as "best".
 - If asked which vehicle/model is definitely reliable, problem-free, safe, guaranteed, or which one
   they should definitely buy, DO NOT substitute different models based on general reputation and do
-  not endorse one. Explain briefly that listing data cannot verify condition/history, then offer to
-  compare the models already under discussion on objective market facts. Mention inspection/service
-  history only as a sensible verification step, not as proof of condition.
+  not endorse one. State plainly that you cannot determine a definite purchase choice or guaranteed
+  condition from these data. Then offer an objective comparison of ONLY the models already under
+  discussion. Mention inspection/service history only as a sensible verification step, not as proof.
 - Model-level positioning may be discussed cautiously when the buyer asks for comparison or a
   soft preference such as economical, premium/luxury, practical, sporty or family-oriented.
 - During initial discovery, keep model lines factual: model name, newest matching year and starting
