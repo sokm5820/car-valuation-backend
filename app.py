@@ -5,8 +5,10 @@ import os
 import requests
 import io
 import threading
+import traceback
 import time
 import json
+import math
 
 # AI interpreter configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -477,11 +479,24 @@ def extract_response_text(payload):
 
 def sanitize_ai_filters(raw_filters):
     """
-    Never trust model output directly. Only allow fields supported by
-    market_search and normalize empty values away.
+    Never trust model/client filter values directly.
+
+    Numeric filters must remain scalar numbers and list filters must remain
+    arrays of strings. Malformed generative output such as {"max": 18000}
+    is rejected here so it can never reach market_search / float().
     """
     if not isinstance(raw_filters, dict):
         return {}
+
+    numeric_fields = {
+        "budget", "min_budget", "min_year", "max_year", "min_km", "max_km",
+    }
+    integer_fields = {"min_year", "max_year"}
+    list_fields = {
+        "brands", "exclude_brands", "models", "exclude_models",
+        "categories", "exclude_categories", "locations", "exclude_locations",
+        "companies", "exclude_companies", "transmissions", "colors",
+    }
 
     clean = {}
 
@@ -492,7 +507,45 @@ def sanitize_ai_filters(raw_filters):
         if value in [None, "", [], {}]:
             continue
 
-        clean[key] = value
+        if key in numeric_fields:
+            if isinstance(value, bool) or isinstance(value, (dict, list, tuple, set)):
+                print(f"IGNORING MALFORMED NUMERIC FILTER {key}: {value!r}", flush=True)
+                continue
+
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                print(f"IGNORING NON-NUMERIC FILTER {key}: {value!r}", flush=True)
+                continue
+
+            if not math.isfinite(number):
+                continue
+
+            clean[key] = int(number) if key in integer_fields else number
+            continue
+
+        if key in list_fields:
+            if isinstance(value, str):
+                values = [value]
+            elif isinstance(value, list):
+                values = value
+            else:
+                print(f"IGNORING MALFORMED LIST FILTER {key}: {value!r}", flush=True)
+                continue
+
+            normalized = []
+            seen = set()
+            for item in values:
+                if isinstance(item, (dict, list, tuple, set)):
+                    continue
+                text = str(item or "").strip()
+                key_text = text.casefold()
+                if text and key_text not in seen:
+                    normalized.append(text)
+                    seen.add(key_text)
+
+            if normalized:
+                clean[key] = normalized
 
     return clean
 
@@ -1765,7 +1818,9 @@ def api_ai_buying_assistant():
 
         message = str(data.get("message", "")).strip()
         language = str(data.get("language", "TR")).upper()
-        current_filters = data.get("current_filters") or {}
+        current_filters = sanitize_ai_filters(
+            data.get("current_filters") or {}
+        )
         current_preferences = data.get("current_preferences") or []
 
         if not message:
@@ -1917,6 +1972,7 @@ def api_ai_buying_assistant():
 
     except Exception as e:
         print("AI ASSISTANT FAILED:", repr(e), flush=True)
+        traceback.print_exc()
 
         return jsonify({
             "success": False,
