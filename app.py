@@ -9,6 +9,7 @@ import traceback
 import time
 import json
 import math
+import re
 
 # AI interpreter configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
