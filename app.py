@@ -545,7 +545,11 @@ Important rules:
 - Use short canonical preference tags whenever possible so they persist cleanly across turns:
   vehicle_type:SUV, vehicle_type:crossover, vehicle_type:pickup, vehicle_type:small_car,
   vehicle_type:motorcycle, use_case:commute, use_case:family, priority:economy,
-  priority:reliability, priority:performance.
+  priority:reliability, priority:performance, priority:luxury, priority:comfort,
+  priority:practicality.
+- Treat words such as economical/economic/ekonomik/fuel-efficient/az yakan as priority:economy.
+- Treat luxury/premium/lüks as priority:luxury.
+- Treat comfortable/konforlu as priority:comfort and practical/pratik as priority:practicality.
 - If the user explicitly says they have no brand/model preference, add "any_brand_model".
 - If they explicitly say they have no year or mileage restriction, add "any_year_km".
 - If they explicitly say any vehicle type is fine, add "any_vehicle_type".
@@ -756,7 +760,8 @@ def market_search(
     max_year=None,
     min_km=None,
     max_km=None,
-    limit=20
+    limit=20,
+    max_limit=100
 ):
     if not MARKET_READY or market_df is None or market_df.empty:
         return {
@@ -1017,9 +1022,16 @@ def market_search(
     except:
         limit = 20
 
+    try:
+        max_limit = int(max_limit)
+    except:
+        max_limit = 100
+
+    max_limit = max(1, min(max_limit, 5000))
+
     limit = max(
         1,
-        min(limit, 100)
+        min(limit, max_limit)
     )
 
     results_df = filtered.head(limit).copy()
@@ -1136,9 +1148,8 @@ def _preference_flags(preferences):
 
 
 def guided_narrowing_question(filters, preferences, count, language="TR"):
-    """Guide broad searches in two stages without turning the chat into a questionnaire."""
+    """Only guide when the request is genuinely too broad to be useful yet."""
     flags = _preference_flags(preferences)
-    count = int(count or 0)
 
     has_budget = filters.get("budget") not in [None, ""]
     has_year = bool(
@@ -1152,10 +1163,26 @@ def guided_narrowing_question(filters, preferences, count, language="TR"):
         filters.get("exclude_brands") or filters.get("exclude_models") or
         flags["any_brand_model"]
     )
-    has_max_km = bool(
+    has_other_hard_constraint = bool(
         filters.get("max_km") not in [None, ""] or
-        flags["any_year_km"]
+        filters.get("min_km") not in [None, ""] or
+        filters.get("transmissions") or
+        filters.get("locations") or
+        filters.get("companies") or
+        filters.get("exclude_companies")
     )
+
+    # Once the buyer has provided two meaningful dimensions, start helping with
+    # real market options instead of automatically asking another question.
+    supplied = sum([
+        bool(has_budget),
+        bool(has_year),
+        bool(has_vehicle_type),
+        bool(has_brand_model),
+        bool(has_other_hard_constraint),
+    ])
+    if supplied >= 2:
+        return None
 
     copy = {
         "TR": {
@@ -1163,96 +1190,255 @@ def guided_narrowing_question(filters, preferences, count, language="TR"):
             "budget": "maksimum bütçenizi",
             "year": "minimum model yılı beklentinizi",
             "type": "araç tipini (ör. SUV, pick-up, otomobil veya motosiklet)",
-            "secondary_intro": "Hâlâ oldukça fazla seçenek var. Aramayı biraz daha daraltabiliriz.",
-            "brand": "ilgilendiğiniz veya istemediğiniz marka/model",
-            "km": "maksimum kilometre",
         },
         "EN": {
             "intro": "To give you more relevant recommendations, I'd suggest narrowing the search a little.",
             "budget": "your maximum budget",
             "year": "your minimum year requirement",
             "type": "vehicle type (e.g. SUV, pickup, car or motorcycle)",
-            "secondary_intro": "There are still quite a lot of options. We can narrow the search a little further.",
-            "brand": "brands/models you are interested in or want to avoid",
-            "km": "maximum mileage",
         },
         "RU": {
             "intro": "Чтобы дать более точные рекомендации, я бы предложил немного сузить поиск.",
             "budget": "максимальный бюджет",
             "year": "минимальный год выпуска",
             "type": "тип транспорта (например SUV, пикап, автомобиль или мотоцикл)",
-            "secondary_intro": "Вариантов всё ещё довольно много. Можно немного сузить поиск.",
-            "brand": "интересующие или нежелательные марки/модели",
-            "km": "максимальный пробег",
         },
     }
     t = copy.get(language, copy["TR"])
 
-    # Stage 1: on a broad search, present the main missing dimensions together.
-    primary_missing = []
+    missing = []
     if not has_budget:
-        primary_missing.append(t["budget"])
+        missing.append(t["budget"])
     if not has_year:
-        primary_missing.append(t["year"])
+        missing.append(t["year"])
     if not has_vehicle_type:
-        primary_missing.append(t["type"])
+        missing.append(t["type"])
 
-    # Do this not only when the raw count is huge, but whenever the buyer has
-    # supplied fewer than two of the three primary dimensions.
-    primary_supplied = 3 - len(primary_missing)
-    if primary_missing and (count > 120 or primary_supplied < 2):
-        if language == "TR":
-            return f'{t["intro"]} ' + ", ".join(primary_missing) + " belirtebilirsiniz; bunlardan biri veya birkaçı yeterli olabilir."
-        if language == "RU":
-            return f'{t["intro"]} ' + ", ".join(primary_missing) + ". Можно указать один или несколько из этих параметров."
-        return f'{t["intro"]} You can add ' + ", ".join(primary_missing) + "; one or more of these may be enough."
+    if not missing:
+        return None
 
-    # Stage 2: if the market is still broad, offer secondary refinements together.
-    secondary_missing = []
-    if not has_brand_model:
-        secondary_missing.append(t["brand"])
-    if not has_max_km:
-        secondary_missing.append(t["km"])
+    if language == "TR":
+        details = ", ".join(missing)
+        details = details[:1].upper() + details[1:] if details else details
+        return f'{t["intro"]} ' + details + " belirtebilirsiniz; bunlardan biri veya birkaçı yeterli olabilir."
+    if language == "RU":
+        return f'{t["intro"]} ' + ", ".join(missing) + ". Можно указать один или несколько из этих параметров."
+    return f'{t["intro"]} You can add ' + ", ".join(missing) + "; one or more of these may be enough."
 
-    if count > 80 and secondary_missing:
-        if language == "TR":
-            return f'{t["secondary_intro"]} ' + " veya ".join(secondary_missing) + " gibi tercihlerinizi belirtebilirsiniz."
-        if language == "RU":
-            return f'{t["secondary_intro"]} ' + " или ".join(secondary_missing) + "."
-        return f'{t["secondary_intro"]} You can add ' + " or ".join(secondary_missing) + "."
 
-    return None
+def _group_market_models(results, max_groups=350):
+    """Compact hard-filter matches into brand/model market summaries for AI reasoning."""
+    grouped = {}
+
+    for item in results or []:
+        brand = str(item.get("brand") or "").strip()
+        model = str(item.get("model") or "").strip()
+        if not brand or not model:
+            continue
+
+        key = (brand.casefold(), model.casefold())
+        bucket = grouped.setdefault(key, {
+            "brand": brand,
+            "model": model,
+            "count": 0,
+            "prices": [],
+            "years": [],
+            "kms": [],
+            "categories": [],
+        })
+        bucket["count"] += 1
+
+        try:
+            if item.get("price") is not None:
+                bucket["prices"].append(float(item["price"]))
+        except (TypeError, ValueError):
+            pass
+        try:
+            if item.get("year") is not None:
+                bucket["years"].append(int(item["year"]))
+        except (TypeError, ValueError):
+            pass
+        try:
+            if item.get("km") is not None:
+                bucket["kms"].append(int(item["km"]))
+        except (TypeError, ValueError):
+            pass
+
+        category = str(item.get("category") or "").strip()
+        if category and category not in bucket["categories"] and len(bucket["categories"]) < 4:
+            bucket["categories"].append(category)
+
+    summaries = []
+    for bucket in grouped.values():
+        prices = bucket.pop("prices")
+        years = bucket.pop("years")
+        kms = bucket.pop("kms")
+        bucket["min_price"] = min(prices) if prices else None
+        bucket["max_price"] = max(prices) if prices else None
+        bucket["min_year"] = min(years) if years else None
+        bucket["max_year"] = max(years) if years else None
+        bucket["min_km"] = min(kms) if kms else None
+        bucket["max_km"] = max(kms) if kms else None
+        summaries.append(bucket)
+
+    # Keep the most represented model families if a very broad hard search produces
+    # hundreds of distinct models. This is only an AI context-size guard.
+    summaries.sort(key=lambda x: (-x["count"], x["brand"].casefold(), x["model"].casefold()))
+    return summaries[:max_groups]
+
+
+def shortlist_models_for_preferences(message, language, filters, preferences, results):
+    """Use automotive knowledge to qualify/rank real model families for soft buyer intent."""
+    preferences = list(preferences or [])
+    relevant_preferences = [
+        p for p in preferences
+        if str(p).casefold().startswith(("vehicle_type:", "priority:", "use_case:"))
+    ]
+
+    if not relevant_preferences:
+        return [], []
+
+    model_market = _group_market_models(results)
+    if not model_market:
+        return [], []
+
+    instructions = """
+You are the vehicle-model reasoning layer for a North Cyprus buying assistant.
+
+You are given model families that ALREADY satisfy the buyer's hard market filters
+(price, year, mileage, brand, location, etc.). Use general automotive knowledge only
+to decide which of those real model families fit the buyer's SOFT preferences.
+
+Rules:
+- Return JSON only in exactly this shape:
+  {"models":[{"brand":"...","model":"...","reason":"..."}]}
+- You may select ONLY brand/model pairs present in model_market.
+- A vehicle_type preference (SUV, crossover, pickup, motorcycle, small_car) is a REQUIRED
+  qualification when present. Do not select a sedan/hatchback when SUV is requested.
+- priority:economy means favour models generally known for economical running/fuel use;
+  hybrids may be relevant, but never invent an engine/trim that is not supported by the listing data.
+- priority:luxury means favour premium/luxury brands or models generally positioned as premium.
+- priority:reliability, priority:performance, priority:comfort and priority:practicality are
+  model-level preferences, not claims about the condition of a particular listing.
+- use_case:family / commute may be used as normal model-level automotive reasoning.
+- Select up to 12 useful model families, ordered from strongest fit to weaker fit.
+- Do not select something merely because it is cheapest.
+- Give each selected model a very short reason tag, not a sales pitch.
+"""
+
+    payload = {
+        "language": language,
+        "latest_message": message,
+        "hard_filters": filters,
+        "soft_preferences": relevant_preferences,
+        "model_market": model_market,
+    }
+
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": OPENAI_MODEL,
+            "instructions": instructions,
+            "input": json.dumps(payload, ensure_ascii=False),
+        },
+        timeout=45,
+    )
+    response.raise_for_status()
+    text = extract_response_text(response.json()).strip()
+    if not text:
+        return [], []
+
+    try:
+        parsed = json.loads(text)
+        selected = parsed.get("models", []) if isinstance(parsed, dict) else []
+    except Exception:
+        return [], []
+
+    valid_market = {
+        (m["brand"].casefold(), m["model"].casefold())
+        for m in model_market
+    }
+    selected_keys = []
+    reasons = []
+    for item in selected:
+        if not isinstance(item, dict):
+            continue
+        brand = str(item.get("brand") or "").strip()
+        model = str(item.get("model") or "").strip()
+        key = (brand.casefold(), model.casefold())
+        if brand and model and key in valid_market and key not in selected_keys:
+            selected_keys.append(key)
+            reasons.append({
+                "brand": brand,
+                "model": model,
+                "reason": str(item.get("reason") or "").strip(),
+            })
+        if len(selected_keys) >= 12:
+            break
+
+    if not selected_keys:
+        return [], []
+
+    qualified = [
+        item for item in (results or [])
+        if (str(item.get("brand") or "").strip().casefold(),
+            str(item.get("model") or "").strip().casefold()) in set(selected_keys)
+    ]
+    return qualified, reasons
 
 
 def select_assistant_candidates(results, filters, max_candidates=24):
-    """Choose a representative sample from the deterministic filtered market."""
+    """Choose useful real listings, including options near the buyer's budget ceiling."""
     if not results:
         return []
 
-    clean = sorted(
-        list(results),
-        key=lambda x: (
-            float(x.get("price") or 0),
-            -(int(x.get("year") or 0)),
-        )
-    )
-
-    if len(clean) <= max_candidates:
-        return clean
-
-    # Sample evenly across the filtered price distribution rather than handing
-    # the model only the cheapest rows.
+    clean = list(results)
+    budget = filters.get("budget")
     chosen = []
     seen = set()
-    for i in range(max_candidates):
-        idx = round(i * (len(clean) - 1) / max(max_candidates - 1, 1))
-        item = clean[idx]
-        identity = item.get("link") or (
-            item.get("brand"), item.get("model"), item.get("year"), item.get("price")
-        )
-        if identity not in seen:
-            chosen.append(item)
-            seen.add(identity)
+
+    def add(items):
+        for item in items:
+            identity = item.get("link") or (
+                item.get("brand"), item.get("model"), item.get("year"), item.get("price")
+            )
+            if identity not in seen:
+                chosen.append(item)
+                seen.add(identity)
+            if len(chosen) >= max_candidates:
+                return
+
+    # Give the AI genuine choices close to the stated ceiling instead of only cheap rows.
+    if budget not in [None, ""]:
+        try:
+            ceiling = float(budget)
+            near_budget = sorted(
+                clean,
+                key=lambda x: abs(ceiling - float(x.get("price") or 0))
+            )
+            add(near_budget[:10])
+        except (TypeError, ValueError):
+            pass
+
+    newest = sorted(
+        clean,
+        key=lambda x: (-(int(x.get("year") or 0)), float(x.get("price") or 0))
+    )
+    add(newest[:8])
+
+    low_km = sorted(
+        [x for x in clean if x.get("km") is not None],
+        key=lambda x: (int(x.get("km") or 0), -int(x.get("year") or 0))
+    )
+    add(low_km[:8])
+
+    if len(chosen) < max_candidates:
+        by_price = sorted(clean, key=lambda x: float(x.get("price") or 0))
+        add(by_price)
 
     return chosen[:max_candidates]
 
@@ -1264,62 +1450,97 @@ def generate_grounded_market_answer(
     preferences,
     search_result,
 ):
-    """
-    Generate a conversational answer grounded in the deterministic
-    market-search result. Current listings, prices, mileage, locations,
-    sellers, and counts may ONLY come from search_result.
-    """
+    """Create a helpful advisory answer grounded in real hard-filter market matches."""
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY_NOT_CONFIGURED")
 
-    count = int(search_result.get("count", 0) or 0)
-    results = search_result.get("results", []) or []
-    candidates = select_assistant_candidates(results, filters)
+    hard_count = int(search_result.get("count", 0) or 0)
+    hard_results = search_result.get("results", []) or []
 
-    if count == 0:
+    if hard_count == 0:
         fallback = {
             "TR": "Bu kriterlere uyan aktif ilan bulamadım. İsterseniz kriterlerden birini esnetebiliriz.",
             "EN": "I couldn't find an active listing matching those criteria. We can loosen one of the filters if you like.",
             "RU": "Я не нашёл активных объявлений по этим критериям. Можно немного ослабить один из фильтров.",
         }
+        return fallback.get(language, fallback["TR"]), [], 0
 
-        return fallback.get(language, fallback["TR"])
+    qualified_results, model_reasons = shortlist_models_for_preferences(
+        message=message,
+        language=language,
+        filters=filters,
+        preferences=preferences,
+        results=hard_results,
+    )
+
+    # When soft preferences were supplied, recommendation evidence should come
+    # from the qualified model families only. If none qualify, say so rather
+    # than silently recommending the wrong body type/intent.
+    has_soft_advisory_pref = any(
+        str(p).casefold().startswith(("vehicle_type:", "priority:", "use_case:"))
+        for p in (preferences or [])
+    )
+
+    if has_soft_advisory_pref and not qualified_results:
+        fallback = {
+            "TR": "Belirttiğiniz tercihleri mevcut kriterlerle birlikte karşılayan uygun bir model seçeneği bulamadım. Bütçe, yıl, kilometre veya araç tipi kriterlerinden birini esnetebiliriz.",
+            "EN": "I couldn't identify a suitable model that satisfies both your current filters and preferences. We can loosen the budget, year, mileage or vehicle-type requirement.",
+            "RU": "Я не нашёл подходящую модель, которая одновременно соответствует вашим фильтрам и предпочтениям. Можно ослабить бюджет, год, пробег или тип автомобиля.",
+        }
+        return fallback.get(language, fallback["TR"]), [], 0
+
+    advisory_results = qualified_results if qualified_results else hard_results
+    advisory_count = len(advisory_results)
+    candidates = select_assistant_candidates(advisory_results, filters)
 
     instructions = """
-You are the conversational intelligence layer for a North Cyprus vehicle-buying assistant.
+You are a decision-support assistant for people buying vehicles in North Cyprus.
+Your job is to HELP THE BUYER DECIDE, not merely report filters or keep asking questions.
 
-Use the supplied deterministic market data as the only source of truth for current listings,
-prices, mileage, locations, sellers, transmissions and result counts. Never invent listing facts.
-General model-level automotive knowledge may be used cautiously for soft preferences such as
-economy or reliability, but never present it as verified condition or performance of an individual listing.
+GROUNDING:
+- Current listing facts (price, year, mileage, seller, location, transmission and availability)
+  may ONLY come from supplied_results / supplied market counts. Never invent listing facts.
+- General automotive knowledge MAY be used at model level to explain soft concepts such as
+  economical, premium/luxury, practical, sporty, comfortable, family-friendly or reliable.
+- Never turn model-level reputation into a claim about the mechanical condition of a particular listing.
 
-STYLE — IMPORTANT:
+BE PROACTIVE:
+- If the buyer has given enough information to identify useful options, immediately mention up to
+  3 relevant brands/models that genuinely fit the supplied market evidence.
+- A budget + vehicle type is already enough to begin helping. Do not insist on brand or mileage first.
+- When a budget ceiling exists, prefer showing some realistic options near that ceiling as well as
+  useful alternatives below it; do not simply recommend the cheapest rows.
+- If many matches exist, this is NOT a reason by itself to refuse recommendations. Give useful
+  model options first, then optionally ask ONE natural follow-up about a meaningful trade-off
+  (e.g. newer year vs lower mileage, economy vs luxury, preferred brand).
+- If the user says SUV/pickup/motorcycle/etc., never recommend a different vehicle type and never
+  ask whether that type is actually required: it is already part of their stated preference.
+
+MONEY:
+- ALL market prices are GBP. Always format prices with £ or GBP.
+- NEVER use $, USD, €, EUR, TL or another currency symbol for supplied market prices.
+
+STYLE:
 - Answer in the requested language.
-- Be brief: normally 1-3 short sentences. Only expand if the user asks for detail.
-- Do NOT output URLs, links, markdown links, or raw listing URLs. Links are UI data only.
-- Do NOT dump a list of listings just because matches exist.
-- Mention at most 3 models/listings, and only when doing so genuinely helps answer the latest question.
-- Avoid generic purchase-checklist advice unless the user asks for it or it is essential to the answer.
-- Sound like a knowledgeable conversational assistant, not a database report.
-- If there are many matches, summarize and help narrow intelligently rather than enumerating results.
-- The application handles guided narrowing before this function is called, so when you are called, answer the buyer's latest need directly and concisely.
-- Do not call a vehicle "best value", "the best", or objectively superior merely because it is cheap.
-- Do not claim a specific listed vehicle is mechanically reliable, economical, safe, or in good condition.
-- supplied_results is a representative candidate sample, not necessarily the full matching set.
-- Prices in supplied_results can contain seller-entry/data-normalisation anomalies. Treat implausibly low prices cautiously;
-  never build a recommendation around a suspicious price simply because it is the cheapest.
+- Normally 2-4 concise sentences; a short 3-item recommendation can be useful.
+- Do not output URLs or markdown links.
+- Sound like a knowledgeable buying advisor, not a database report or questionnaire.
+- Do not say a specific vehicle is "best value" or objectively best merely because it is cheap.
+- If listing examples are mentioned, state only facts present in supplied_results.
 """
 
     payload = {
         "language": language,
         "latest_message": message,
-        "active_filters": filters,
+        "active_hard_filters": filters,
         "soft_preferences": preferences,
-        "total_count": count,
+        "hard_filter_count": hard_count,
+        "preference_qualified_count": advisory_count if qualified_results else None,
+        "qualified_model_reasons": model_reasons,
         "supplied_results": candidates,
         "important_note": (
-            "supplied_results is a selected representative sample when total_count is larger "
-            "than the number of supplied results. Raw listing URLs must never be printed."
+            "All supplied prices are GBP. supplied_results are real current-market rows selected "
+            "from the hard-filtered market and, when soft preferences exist, from preference-qualified models."
         ),
     }
 
@@ -1336,16 +1557,16 @@ STYLE — IMPORTANT:
         },
         timeout=45,
     )
-
     response.raise_for_status()
 
-    response_payload = response.json()
-    answer = extract_response_text(response_payload).strip()
-
+    answer = extract_response_text(response.json()).strip()
     if not answer:
         raise ValueError("AI_ASSISTANT_EMPTY_RESPONSE")
 
-    return answer
+    # Final currency guardrail for display text. The source dataset is GBP only.
+    answer = answer.replace("$", "£").replace(" USD", " GBP").replace("USD ", "GBP ")
+
+    return answer, advisory_results, advisory_count
 
 
 @app.route("/api/assistant", methods=["POST"])
@@ -1418,6 +1639,7 @@ def api_ai_buying_assistant():
             min_km=next_filters.get("min_km"),
             max_km=next_filters.get("max_km"),
             limit=5000,
+            max_limit=5000,
         )
 
         if not search_result.get("success"):
@@ -1446,7 +1668,7 @@ def api_ai_buying_assistant():
                 "stage": "narrowing",
             })
 
-        answer = generate_grounded_market_answer(
+        answer, advisory_results, advisory_count = generate_grounded_market_answer(
             message=message,
             language=language,
             filters=next_filters,
@@ -1454,13 +1676,14 @@ def api_ai_buying_assistant():
             search_result=search_result,
         )
 
-        public_results = (search_result.get("results") or [])[:100]
+        public_results = (advisory_results or search_result.get("results") or [])[:100]
         return jsonify({
             "success": True,
             "answer": answer,
             "filters": next_filters,
             "preferences": next_preferences,
             "count": search_result.get("count", 0),
+            "advisory_count": advisory_count,
             "returned": len(public_results),
             "results": public_results,
             "interpretation": interpretation,
