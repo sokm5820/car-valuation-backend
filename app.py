@@ -1227,7 +1227,7 @@ def guided_narrowing_question(filters, preferences, count, language="TR"):
 
 
 def _group_market_models(results, max_groups=350):
-    """Compact hard-filter matches into brand/model market summaries for AI reasoning."""
+    """Aggregate real matching listings into factual brand/model market options."""
     grouped = {}
 
     for item in results or []:
@@ -1244,7 +1244,8 @@ def _group_market_models(results, max_groups=350):
             "prices": [],
             "years": [],
             "kms": [],
-            "categories": [],
+            "transmissions": set(),
+            "locations": set(),
         })
         bucket["count"] += 1
 
@@ -1264,66 +1265,76 @@ def _group_market_models(results, max_groups=350):
         except (TypeError, ValueError):
             pass
 
-        category = str(item.get("category") or "").strip()
-        if category and category not in bucket["categories"] and len(bucket["categories"]) < 4:
-            bucket["categories"].append(category)
+        transmission = str(item.get("transmission") or "").strip()
+        location = str(item.get("location") or "").strip()
+        if transmission:
+            bucket["transmissions"].add(transmission)
+        if location:
+            bucket["locations"].add(location)
 
     summaries = []
     for bucket in grouped.values():
         prices = bucket.pop("prices")
         years = bucket.pop("years")
         kms = bucket.pop("kms")
-        bucket["min_price"] = min(prices) if prices else None
-        bucket["max_price"] = max(prices) if prices else None
-        bucket["min_year"] = min(years) if years else None
-        bucket["max_year"] = max(years) if years else None
-        bucket["min_km"] = min(kms) if kms else None
-        bucket["max_km"] = max(kms) if kms else None
+        bucket["transmissions"] = sorted(bucket["transmissions"])
+        bucket["locations"] = sorted(bucket["locations"])
+        bucket["starting_price"] = min(prices) if prices else None
+        bucket["highest_price"] = max(prices) if prices else None
+        bucket["oldest_year"] = min(years) if years else None
+        bucket["newest_year"] = max(years) if years else None
+        bucket["lowest_km"] = min(kms) if kms else None
+        bucket["highest_km"] = max(kms) if kms else None
         summaries.append(bucket)
 
-    # Keep the most represented model families if a very broad hard search produces
-    # hundreds of distinct models. This is only an AI context-size guard.
-    summaries.sort(key=lambda x: (-x["count"], x["brand"].casefold(), x["model"].casefold()))
+    summaries.sort(
+        key=lambda x: (
+            -int(x.get("count") or 0),
+            -(int(x.get("newest_year") or 0)),
+            float(x.get("starting_price") or 10**12),
+        )
+    )
     return summaries[:max_groups]
 
 
 def shortlist_models_for_preferences(message, language, filters, preferences, results):
-    """Use automotive knowledge to qualify/rank real model families for soft buyer intent."""
+    """Qualify/rank only real model families against soft intent and vehicle type."""
     preferences = list(preferences or [])
     relevant_preferences = [
         p for p in preferences
         if str(p).casefold().startswith(("vehicle_type:", "priority:", "use_case:"))
     ]
 
-    if not relevant_preferences:
-        return [], []
-
     model_market = _group_market_models(results)
     if not model_market:
-        return [], []
+        return [], [], []
+
+    # If there is no soft preference, every hard-filtered model family remains eligible.
+    if not relevant_preferences:
+        return list(results or []), [], model_market
 
     instructions = """
-You are the vehicle-model reasoning layer for a North Cyprus buying assistant.
+You are the model-qualification layer for a North Cyprus vehicle buying assistant.
 
-You are given model families that ALREADY satisfy the buyer's hard market filters
-(price, year, mileage, brand, location, etc.). Use general automotive knowledge only
-to decide which of those real model families fit the buyer's SOFT preferences.
+The supplied model_market contains ONLY model families that already satisfy the buyer's
+hard filters such as budget, year, mileage, brand, transmission and location.
+Use general automotive knowledge only to qualify and rank these REAL model families
+against the buyer's soft intent.
+
+Return JSON only:
+{"models":[{"brand":"...","model":"...","reason":"..."}]}
 
 Rules:
-- Return JSON only in exactly this shape:
-  {"models":[{"brand":"...","model":"...","reason":"..."}]}
-- You may select ONLY brand/model pairs present in model_market.
-- A vehicle_type preference (SUV, crossover, pickup, motorcycle, small_car) is a REQUIRED
-  qualification when present. Do not select a sedan/hatchback when SUV is requested.
-- priority:economy means favour models generally known for economical running/fuel use;
-  hybrids may be relevant, but never invent an engine/trim that is not supported by the listing data.
-- priority:luxury means favour premium/luxury brands or models generally positioned as premium.
-- priority:reliability, priority:performance, priority:comfort and priority:practicality are
-  model-level preferences, not claims about the condition of a particular listing.
-- use_case:family / commute may be used as normal model-level automotive reasoning.
-- Select up to 12 useful model families, ordered from strongest fit to weaker fit.
-- Do not select something merely because it is cheapest.
-- Give each selected model a very short reason tag, not a sales pitch.
+- Select ONLY exact brand/model pairs present in model_market.
+- vehicle_type:SUV / crossover / pickup / motorcycle / small_car is a REQUIRED qualification.
+  Never include the wrong body/vehicle type.
+- priority:economy: favour model families generally associated with economical use/ownership.
+- priority:luxury: favour premium/luxury-positioned brands or model families.
+- priority:reliability, performance, comfort and practicality are model-level positioning only.
+- use_case:family and use_case:commute may be used as broad model-level reasoning.
+- Never make claims about the condition or quality of an individual advertised vehicle.
+- Select up to 20 qualifying model families, ordered by relevance.
+- Keep reason extremely short and neutral. It is internal context, not advertising copy.
 """
 
     payload = {
@@ -1350,56 +1361,119 @@ Rules:
     response.raise_for_status()
     text = extract_response_text(response.json()).strip()
     if not text:
-        return [], []
+        return [], [], []
 
     try:
         parsed = json.loads(text)
         selected = parsed.get("models", []) if isinstance(parsed, dict) else []
     except Exception:
-        return [], []
+        return [], [], []
 
-    valid_market = {
-        (m["brand"].casefold(), m["model"].casefold())
+    market_by_key = {
+        (m["brand"].casefold(), m["model"].casefold()): m
         for m in model_market
     }
     selected_keys = []
     reasons = []
+    selected_summaries = []
+
     for item in selected:
         if not isinstance(item, dict):
             continue
         brand = str(item.get("brand") or "").strip()
         model = str(item.get("model") or "").strip()
         key = (brand.casefold(), model.casefold())
-        if brand and model and key in valid_market and key not in selected_keys:
+        if brand and model and key in market_by_key and key not in selected_keys:
             selected_keys.append(key)
+            selected_summaries.append(market_by_key[key])
             reasons.append({
                 "brand": brand,
                 "model": model,
                 "reason": str(item.get("reason") or "").strip(),
             })
-        if len(selected_keys) >= 12:
+        if len(selected_keys) >= 20:
             break
 
     if not selected_keys:
-        return [], []
+        return [], [], []
 
+    selected_set = set(selected_keys)
     qualified = [
         item for item in (results or [])
-        if (str(item.get("brand") or "").strip().casefold(),
-            str(item.get("model") or "").strip().casefold()) in set(selected_keys)
+        if (
+            str(item.get("brand") or "").strip().casefold(),
+            str(item.get("model") or "").strip().casefold(),
+        ) in selected_set
     ]
-    return qualified, reasons
+    return qualified, reasons, selected_summaries
+
+
+def _select_model_options(model_summaries, reasons, filters, max_options=8):
+    """Build a diverse factual option set; AI will normally surface only 3-5."""
+    if not model_summaries:
+        return []
+
+    reason_map = {
+        (str(x.get("brand") or "").casefold(), str(x.get("model") or "").casefold()): x.get("reason", "")
+        for x in (reasons or [])
+    }
+
+    enriched = []
+    for summary in model_summaries:
+        item = dict(summary)
+        item["reason"] = reason_map.get(
+            (item["brand"].casefold(), item["model"].casefold()),
+            "",
+        )
+        enriched.append(item)
+
+    # Preserve AI relevance ordering when soft preferences qualified the models.
+    if reasons:
+        order = {
+            (str(x.get("brand") or "").casefold(), str(x.get("model") or "").casefold()): i
+            for i, x in enumerate(reasons)
+        }
+        enriched.sort(key=lambda x: order.get((x["brand"].casefold(), x["model"].casefold()), 9999))
+        return enriched[:max_options]
+
+    # Without a soft preference, provide a useful spread: represented, newest, and near budget.
+    chosen, seen = [], set()
+
+    def add(items):
+        for item in items:
+            key = (item["brand"].casefold(), item["model"].casefold())
+            if key not in seen:
+                chosen.append(item)
+                seen.add(key)
+            if len(chosen) >= max_options:
+                return
+
+    add(sorted(enriched, key=lambda x: (-int(x.get("count") or 0), -(int(x.get("newest_year") or 0))))[:3])
+    add(sorted(enriched, key=lambda x: (-(int(x.get("newest_year") or 0)), float(x.get("starting_price") or 10**12)))[:3])
+
+    budget = filters.get("budget")
+    if budget not in [None, ""]:
+        try:
+            ceiling = float(budget)
+            add(sorted(
+                enriched,
+                key=lambda x: abs(ceiling - float(x.get("starting_price") or 0))
+            )[:4])
+        except (TypeError, ValueError):
+            pass
+
+    add(enriched)
+    return chosen[:max_options]
 
 
 def select_assistant_candidates(results, filters, max_candidates=24):
-    """Choose useful real listings, including options near the buyer's budget ceiling."""
+    """Choose factual listing rows only for explicit listing-level follow-up."""
     if not results:
         return []
 
     clean = list(results)
     budget = filters.get("budget")
-    chosen = []
-    seen = set()
+    chosen, seen = [], set()
 
     def add(items):
         for item in items:
@@ -1412,45 +1486,24 @@ def select_assistant_candidates(results, filters, max_candidates=24):
             if len(chosen) >= max_candidates:
                 return
 
-    # Give the AI genuine choices close to the stated ceiling instead of only cheap rows.
     if budget not in [None, ""]:
         try:
             ceiling = float(budget)
-            near_budget = sorted(
-                clean,
-                key=lambda x: abs(ceiling - float(x.get("price") or 0))
-            )
-            add(near_budget[:10])
+            add(sorted(clean, key=lambda x: abs(ceiling - float(x.get("price") or 0)))[:8])
         except (TypeError, ValueError):
             pass
 
-    newest = sorted(
-        clean,
-        key=lambda x: (-(int(x.get("year") or 0)), float(x.get("price") or 0))
-    )
-    add(newest[:8])
-
-    low_km = sorted(
+    add(sorted(clean, key=lambda x: (-(int(x.get("year") or 0)), float(x.get("price") or 0)))[:8])
+    add(sorted(
         [x for x in clean if x.get("km") is not None],
-        key=lambda x: (int(x.get("km") or 0), -int(x.get("year") or 0))
-    )
-    add(low_km[:8])
-
-    if len(chosen) < max_candidates:
-        by_price = sorted(clean, key=lambda x: float(x.get("price") or 0))
-        add(by_price)
-
+        key=lambda x: (int(x.get("km") or 0), -int(x.get("year") or 0)),
+    )[:8])
+    add(sorted(clean, key=lambda x: float(x.get("price") or 0)))
     return chosen[:max_candidates]
 
 
-def generate_grounded_market_answer(
-    message,
-    language,
-    filters,
-    preferences,
-    search_result,
-):
-    """Create a helpful advisory answer grounded in real hard-filter market matches."""
+def generate_grounded_market_answer(message, language, filters, preferences, search_result):
+    """Progressive-disclosure buying advice grounded in deterministic market data."""
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY_NOT_CONFIGURED")
 
@@ -1459,13 +1512,13 @@ def generate_grounded_market_answer(
 
     if hard_count == 0:
         fallback = {
-            "TR": "Bu kriterlere uyan aktif ilan bulamadım. İsterseniz kriterlerden birini esnetebiliriz.",
-            "EN": "I couldn't find an active listing matching those criteria. We can loosen one of the filters if you like.",
-            "RU": "Я не нашёл активных объявлений по этим критериям. Можно немного ослабить один из фильтров.",
+            "TR": "Bu kriterlere uyan aktif ilan bulamadım. İsterseniz bütçe, yıl, kilometre veya diğer kriterlerden birini esnetebiliriz.",
+            "EN": "I couldn't find an active listing matching those criteria. We can loosen the budget, year, mileage or another filter.",
+            "RU": "Я не нашёл активных объявлений по этим критериям. Можно немного ослабить бюджет, год, пробег или другой фильтр.",
         }
-        return fallback.get(language, fallback["TR"]), [], 0
+        return fallback.get(language, fallback["TR"]), [], 0, []
 
-    qualified_results, model_reasons = shortlist_models_for_preferences(
+    qualified_results, model_reasons, qualified_summaries = shortlist_models_for_preferences(
         message=message,
         language=language,
         filters=filters,
@@ -1473,60 +1526,79 @@ def generate_grounded_market_answer(
         results=hard_results,
     )
 
-    # When soft preferences were supplied, recommendation evidence should come
-    # from the qualified model families only. If none qualify, say so rather
-    # than silently recommending the wrong body type/intent.
-    has_soft_advisory_pref = any(
+    has_soft_pref = any(
         str(p).casefold().startswith(("vehicle_type:", "priority:", "use_case:"))
         for p in (preferences or [])
     )
 
-    if has_soft_advisory_pref and not qualified_results:
+    if has_soft_pref and not qualified_results:
         fallback = {
-            "TR": "Belirttiğiniz tercihleri mevcut kriterlerle birlikte karşılayan uygun bir model seçeneği bulamadım. Bütçe, yıl, kilometre veya araç tipi kriterlerinden birini esnetebiliriz.",
-            "EN": "I couldn't identify a suitable model that satisfies both your current filters and preferences. We can loosen the budget, year, mileage or vehicle-type requirement.",
-            "RU": "Я не нашёл подходящую модель, которая одновременно соответствует вашим фильтрам и предпочтениям. Можно ослабить бюджет, год, пробег или тип автомобиля.",
+            "TR": "Belirttiğiniz kriterlerle bu tercihi karşılayan bir model bulamadım. İsterseniz bütçe, yıl, kilometre veya araç tipi kriterlerinden birini esnetebiliriz.",
+            "EN": "I couldn't find a model that matches both those filters and that preference. We can loosen the budget, year, mileage or vehicle type.",
+            "RU": "Я не нашёл модель, которая одновременно соответствует этим фильтрам и предпочтению. Можно ослабить бюджет, год, пробег или тип автомобиля.",
         }
-        return fallback.get(language, fallback["TR"]), [], 0
+        return fallback.get(language, fallback["TR"]), [], 0, []
 
     advisory_results = qualified_results if qualified_results else hard_results
     advisory_count = len(advisory_results)
-    candidates = select_assistant_candidates(advisory_results, filters)
+    model_summaries = qualified_summaries if qualified_summaries else _group_market_models(advisory_results)
+    model_options = _select_model_options(model_summaries, model_reasons, filters, max_options=8)
+    listing_candidates = select_assistant_candidates(advisory_results, filters, max_candidates=18)
 
     instructions = """
-You are a decision-support assistant for people buying vehicles in North Cyprus.
-Your job is to HELP THE BUYER DECIDE, not merely report filters or keep asking questions.
+You are a premium, neutral vehicle-buying decision assistant for North Cyprus.
+Think like a helpful expert conversation, not a search form and not a salesperson.
+
+CORE BEHAVIOUR — PROGRESSIVE DISCLOSURE:
+1. DISCOVERY is the default. Once the buyer gives enough direction to be useful (for example
+   budget + SUV, budget + minimum year, or "economical car under £15k"), immediately show them
+   a small set of MODEL FAMILIES that their criteria can actually buy in the live market.
+2. Do NOT dump individual listings, mileage, seller and location on the first useful question.
+3. For model discovery, use model_options. Each option contains deterministic facts such as
+   newest_year and starting_price. These are the ONLY values you may quote for market year/price.
+4. Normally surface 3 model families; use 4-5 only when it materially improves choice.
+5. After showing useful options, ask one short natural question such as whether any model interests
+   them, or whether they want to prioritise economy, premium feel, newer year or lower mileage.
+6. Move to individual listing detail ONLY when the buyer explicitly asks to see listings/vehicles,
+   asks for concrete examples of a chosen model, or has narrowed to a specific model and clearly
+   wants available cars. listing_candidates exist for that later stage.
+
+NEUTRALITY:
+- Never tell the buyer to buy a specific advertised vehicle.
+- Never call a listing good, safe, reliable, problem-free, high-quality, best value or mechanically sound.
+- Do not rank individual listings as "best".
+- Model-level positioning may be discussed cautiously: economical, premium/luxury, practical,
+  sporty, compact, family-oriented, etc. Make clear this is general model-level context, not a
+  verified property of a specific advertised vehicle.
+- If the buyer says "economic/economical/ekonomik", help identify suitable real model families.
+- If they say "luxury/premium/lüks", help identify premium-positioned real model families.
+- Hard facts about the current market always override general automotive knowledge.
 
 GROUNDING:
-- Current listing facts (price, year, mileage, seller, location, transmission and availability)
-  may ONLY come from supplied_results / supplied market counts. Never invent listing facts.
-- General automotive knowledge MAY be used at model level to explain soft concepts such as
-  economical, premium/luxury, practical, sporty, comfortable, family-friendly or reliable.
-- Never turn model-level reputation into a claim about the mechanical condition of a particular listing.
-
-BE PROACTIVE:
-- If the buyer has given enough information to identify useful options, immediately mention up to
-  3 relevant brands/models that genuinely fit the supplied market evidence.
-- A budget + vehicle type is already enough to begin helping. Do not insist on brand or mileage first.
-- When a budget ceiling exists, prefer showing some realistic options near that ceiling as well as
-  useful alternatives below it; do not simply recommend the cheapest rows.
-- If many matches exist, this is NOT a reason by itself to refuse recommendations. Give useful
-  model options first, then optionally ask ONE natural follow-up about a meaningful trade-off
-  (e.g. newer year vs lower mileage, economy vs luxury, preferred brand).
-- If the user says SUV/pickup/motorcycle/etc., never recommend a different vehicle type and never
-  ask whether that type is actually required: it is already part of their stated preference.
+- model_options and listing_candidates come from the live deterministic market search.
+- Never invent a model, price, year, mileage, seller, location, transmission or count.
+- Never mention a model that is not in model_options during discovery.
+- "starting_price" means the lowest current asking price among matching listings for that model.
+- "newest_year" means the newest model year among matching listings for that model.
+- Do NOT imply the starting-price vehicle is also the newest-year vehicle; they are aggregate facts.
+- If a requested vehicle type is present, all surfaced models must satisfy it.
 
 MONEY:
-- ALL market prices are GBP. Always format prices with £ or GBP.
-- NEVER use $, USD, €, EUR, TL or another currency symbol for supplied market prices.
+- Every supplied market price is GBP.
+- Always format as £18.000 / £17.500 style in Turkish, and appropriate thousands formatting in English/Russian.
+- Never output $, USD, EUR, €, TL or another currency for supplied market prices.
 
-STYLE:
-- Answer in the requested language.
-- Normally 2-4 concise sentences; a short 3-item recommendation can be useful.
-- Do not output URLs or markdown links.
-- Sound like a knowledgeable buying advisor, not a database report or questionnaire.
-- Do not say a specific vehicle is "best value" or objectively best merely because it is cheap.
-- If listing examples are mentioned, state only facts present in supplied_results.
+FORMAT — IMPORTANT:
+- Clean, premium chat formatting. No large headings, tables or database dumps.
+- For discovery: one short intro sentence, then 3 compact model lines, then one short follow-up question.
+- Do not use markdown bullets, numbered lists, asterisks or bold markers. Put each model on its own line.
+- Turkish example structure (facts are illustrative only):
+  18.000 GBP altında değerlendirebileceğiniz SUV modellerinden bazıları:
+  Honda Vezel — 2021'e kadar, £17.500'den başlayan seçenekler
+  Toyota C-HR — 2020'ye kadar, £18.000'den başlayan seçenekler
+  Nissan Qashqai — 2021'e kadar, £15.500'den başlayan seçenekler
+  Bunlardan ilginizi çeken var mı? İsterseniz ekonomik, premium, daha yeni veya düşük kilometreli seçeneklere odaklanabiliriz.
+- Keep it concise. Do not explain the system or the database to the buyer.
 """
 
     payload = {
@@ -1536,11 +1608,11 @@ STYLE:
         "soft_preferences": preferences,
         "hard_filter_count": hard_count,
         "preference_qualified_count": advisory_count if qualified_results else None,
-        "qualified_model_reasons": model_reasons,
-        "supplied_results": candidates,
-        "important_note": (
-            "All supplied prices are GBP. supplied_results are real current-market rows selected "
-            "from the hard-filtered market and, when soft preferences exist, from preference-qualified models."
+        "model_options": model_options,
+        "listing_candidates": listing_candidates,
+        "instruction_note": (
+            "Default to model-level discovery. Use individual listing facts only if the latest message "
+            "explicitly asks for listing-level detail. All prices are GBP."
         ),
     }
 
@@ -1563,10 +1635,8 @@ STYLE:
     if not answer:
         raise ValueError("AI_ASSISTANT_EMPTY_RESPONSE")
 
-    # Final currency guardrail for display text. The source dataset is GBP only.
     answer = answer.replace("$", "£").replace(" USD", " GBP").replace("USD ", "GBP ")
-
-    return answer, advisory_results, advisory_count
+    return answer, advisory_results, advisory_count, model_options
 
 
 @app.route("/api/assistant", methods=["POST"])
@@ -1668,7 +1738,7 @@ def api_ai_buying_assistant():
                 "stage": "narrowing",
             })
 
-        answer, advisory_results, advisory_count = generate_grounded_market_answer(
+        answer, advisory_results, advisory_count, model_options = generate_grounded_market_answer(
             message=message,
             language=language,
             filters=next_filters,
@@ -1684,6 +1754,7 @@ def api_ai_buying_assistant():
             "preferences": next_preferences,
             "count": search_result.get("count", 0),
             "advisory_count": advisory_count,
+            "model_options": model_options,
             "returned": len(public_results),
             "results": public_results,
             "interpretation": interpretation,
