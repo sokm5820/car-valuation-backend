@@ -307,52 +307,147 @@ def _profile_matches_vehicle_type(profile, requested_type):
     return True
 
 
+def _canonicalize_buyer_preferences(preferences):
+    """Map multilingual/legacy preference labels to one internal taxonomy.
+
+    Language is an input/output concern only. The market/profile engine should only
+    ever see these canonical values, so EN/TR/RU requests behave identically.
+    """
+    aliases = {
+        # vehicle profile
+        "vehicle_type:small_car": "vehicle_type:small_car",
+        "vehicle_type:small car": "vehicle_type:small_car",
+        "vehicle_type:küçük araç": "vehicle_type:small_car",
+        "vehicle_type:kucuk arac": "vehicle_type:small_car",
+        "vehicle_type:небольшая машина": "vehicle_type:small_car",
+        "vehicle_type:небольшой автомобиль": "vehicle_type:small_car",
+        "vehicle_type:suv": "vehicle_type:SUV",
+        "vehicle_type:crossover": "vehicle_type:crossover",
+        "vehicle_type:pickup": "vehicle_type:pickup",
+        "vehicle_type:pick-up": "vehicle_type:pickup",
+        "vehicle_type:motorcycle": "vehicle_type:motorcycle",
+        "vehicle_type:motosiklet": "vehicle_type:motorcycle",
+        "vehicle_type:мотоцикл": "vehicle_type:motorcycle",
+        "vehicle_type:scooter": "vehicle_type:scooter",
+        "vehicle_type:скутер": "vehicle_type:scooter",
+        # buyer priorities
+        "priority:economy": "priority:economy",
+        "priority:economical": "priority:economy",
+        "priority:ekonomik": "priority:economy",
+        "priority:экономичная": "priority:economy",
+        "priority:экономичный": "priority:economy",
+        "priority:luxury": "priority:luxury",
+        "priority:comfort": "priority:comfort",
+        "priority:performance": "priority:performance",
+        "priority:practicality": "priority:practicality",
+        "use_case:family": "use_case:family",
+        "use_case:commute": "use_case:commute",
+    }
+    out = []
+    seen = set()
+    for pref in preferences or []:
+        raw = str(pref or "").strip()
+        if not raw:
+            continue
+        canonical = aliases.get(raw.casefold(), raw)
+        key = canonical.casefold()
+        if key not in seen:
+            out.append(canonical)
+            seen.add(key)
+    return out
+
+
 def _profile_preference_score(profile, preferences):
+    """Score buyer-profile fit without allowing soft traits to erase the market.
+
+    Concrete vehicle classes (SUV/pickup/motorcycle/scooter) remain strict.
+    Descriptors such as small-car, economy, comfort, practicality, family and
+    commute are ranking preferences. This prevents a taxonomy/profile mismatch
+    from turning valid hard-filtered inventory into an incorrect zero-result state.
+    """
+    preferences = _canonicalize_buyer_preferences(preferences)
     score = 0
-    hard_type_seen = False
+    matched_soft = 0
+    requested_soft = 0
+
     for pref in preferences or []:
         p = str(pref or "").strip().casefold()
         if p.startswith("vehicle_type:"):
-            hard_type_seen = True
             requested = p.split(":", 1)[1]
-            if not _profile_matches_vehicle_type(profile, requested):
-                return None
-            score += 6
+            # Explicit physical classes are genuine constraints. "small_car" is a
+            # buyer profile/size preference and is therefore scored rather than fatal.
+            if requested in {"suv", "crossover", "pickup", "pick-up", "motorcycle", "motosiklet", "scooter"}:
+                if not _profile_matches_vehicle_type(profile, requested):
+                    return None
+                score += 8
+            elif requested == "small_car":
+                requested_soft += 1
+                if _profile_matches_vehicle_type(profile, requested):
+                    matched_soft += 1
+                    score += 8
+                else:
+                    score -= 5
         elif p == "priority:economy":
+            requested_soft += 1
             level = _profile_level(profile.get("Economy"))
-            if level < 2:
-                return None
-            score += level * 3
+            if level >= 2:
+                matched_soft += 1
+                score += level * 4
+            else:
+                score -= 4
         elif p == "priority:luxury":
+            requested_soft += 1
             level = _profile_level(profile.get("Luxury"))
-            if level < 2:
-                return None
-            score += level * 3
+            if level >= 2:
+                matched_soft += 1
+                score += level * 4
+            else:
+                score -= 4
         elif p == "priority:comfort":
+            requested_soft += 1
             level = _profile_level(profile.get("Comfort"))
-            if level < 2:
-                return None
-            score += level * 2
+            if level >= 2:
+                matched_soft += 1
+                score += level * 3
+            else:
+                score -= 3
         elif p == "priority:performance":
+            requested_soft += 1
             level = _profile_level(profile.get("Performance"))
-            if level < 2:
-                return None
-            score += level * 2
+            if level >= 2:
+                matched_soft += 1
+                score += level * 3
+            else:
+                score -= 3
         elif p == "priority:practicality":
+            requested_soft += 1
             level = _profile_level(profile.get("Practicality"))
-            if level < 2:
-                return None
-            score += level * 2
+            if level >= 2:
+                matched_soft += 1
+                score += level * 3
+            else:
+                score -= 3
         elif p == "use_case:family":
+            requested_soft += 1
             level = _profile_level(profile.get("Family"))
-            if level < 2:
-                return None
-            score += level * 2
+            if level >= 2:
+                matched_soft += 1
+                score += level * 3
+            else:
+                score -= 3
         elif p == "use_case:commute":
+            requested_soft += 1
             level = _profile_level(profile.get("Commute"))
-            if level < 2:
-                return None
-            score += level * 2
+            if level >= 2:
+                matched_soft += 1
+                score += level * 3
+            else:
+                score -= 3
+
+    # At least one requested soft trait must be genuinely supported. This avoids
+    # returning unrelated cars while still permitting graceful partial matches.
+    if requested_soft and matched_soft == 0:
+        return None
 
     confidence = str(profile.get("Confidence") or "").strip().upper()
     if confidence == "HIGH":
@@ -1252,10 +1347,10 @@ def fast_common_interpretation(message, resolved_targets=None):
         decision_mode = "DISCOVER"
 
     # Budget forms: £15,000; 15k GBP; 15000 pounds; 15 bin; 15 тыс.
-    budget_match = re.search(r"£\s*([0-9][0-9.,]*\s*[kK]?)", raw)
+    budget_match = re.search(r"£\s*([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)", raw)
     if not budget_match:
         budget_match = re.search(
-            r"\b([0-9][0-9.,]*\s*[kK]?)\s*(?:gbp|pounds?|sterling|sterlin|sterlinlik|"
+            r"\b([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)\s*(?:gbp|pounds?|sterling|sterlin|sterlinlik|"
             r"фунт(?:ов|а)?|стерлинг(?:ов|а)?)\b",
             low,
         )
@@ -1278,8 +1373,8 @@ def fast_common_interpretation(message, resolved_targets=None):
 
     # Common mileage restrictions, including both prefix and suffix forms.
     km_patterns = [
-        r"(?:under|below|max(?:imum)?|less than|altında|en fazla|maksimum|до|максимум|не более)\s*([0-9][0-9.,]*\s*[kK]?)\s*(?:km|kilomet(?:er|re)?|км)",
-        r"([0-9][0-9.,]*\s*[kK]?)\s*(?:km|kilomet(?:er|re)?|км)\s*(?:altında|altinda|ve altı|ve alti|or less|or below|maximum|максимум|или меньше)",
+        r"(?:under|below|max(?:imum)?|less than|altında|en fazla|maksimum|до|максимум|не более)\s*([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)\s*(?:km|kilomet(?:er|re)?|км)",
+        r"([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)\s*(?:km|kilomet(?:er|re)?|км)\s*(?:altında|altinda|ve altı|ve alti|or less|or below|maximum|максимум|или меньше)",
     ]
     for pattern in km_patterns:
         km_match = re.search(pattern, low)
@@ -1381,7 +1476,7 @@ def fast_common_interpretation(message, resolved_targets=None):
         "filters": sanitize_ai_filters(filters),
         "clear_filters": [],
         "seller_mode": seller_mode,
-        "preferences": preferences,
+        "preferences": _canonicalize_buyer_preferences(preferences),
         "needs_clarification": False,
         "clarification_question": None,
         "decision_mode": decision_mode,
@@ -2310,7 +2405,7 @@ def shortlist_models_for_preferences(message, language, filters, preferences, re
     fallback exists only while profiles are unavailable/incomplete and is never
     allowed to hold a live request for tens of seconds.
     """
-    preferences = list(preferences or [])
+    preferences = _canonicalize_buyer_preferences(preferences)
     relevant_preferences = [
         p for p in preferences
         if str(p).casefold().startswith(("vehicle_type:", "priority:", "use_case:"))
@@ -3303,12 +3398,12 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
     )
 
     if decision_mode == "DISCOVER" and has_soft_pref and not qualified_results:
-        fallback = {
-            "TR": "Belirttiğiniz kriterlerle bu tercihi karşılayan bir model bulamadım. İsterseniz bütçe, yıl, kilometre veya araç tipi kriterlerinden birini esnetebiliriz.",
-            "EN": "I couldn't find a model that matches both those filters and that preference. We can loosen the budget, year, mileage or vehicle type.",
-            "RU": "Я не нашёл модель, которая одновременно соответствует этим фильтрам и предпочтению. Можно ослабить бюджет, год, пробег или тип автомобиля.",
-        }
-        return fallback.get(language, fallback["TR"]), [], 0, []
+        # Soft buyer traits are advisory ranking signals. Never report an empty market
+        # when the user's hard constraints actually have inventory. Fall back to that
+        # inventory and explain/surface the closest options deterministically.
+        qualified_results = list(hard_results)
+        model_reasons = []
+        qualified_summaries = _group_market_models(hard_results)
 
     advisory_results = qualified_results if qualified_results else hard_results
     advisory_count = len(advisory_results)
