@@ -106,6 +106,127 @@ MARKET_CSV_URL = "https://raw.githubusercontent.com/sokm5820/car-valuation-backe
 market_df = pd.DataFrame()
 MARKET_READY = False
 
+# =========================================================
+# AI BUYING ASSISTANT - BUYER INTELLIGENCE v1
+# =========================================================
+BUYER_MODEL_CSV_URL = (
+    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
+    "buyer_model_intelligence.csv"
+)
+BUYER_CATEGORY_CSV_URL = (
+    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
+    "buyer_category_intelligence.csv"
+)
+
+buyer_model_df = pd.DataFrame()
+buyer_category_df = pd.DataFrame()
+BUYER_INTELLIGENCE_READY = False
+
+
+def _prepare_buyer_intelligence_frame(frame):
+    frame = frame.copy()
+
+    text_cols = [
+        "VehicleType", "Brand", "Model", "CategoryDetail",
+        "LiquidityEvidenceLevel", "PricePressureEvidenceLevel",
+        "Buyer_LiquidityEvidenceConfidence",
+        "Buyer_PricePressureEvidenceConfidence",
+        "RecommendationGranularity",
+    ]
+    for col in text_cols:
+        if col in frame.columns:
+            frame[col] = (
+                frame[col].fillna("").astype(str).str.strip()
+            )
+
+    numeric_cols = [
+        "Year", "CurrentListings", "CurrentStartingPrice",
+        "CurrentMedianPrice", "CurrentHighestPrice", "CurrentMedianKM",
+        "GalleryListings", "PrivateListings",
+        "Buyer_HistoricalDistinctListings",
+        "Buyer_MedianObservedDaysToExit",
+        "Buyer_Exit30EligibleListings",
+        "Buyer_ObservedExitWithin30DaysRate",
+        "Buyer_Exit60EligibleListings",
+        "Buyer_ObservedExitWithin60DaysRate",
+        "Buyer_Exit90EligibleListings",
+        "Buyer_ObservedExitWithin90DaysRate",
+        "Buyer_PricePressureEligibleListings",
+        "Buyer_PriceReductionRate",
+        "Buyer_MedianReductionPctAmongReduced",
+        "Buyer_ListingVolumeRankWithinVehicleType",
+        "Buyer_CategoryListingVolumeRankWithinModel",
+        "Buyer_ModelListingVolumeRankWithinVehicleType",
+    ]
+    for col in numeric_cols:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+    return frame
+
+
+def load_buyer_intelligence():
+    global buyer_model_df, buyer_category_df, BUYER_INTELLIGENCE_READY
+
+    try:
+        model_r = requests.get(BUYER_MODEL_CSV_URL, timeout=20)
+        model_r.raise_for_status()
+        category_r = requests.get(BUYER_CATEGORY_CSV_URL, timeout=20)
+        category_r.raise_for_status()
+
+        new_model = pd.read_csv(
+            io.StringIO(model_r.text), low_memory=False
+        )
+        new_category = pd.read_csv(
+            io.StringIO(category_r.text), low_memory=False
+        )
+
+        required_model = {
+            "VehicleType", "Brand", "Model", "Year",
+            "CurrentListings", "CurrentStartingPrice",
+            "Buyer_ObservedExitWithin60DaysRate",
+            "Buyer_LiquidityEvidenceConfidence",
+            "LiquidityEvidenceLevel",
+        }
+        required_category = {
+            "VehicleType", "Brand", "Model", "CategoryDetail", "Year",
+            "CurrentListings", "CurrentStartingPrice",
+            "Buyer_ObservedExitWithin60DaysRate",
+            "Buyer_LiquidityEvidenceConfidence",
+            "LiquidityEvidenceLevel",
+        }
+
+        missing_model = required_model - set(new_model.columns)
+        missing_category = required_category - set(new_category.columns)
+        if missing_model or missing_category:
+            raise ValueError(
+                "Buyer Intelligence schema mismatch. "
+                f"model missing={sorted(missing_model)}, "
+                f"category missing={sorted(missing_category)}"
+            )
+
+        buyer_model_df = _prepare_buyer_intelligence_frame(new_model)
+        buyer_category_df = _prepare_buyer_intelligence_frame(new_category)
+        BUYER_INTELLIGENCE_READY = True
+
+        print(
+            "Buyer Intelligence loaded successfully: "
+            f"{len(buyer_model_df)} model-year rows, "
+            f"{len(buyer_category_df)} category-year rows"
+        )
+
+    except Exception as e:
+        print("BUYER INTELLIGENCE LOAD FAILED:", e)
+
+        # Keep the last successful intelligence snapshot alive.
+        if (
+            buyer_model_df is None or buyer_model_df.empty
+            or buyer_category_df is None or buyer_category_df.empty
+        ):
+            buyer_model_df = pd.DataFrame()
+            buyer_category_df = pd.DataFrame()
+            BUYER_INTELLIGENCE_READY = False
+
 
 def load_market_data():
     global market_df, MARKET_READY
@@ -210,6 +331,7 @@ def load_market_data():
 
 
 load_market_data()
+load_buyer_intelligence()
 
 
 # =========================================================
@@ -223,6 +345,8 @@ def refresh_market_data_loop():
         print("Refreshing market CSV data from GitHub...")
 
         load_market_data()
+        print("Refreshing Buyer Intelligence from GitHub...")
+        load_buyer_intelligence()
 
 
 threading.Thread(
@@ -1817,6 +1941,337 @@ def select_assistant_candidates(results, filters, max_candidates=3):
     return chosen[:max_candidates]
 
 
+
+def _json_number(value, integer=False):
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return int(value) if integer else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _vehicle_type_preference(preferences):
+    for pref in preferences or []:
+        value = str(pref or "").strip()
+        if value.casefold().startswith("vehicle_type:"):
+            return value.split(":", 1)[1].strip()
+    return None
+
+
+def _buyer_vehicle_type_matches(series, requested_type):
+    """
+    Deterministic only where Category Master gives us a defensible mapping.
+    Ambiguous concepts such as small_car/crossover remain AI qualifications.
+    """
+    if not requested_type:
+        return pd.Series(True, index=series.index)
+
+    requested = str(requested_type).strip().casefold()
+    normalized = series.fillna("").astype(str).str.strip().str.casefold()
+
+    exact_map = {
+        "suv": {"suv, pick-up"},
+        "pickup": {"suv, pick-up"},
+        "pick-up": {"suv, pick-up"},
+        "motorcycle": {"motosiklet"},
+        "motosiklet": {"motosiklet"},
+        "atv": {"atv & utv"},
+        "utv": {"atv & utv"},
+        "classic": {"klasik araçlar"},
+        "boat": {"deniz araçları"},
+    }
+
+    allowed = exact_map.get(requested)
+    if not allowed:
+        return pd.Series(True, index=series.index)
+
+    return normalized.isin(allowed)
+
+
+def _matching_buyer_model_rows(model_option, filters, preferences):
+    if (
+        not BUYER_INTELLIGENCE_READY
+        or buyer_model_df is None
+        or buyer_model_df.empty
+    ):
+        return pd.DataFrame()
+
+    brand = str(model_option.get("brand") or "").strip().casefold()
+    model = str(model_option.get("model") or "").strip().casefold()
+
+    rows = buyer_model_df[
+        (buyer_model_df["Brand"].astype(str).str.casefold() == brand)
+        & (buyer_model_df["Model"].astype(str).str.casefold() == model)
+    ].copy()
+
+    if rows.empty:
+        return rows
+
+    min_year = filters.get("min_year")
+    max_year = filters.get("max_year")
+    budget = filters.get("budget")
+    min_budget = filters.get("min_budget")
+
+    if min_year not in [None, ""]:
+        rows = rows[rows["Year"] >= int(min_year)]
+    if max_year not in [None, ""]:
+        rows = rows[rows["Year"] <= int(max_year)]
+    if budget not in [None, ""]:
+        rows = rows[
+            rows["CurrentStartingPrice"].notna()
+            & (rows["CurrentStartingPrice"] <= float(budget))
+        ]
+    if min_budget not in [None, ""]:
+        # Keep a year if its market range can reach the buyer's floor.
+        rows = rows[
+            rows["CurrentHighestPrice"].notna()
+            & (rows["CurrentHighestPrice"] >= float(min_budget))
+        ]
+
+    requested_type = _vehicle_type_preference(preferences)
+    if requested_type and not rows.empty:
+        rows = rows[
+            _buyer_vehicle_type_matches(
+                rows["VehicleType"], requested_type
+            )
+        ]
+
+    return rows
+
+
+def _matching_buyer_category_rows(model_option, filters, preferences, hard_results):
+    if (
+        not BUYER_INTELLIGENCE_READY
+        or buyer_category_df is None
+        or buyer_category_df.empty
+    ):
+        return pd.DataFrame()
+
+    brand = str(model_option.get("brand") or "").strip()
+    model = str(model_option.get("model") or "").strip()
+    brand_cf = brand.casefold()
+    model_cf = model.casefold()
+
+    # Restrict variants to CategoryDetail strings actually represented in the
+    # current hard-filtered listing result set for this model.
+    observed_categories = {
+        str(x.get("category") or "").strip().casefold()
+        for x in (hard_results or [])
+        if str(x.get("brand") or "").strip().casefold() == brand_cf
+        and str(x.get("model") or "").strip().casefold() == model_cf
+        and str(x.get("category") or "").strip()
+    }
+
+    rows = buyer_category_df[
+        (buyer_category_df["Brand"].astype(str).str.casefold() == brand_cf)
+        & (buyer_category_df["Model"].astype(str).str.casefold() == model_cf)
+    ].copy()
+
+    if rows.empty:
+        return rows
+
+    if observed_categories:
+        detail_cf = rows["CategoryDetail"].astype(str).str.casefold()
+        mask = detail_cf.map(
+            lambda detail: any(
+                detail and detail in observed
+                for observed in observed_categories
+            )
+        )
+        rows = rows[mask]
+
+    min_year = filters.get("min_year")
+    max_year = filters.get("max_year")
+    budget = filters.get("budget")
+
+    if min_year not in [None, ""]:
+        rows = rows[rows["Year"] >= int(min_year)]
+    if max_year not in [None, ""]:
+        rows = rows[rows["Year"] <= int(max_year)]
+    if budget not in [None, ""]:
+        rows = rows[
+            rows["CurrentStartingPrice"].notna()
+            & (rows["CurrentStartingPrice"] <= float(budget))
+        ]
+
+    requested_type = _vehicle_type_preference(preferences)
+    if requested_type and not rows.empty:
+        rows = rows[
+            _buyer_vehicle_type_matches(
+                rows["VehicleType"], requested_type
+            )
+        ]
+
+    return rows
+
+
+def enrich_model_options_with_buyer_intelligence(
+    model_options,
+    filters,
+    preferences,
+    hard_results,
+):
+    """
+    Attach proprietary Cyprus-market evidence to the real model options.
+
+    This does NOT calculate a universal score. It exposes transparent current
+    market, liquidity and asking-price-pressure evidence for the response model.
+    """
+    if not model_options:
+        return []
+
+    enriched = []
+
+    for option in model_options:
+        item = dict(option)
+        model_rows = _matching_buyer_model_rows(
+            item, filters, preferences
+        )
+
+        if not model_rows.empty:
+            model_rows = model_rows.sort_values(
+                "Year", ascending=False
+            )
+            newest = model_rows.iloc[0]
+
+            # Historical evidence repeats across model-year rows, so take the
+            # newest matching row as the carrier of those model-level fields.
+            item["buyer_intelligence"] = {
+                "available_years": sorted(
+                    [
+                        int(x) for x in model_rows["Year"].dropna().unique()
+                    ],
+                    reverse=True,
+                ),
+                "newest_affordable_year": _json_number(
+                    model_rows["Year"].max(), integer=True
+                ),
+                "newest_affordable_year_starting_price": _json_number(
+                    newest.get("CurrentStartingPrice")
+                ),
+                "newest_affordable_year_median_price": _json_number(
+                    newest.get("CurrentMedianPrice")
+                ),
+                "newest_affordable_year_median_km": _json_number(
+                    newest.get("CurrentMedianKM")
+                ),
+                "historical_distinct_listings": _json_number(
+                    newest.get("Buyer_HistoricalDistinctListings"),
+                    integer=True,
+                ),
+                "median_observed_days_to_exit": _json_number(
+                    newest.get("Buyer_MedianObservedDaysToExit")
+                ),
+                "exit_30_rate": _json_number(
+                    newest.get("Buyer_ObservedExitWithin30DaysRate")
+                ),
+                "exit_30_eligible": _json_number(
+                    newest.get("Buyer_Exit30EligibleListings"),
+                    integer=True,
+                ),
+                "exit_60_rate": _json_number(
+                    newest.get("Buyer_ObservedExitWithin60DaysRate")
+                ),
+                "exit_60_eligible": _json_number(
+                    newest.get("Buyer_Exit60EligibleListings"),
+                    integer=True,
+                ),
+                "exit_90_rate": _json_number(
+                    newest.get("Buyer_ObservedExitWithin90DaysRate")
+                ),
+                "exit_90_eligible": _json_number(
+                    newest.get("Buyer_Exit90EligibleListings"),
+                    integer=True,
+                ),
+                "liquidity_confidence": str(
+                    newest.get("Buyer_LiquidityEvidenceConfidence") or ""
+                ),
+                "liquidity_evidence_level": str(
+                    newest.get("LiquidityEvidenceLevel") or ""
+                ),
+                "price_reduction_rate": _json_number(
+                    newest.get("Buyer_PriceReductionRate")
+                ),
+                "price_pressure_eligible": _json_number(
+                    newest.get("Buyer_PricePressureEligibleListings"),
+                    integer=True,
+                ),
+                "median_reduction_pct_when_reduced": _json_number(
+                    newest.get("Buyer_MedianReductionPctAmongReduced")
+                ),
+                "price_pressure_confidence": str(
+                    newest.get("Buyer_PricePressureEvidenceConfidence") or ""
+                ),
+                "price_pressure_evidence_level": str(
+                    newest.get("PricePressureEvidenceLevel") or ""
+                ),
+            }
+        else:
+            item["buyer_intelligence"] = None
+
+        category_rows = _matching_buyer_category_rows(
+            item, filters, preferences, hard_results
+        )
+        variant_context = []
+        if not category_rows.empty:
+            # Prefer variants with the most current supply, then newest year.
+            category_rows = category_rows.sort_values(
+                ["CurrentListings", "Year"],
+                ascending=[False, False],
+            )
+            seen = set()
+            for _, row in category_rows.iterrows():
+                detail = str(row.get("CategoryDetail") or "").strip()
+                key = detail.casefold()
+                if not detail or key in seen:
+                    continue
+                seen.add(key)
+                variant_context.append({
+                    "category_detail": detail,
+                    "year": _json_number(row.get("Year"), integer=True),
+                    "current_listings": _json_number(
+                        row.get("CurrentListings"), integer=True
+                    ),
+                    "starting_price": _json_number(
+                        row.get("CurrentStartingPrice")
+                    ),
+                    "median_price": _json_number(
+                        row.get("CurrentMedianPrice")
+                    ),
+                    "median_km": _json_number(
+                        row.get("CurrentMedianKM")
+                    ),
+                    "exit_60_rate": _json_number(
+                        row.get("Buyer_ObservedExitWithin60DaysRate")
+                    ),
+                    "exit_60_eligible": _json_number(
+                        row.get("Buyer_Exit60EligibleListings"),
+                        integer=True,
+                    ),
+                    "liquidity_confidence": str(
+                        row.get("Buyer_LiquidityEvidenceConfidence") or ""
+                    ),
+                    "liquidity_evidence_level": str(
+                        row.get("LiquidityEvidenceLevel") or ""
+                    ),
+                    "price_reduction_rate": _json_number(
+                        row.get("Buyer_PriceReductionRate")
+                    ),
+                    "price_pressure_evidence_level": str(
+                        row.get("PricePressureEvidenceLevel") or ""
+                    ),
+                })
+                if len(variant_context) >= 4:
+                    break
+
+        item["variant_intelligence"] = variant_context
+        enriched.append(item)
+
+    return enriched
+
+
+
 def generate_grounded_market_answer(message, language, filters, preferences, search_result, conversation_history=None):
     """Progressive-disclosure buying advice grounded in deterministic market data."""
     if not OPENAI_API_KEY:
@@ -1858,6 +2313,12 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
     advisory_count = len(advisory_results)
     model_summaries = qualified_summaries if qualified_summaries else _group_market_models(advisory_results)
     model_options = _select_model_options(model_summaries, model_reasons, filters, max_options=20)
+    model_options = enrich_model_options_with_buyer_intelligence(
+        model_options=model_options,
+        filters=filters,
+        preferences=preferences,
+        hard_results=advisory_results,
+    )
     listing_candidates = select_assistant_candidates(advisory_results, filters, max_candidates=3)
 
     instructions = """
@@ -1914,6 +2375,33 @@ NEUTRALITY:
 - If they say "luxury/premium/lüks", help identify premium-positioned real model families.
 - Hard facts about the current market always override general automotive knowledge.
 
+BUYER INTELLIGENCE:
+- model_options may contain buyer_intelligence and variant_intelligence calculated from OtoDeğer's
+  validated current + historical Cyprus-market datasets.
+- Treat these fields as proprietary factual evidence, not as general automotive knowledge.
+- Use historical evidence to improve recommendations when it is relevant to the buyer's decision.
+- "exit_60_rate" means the observed share of a mature historical listing cohort that left the observed
+  market within 60 days. It does NOT prove the vehicles were sold.
+- "median_observed_days_to_exit" is observed listing duration before market exit; do not call it
+  guaranteed "days to sell".
+- "price_reduction_rate" is the share of eligible historical listings whose asking price was reduced.
+  It is evidence of asking-price pressure, NOT depreciation or value retention.
+- Respect liquidity_confidence / price_pressure_confidence. Avoid strong conclusions from LOW or
+  INSUFFICIENT evidence. Mention limited evidence when it materially affects a comparison.
+- liquidity_evidence_level / price_pressure_evidence_level tells you whether CATEGORY or MODEL
+  evidence is being used. Category evidence is more specific; MODEL means the category sample was
+  too thin and the system deliberately fell back upward.
+- Never convert listing volume into a claim of popularity.
+- Never invent a universal resale score, reliability score or recommendation score.
+- variant_intelligence may be used to distinguish variants within the same model when the data
+  supports it. Do not invent a variant that is absent from variant_intelligence.
+- Prefer useful relative conclusions ("historically faster observed turnover", "more current supply",
+  "less asking-price reduction pressure") backed by supplied evidence over dumping statistics.
+- When the buyer asks about resale/liquidity, use the historical evidence directly and describe it as
+  observed market behaviour, not a guarantee of future resale.
+- When historical intelligence is unavailable, simply omit that claim rather than filling it with
+  general knowledge.
+
 GROUNDING:
 - model_options and listing_candidates come from the live deterministic market search.
 - Never invent a model, price, year, mileage, seller, location, transmission or count.
@@ -1963,6 +2451,7 @@ FORMAT — IMPORTANT:
         "soft_preferences": preferences,
         "hard_filter_count": hard_count,
         "preference_qualified_count": advisory_count if qualified_results else None,
+        "buyer_intelligence_ready": BUYER_INTELLIGENCE_READY,
         "model_options": model_options,
         "listing_candidates": listing_candidates,
         "listing_display_limit": 3,
@@ -2331,7 +2820,10 @@ def market_health():
     return jsonify({
         "status": "ok" if MARKET_READY else "loading",
         "ready": MARKET_READY,
-        "rows": len(market_df)
+        "rows": len(market_df),
+        "buyer_intelligence_ready": BUYER_INTELLIGENCE_READY,
+        "buyer_model_rows": len(buyer_model_df),
+        "buyer_category_rows": len(buyer_category_df),
     })
 
 # =========================================================
