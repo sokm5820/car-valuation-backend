@@ -1730,40 +1730,30 @@ def market_search(
     # JSON-SAFE RESULTS
     # -----------------------
 
-    results = []
+    # Vectorized serialization is materially faster than iterrows() when the
+    # assistant asks for thousands of internal candidates.
+    raw_records = results_df[[
+        "Brand", "Model", "Category", "Year", "Price", "KM",
+        "Company", "Location", "Transmission", "Color", "Image", "Link"
+    ]].to_dict(orient="records")
 
-    for _, row in results_df.iterrows():
-
-        results.append({
+    results = [
+        {
             "brand": row["Brand"],
             "model": row["Model"],
             "category": row["Category"],
-
-            "year": (
-                int(row["Year"])
-                if pd.notna(row["Year"])
-                else None
-            ),
-
-            "price": (
-                float(row["Price"])
-                if pd.notna(row["Price"])
-                else None
-            ),
-
-            "km": (
-                int(row["KM"])
-                if pd.notna(row["KM"])
-                else None
-            ),
-
+            "year": int(row["Year"]) if pd.notna(row["Year"]) else None,
+            "price": float(row["Price"]) if pd.notna(row["Price"]) else None,
+            "km": int(row["KM"]) if pd.notna(row["KM"]) else None,
             "company": row["Company"],
             "location": row["Location"],
             "transmission": row["Transmission"],
             "color": row["Color"],
             "image": row["Image"],
-            "link": row["Link"]
-        })
+            "link": row["Link"],
+        }
+        for row in raw_records
+    ]
 
     return {
         "success": True,
@@ -2103,7 +2093,7 @@ def shortlist_models_for_preferences(message, language, filters, preferences, re
     instructions = """
 You are the model-qualification layer for a North Cyprus vehicle buying assistant.
 
-The supplied model_market contains ONLY model families that already satisfy the buyer's
+The supplied model_candidates contains ONLY model families that already satisfy the buyer's
 hard filters such as budget, year, mileage, brand, transmission and location.
 Use general automotive knowledge only to qualify and rank these REAL model families
 against the buyer's soft intent.
@@ -2112,7 +2102,7 @@ Return JSON only:
 {"models":[{"brand":"...","model":"...","reason":"..."}]}
 
 Rules:
-- Select ONLY exact brand/model pairs present in model_market.
+- Select ONLY exact brand/model pairs present in model_candidates.
 - vehicle_type:SUV / crossover / pickup / motorcycle / small_car is a REQUIRED qualification.
   Never include the wrong body/vehicle type.
 - priority:economy: favour model families generally associated with economical use/ownership.
@@ -2127,14 +2117,19 @@ Rules:
     # Keep the qualification request compact. The deterministic market grouping is
     # already ordered by current representation/newness, so a generous cap preserves
     # useful choice while avoiding sending hundreds of model families to the LLM.
-    qualification_market = model_market[:160]
+    qualification_market = model_market[:120]
 
     payload = {
         "language": language,
         "latest_message": message,
         "hard_filters": filters,
         "soft_preferences": relevant_preferences,
-        "model_market": qualification_market,
+        # The LLM only needs the identity of each real candidate to judge soft intent.
+        # Price/year/count/KM facts are deterministic and are deliberately NOT sent here.
+        "model_candidates": [
+            {"brand": m["brand"], "model": m["model"]}
+            for m in qualification_market
+        ],
     }
 
     response = None
@@ -2150,7 +2145,7 @@ Rules:
                 json={
                     "model": OPENAI_MODEL,
                     "reasoning": {"effort": "none"},
-                    "max_output_tokens": 900,
+                    "max_output_tokens": 450,
                     "instructions": instructions,
                     "input": json.dumps(payload, ensure_ascii=False),
                 },
