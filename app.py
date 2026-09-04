@@ -2800,12 +2800,39 @@ def _fast_compare_answer(message, language, filters, model_options):
             key=lambda t: (float(t[1]) if t[1] is not None else 10**9, -(float(t[2]) if t[2] is not None else -1)),
         )[0]
 
+    same_market_winner = label(choice_winner) == label(newest_winner)
+    liquidity_label = label(liquidity_winner) if liquidity_winner is not None else None
+
     if language == "TR":
-        intro = (f"{budget_text} bütçenizde " if budget_text else "") + f"{label(choice_winner)} daha fazla seçenek sunuyor; {label(newest_winner)} ise ulaşılabilen en yeni model yılı açısından öne çıkıyor."
+        prefix = f"{budget_text} bütçenizde " if budget_text else ""
+        if same_market_winner:
+            intro = prefix + f"{label(choice_winner)} hem daha fazla seçenek hem de daha yeni araçlara erişim sunuyor"
+        else:
+            intro = prefix + f"{label(choice_winner)} daha fazla seçenek sunarken {label(newest_winner)} daha yeni araçlara erişim sağlıyor"
+        if liquidity_label and liquidity_label != label(choice_winner):
+            intro += f"; {liquidity_label} ise tarihsel yeniden satış kolaylığı sinyalinde daha güçlü."
+        else:
+            intro += "."
     elif language == "RU":
-        intro = (f"При бюджете {budget_text} " if budget_text else "") + f"у {label(choice_winner)} больше выбора, а {label(newest_winner)} лидирует по самому новому доступному году."
+        prefix = f"При бюджете {budget_text} " if budget_text else ""
+        if same_market_winner:
+            intro = prefix + f"{label(choice_winner)} предлагает и больший выбор, и доступ к более новым автомобилям"
+        else:
+            intro = prefix + f"у {label(choice_winner)} больше выбора, а {label(newest_winner)} даёт доступ к более новым автомобилям"
+        if liquidity_label and liquidity_label != label(choice_winner):
+            intro += f"; при этом исторический сигнал по лёгкости перепродажи сильнее у {liquidity_label}."
+        else:
+            intro += "."
     else:
-        intro = (f"With your {budget_text} ceiling, " if budget_text else "") + f"{label(choice_winner)} gives you more choice, while {label(newest_winner)} reaches the newest affordable model year."
+        prefix = f"With your {budget_text} ceiling, " if budget_text else ""
+        if same_market_winner:
+            intro = prefix + f"{label(choice_winner)} offers considerably more choice and access to newer cars"
+        else:
+            intro = prefix + f"{label(choice_winner)} offers more choice, while {label(newest_winner)} gives you access to newer cars"
+        if liquidity_label and liquidity_label != label(choice_winner):
+            intro += f", while {liquidity_label} has the stronger historical resale-ease signal."
+        else:
+            intro += "."
 
     sections=[]
     for o in chosen:
@@ -2881,7 +2908,10 @@ def _localize_listing_value(value, field, language):
                 "gri": "Grey", "fume": "Dark grey", "mavi": "Blue",
                 "kirmizi": "Red", "yesil": "Green", "sari": "Yellow",
                 "bej": "Beige", "kahverengi": "Brown", "turuncu": "Orange",
-                "lacivert": "Navy", "bordo": "Burgundy"
+                "lacivert": "Navy", "bordo": "Burgundy",
+                "mavi okyanus": "Ocean Blue", "mavi parlement": "Parliament Blue",
+                "inci beyaz": "Pearl White", "metalik gri": "Metallic Grey",
+                "koyu gri": "Dark Grey", "acik gri": "Light Grey"
             },
         }
         return maps.get(field, {}).get(key, text)
@@ -2897,6 +2927,74 @@ def _localize_listing_value(value, field, language):
         }
         return maps.get(field, {}).get(key, text)
     return text
+
+
+def _select_shop_representatives(results, max_candidates=3):
+    """Pick a small, useful SHOP set: newest, lowest-mileage and lower-priced.
+
+    All rows have already passed the deterministic active filters. Selection is
+    presentation-only and never relaxes budget/model/year/KM/location/seller rules.
+    """
+    clean = list(results or [])
+    if not clean:
+        return []
+
+    chosen, seen = [], set()
+
+    def identity(item):
+        return item.get("link") or (
+            item.get("brand"), item.get("model"), item.get("category"),
+            item.get("year"), item.get("price"), item.get("km"), item.get("company")
+        )
+
+    def take(item):
+        if item is None:
+            return
+        key = identity(item)
+        if key not in seen:
+            chosen.append(item)
+            seen.add(key)
+
+    # 1) Newest available example; among the newest year prefer lower mileage,
+    # then lower asking price.
+    newest = sorted(
+        clean,
+        key=lambda x: (
+            -(int(x.get("year") or 0)),
+            int(x.get("km")) if x.get("km") is not None else 10**12,
+            float(x.get("price") or 10**12),
+        ),
+    )
+    take(newest[0] if newest else None)
+
+    # 2) Lowest-mileage remaining example.
+    low_km = sorted(
+        [x for x in clean if x.get("km") is not None],
+        key=lambda x: (int(x.get("km") or 0), -int(x.get("year") or 0), float(x.get("price") or 10**12)),
+    )
+    for item in low_km:
+        if identity(item) not in seen:
+            take(item)
+            break
+
+    # 3) Lower-priced remaining example. This is a factual price distinction,
+    # not a claim that the listing is better value.
+    lower_price = sorted(
+        clean,
+        key=lambda x: (float(x.get("price") or 10**12), -int(x.get("year") or 0), int(x.get("km")) if x.get("km") is not None else 10**12),
+    )
+    for item in lower_price:
+        if identity(item) not in seen:
+            take(item)
+            break
+
+    # Defensive fill for tiny/duplicate datasets.
+    for item in newest:
+        if len(chosen) >= max_candidates:
+            break
+        take(item)
+
+    return chosen[:max_candidates]
 
 
 def _fast_shop_answer(language, filters, search_result, listing_candidates):
@@ -3030,10 +3128,12 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
             "newest_matching_year_starting_price": option.get("newest_year_starting_price"),
             "lowest_matching_asking_price": option.get("starting_price"),
         }
-    listing_candidate_limit = 12 if decision_mode == "SHOP" else 3
-    listing_candidates = select_assistant_candidates(
-        advisory_results, filters, max_candidates=listing_candidate_limit
-    )
+    if decision_mode == "SHOP":
+        listing_candidates = _select_shop_representatives(advisory_results, max_candidates=3)
+    else:
+        listing_candidates = select_assistant_candidates(
+            advisory_results, filters, max_candidates=3
+        )
 
     # Fast paths: DISCOVER and SHOP are already fully grounded by deterministic data.
     # Avoid a second writing-model request; this removes one sequential network/LLM
