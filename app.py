@@ -1204,7 +1204,8 @@ def _parse_human_number(token):
 
 def fast_common_interpretation(message, resolved_targets=None):
     """
-    Deterministic fast path for common, high-confidence buyer requests.
+    Deterministic multilingual fast path for common buyer requests.
+    Supports English, Turkish and Russian without a live LLM round-trip.
     Ambiguous conversational turns still fall back to the LLM interpreter.
     """
     raw = str(message or "").strip()
@@ -1212,11 +1213,16 @@ def fast_common_interpretation(message, resolved_targets=None):
     if not raw:
         return None
 
-    # Terse contextual replies and explicit negations/corrections are intentionally
-    # left to the conversational interpreter.
-    if low in {"yes", "no", "evet", "hayır", "more", "more?", "daha", "daha?", "all", "all of them"}:
+    # Terse contextual replies and explicit corrections/negations are intentionally
+    # left to the conversational interpreter because they depend heavily on history.
+    terse = {
+        "yes", "no", "evet", "hayır", "да", "нет",
+        "more", "more?", "daha", "daha?", "ещё", "еще",
+        "all", "all of them", "hepsi", "все", "все варианты",
+    }
+    if low in terse:
         return None
-    if re.search(r"\b(don't|do not|without|exclude|istemiyorum|olmasın|hariç)\b", low):
+    if re.search(r"\b(don't|do not|without|exclude|istemiyorum|olmasın|hariç|istemem|без|исключи|не хочу)\b", low):
         return None
 
     targets = list(resolved_targets or [])
@@ -1224,9 +1230,18 @@ def fast_common_interpretation(message, resolved_targets=None):
     preferences = []
     seller_mode = None
 
-    # Decision mode.
-    shop_words = re.search(r"\b(listings?|ads?|advert(?:s|isements?)?|for sale|show me actual|ilan(?:lar|ları)?|göster)\b", low)
-    compare_words = re.search(r"\b(compare|versus|vs\.?|karşılaştır|kıyasla|сравни)\b", low)
+    # Decision mode — deliberately multilingual and conservative.
+    shop_words = re.search(
+        r"\b(listings?|ads?|advert(?:s|isements?)?|for sale|show me actual|"
+        r"ilan(?:lar|ları|lari)?|satılık|satilik|göster|goster|"
+        r"объявлен(?:ие|ия|ий)|покажи|показать|в продаже|прода(?:же|ются))\b",
+        low,
+    )
+    compare_words = re.search(
+        r"\b(compare|comparison|versus|vs\.?|karşılaştır|karsilastir|kıyasla|kiyasla|"
+        r"сравни(?:ть|те)?|сравнение|против)\b",
+        low,
+    )
     if shop_words and targets:
         decision_mode = "SHOP"
     elif compare_words or len(targets) >= 2:
@@ -1236,62 +1251,116 @@ def fast_common_interpretation(message, resolved_targets=None):
     else:
         decision_mode = "DISCOVER"
 
-    # Budget forms: £15,000, 15k GBP, 15000 pounds, 15 bin.
+    # Budget forms: £15,000; 15k GBP; 15000 pounds; 15 bin; 15 тыс.
     budget_match = re.search(r"£\s*([0-9][0-9.,]*\s*[kK]?)", raw)
     if not budget_match:
-        budget_match = re.search(r"\b([0-9][0-9.,]*\s*[kK]?)\s*(?:gbp|pounds?|sterling)\b", low)
+        budget_match = re.search(
+            r"\b([0-9][0-9.,]*\s*[kK]?)\s*(?:gbp|pounds?|sterling|sterlin|sterlinlik|"
+            r"фунт(?:ов|а)?|стерлинг(?:ов|а)?)\b",
+            low,
+        )
     if not budget_match:
         bin_match = re.search(r"\b([0-9]+(?:[.,][0-9]+)?)\s*bin\b", low)
         if bin_match:
             amount = _parse_human_number(bin_match.group(1))
             if amount is not None:
                 filters["budget"] = amount * 1000
+        else:
+            ru_thousand = re.search(r"\b([0-9]+(?:[.,][0-9]+)?)\s*(?:тыс|тысяч)\b", low)
+            if ru_thousand:
+                amount = _parse_human_number(ru_thousand.group(1))
+                if amount is not None:
+                    filters["budget"] = amount * 1000
     else:
         amount = _parse_human_number(budget_match.group(1))
         if amount is not None:
             filters["budget"] = amount
 
-    # Common mileage restrictions.
-    km_match = re.search(r"(?:under|below|max(?:imum)?|less than|altında|en fazla)\s*([0-9][0-9.,]*\s*[kK]?)\s*(?:km|kilomet)", low)
-    if km_match:
-        amount = _parse_human_number(km_match.group(1))
-        if amount is not None:
-            filters["max_km"] = amount
+    # Common mileage restrictions, including both prefix and suffix forms.
+    km_patterns = [
+        r"(?:under|below|max(?:imum)?|less than|altında|en fazla|maksimum|до|максимум|не более)\s*([0-9][0-9.,]*\s*[kK]?)\s*(?:km|kilomet(?:er|re)?|км)",
+        r"([0-9][0-9.,]*\s*[kK]?)\s*(?:km|kilomet(?:er|re)?|км)\s*(?:altında|altinda|ve altı|ve alti|or less|or below|maximum|максимум|или меньше)",
+    ]
+    for pattern in km_patterns:
+        km_match = re.search(pattern, low)
+        if km_match:
+            amount = _parse_human_number(km_match.group(1))
+            if amount is not None:
+                filters["max_km"] = amount
+            break
 
-    # Common minimum-year wording.
-    year_match = re.search(r"\b((?:19|20)\d{2})\s*(?:or newer|and newer|ve üzeri|ve sonrası)\b", low)
-    if year_match:
-        filters["min_year"] = int(year_match.group(1))
-    else:
-        year_match = re.search(r"(?:minimum|min(?:imum)? year|from|since|en az)\s*((?:19|20)\d{2})", low)
+    # Common minimum-year wording in EN/TR/RU.
+    year_patterns = [
+        r"\b((?:19|20)\d{2})\s*(?:or newer|and newer|ve üzeri|ve uzeri|ve sonrası|ve sonrasi|и новее|или новее)\b",
+        r"(?:minimum|min(?:imum)? year|from|since|en az|minimum yıl|min yıl|от|не старше)\s*((?:19|20)\d{2})",
+        r"((?:19|20)\d{2})\s*(?:model ve üstü|model ve ustu|modelden yeni|года и новее)",
+    ]
+    for pattern in year_patterns:
+        year_match = re.search(pattern, low)
         if year_match:
             filters["min_year"] = int(year_match.group(1))
+            break
 
-    if re.search(r"\b(automatic|otomatik|автомат)\b", low):
+    # Transmission.
+    if re.search(r"\b(automatic|otomatik|автомат(?:ическая|ический)?|акпп)\b", low):
         filters["transmissions"] = ["Automatic"]
-    elif re.search(r"\b(manual|manuel|механик)\b", low):
+    elif re.search(r"\b(manual|manuel|механик(?:а|ическая)?|мкпп)\b", low):
         filters["transmissions"] = ["Manual"]
 
-    if re.search(r"\b(private seller|individual seller|bireysel|özel satıcı)\b", low):
+    # Seller type.
+    if re.search(r"\b(private seller|individual seller|bireysel|özel satıcı|ozel satici|частн(?:ый|ого) продавец|частник)\b", low):
         seller_mode = "individual"
-    elif re.search(r"\b(dealer|dealership|gallery|galeri)\b", low):
+    elif re.search(r"\b(dealer|dealership|gallery|galeri|дилер|автосалон)\b", low):
         seller_mode = "gallery"
 
-    # High-value soft preferences.
-    if re.search(r"\b(economical|economic|fuel efficient|fuel-efficient|economy|ekonomik|az yakan|tasarruflu)\b", low):
+    # Buyer-oriented soft preferences. These map to the precomputed profile layer,
+    # so they remain deterministic and fast in all three supported languages.
+    if re.search(
+        r"\b(economical|economic|fuel efficient|fuel-efficient|economy|cheap to run|"
+        r"ekonomik|az yakan|tasarruflu|düşük tüketim|dusuk tuketim|"
+        r"экономич\w*|экономн\w*|низкий расход)\b",
+        low,
+    ):
         preferences.append("priority:economy")
-    if re.search(r"\b(luxury|premium|lüks)\b", low):
+
+    if re.search(r"\b(luxury|premium|luxurious|lüks|luks|премиальн\w*|роскошн\w*)\b", low):
         preferences.append("priority:luxury")
-    if re.search(r"\b(comfortable|comfort|konforlu|konfor)\b", low):
+
+    if re.search(r"\b(comfortable|comfort|konforlu|konfor|комфортн\w*|комфорт)\b", low):
         preferences.append("priority:comfort")
-    if re.search(r"\b(sporty|performance|sportif|performans)\b", low):
+
+    if re.search(r"\b(sporty|performance|sportif|performans|спортивн\w*|динамичн\w*|производительн\w*)\b", low):
         preferences.append("priority:performance")
-    if re.search(r"\b(small car|city car|küçük araba|küçük otomobil)\b", low):
+
+    if re.search(r"\b(practical|practicality|pratik|kullanışlı|kullanisli|практичн\w*)\b", low):
+        preferences.append("priority:practicality")
+
+    if re.search(r"\b(family car|family vehicle|for my family|aile arabası|aile arabasi|aile için|aile icin|семейн\w* автомобил\w*|для семьи)\b", low):
+        preferences.append("use_case:family")
+
+    if re.search(r"\b(commute|commuting|daily commute|işe gidip gel|ise gidip gel|günlük kullanım|gunluk kullanim|для поездок на работу|на каждый день|ежедневн\w*)\b", low):
+        preferences.append("use_case:commute")
+
+    # Vehicle/body type. Note the natural Turkish/Russian variants that were
+    # previously missed (e.g. "küçük bir araç", "небольшую машину").
+    if re.search(
+        r"\b(small car|small vehicle|city car|compact car|"
+        r"küçük(?:\s+bir)?\s+(?:araba|otomobil|araç)|şehir arabası|sehir arabasi|kompakt araba|"
+        r"маленьк\w*\s+(?:машин\w*|автомобил\w*)|небольш\w*\s+(?:машин\w*|автомобил\w*)|"
+        r"компактн\w*\s+(?:машин\w*|автомобил\w*)|городск\w*\s+автомобил\w*)\b",
+        low,
+    ):
         preferences.append("vehicle_type:small_car")
-    elif re.search(r"\b(suv)\b", low):
+    elif re.search(r"\b(suv|кроссовер|внедорожник)\b", low):
         preferences.append("vehicle_type:SUV")
-    elif re.search(r"\b(motorcycle|motosiklet)\b", low):
+    elif re.search(r"\b(crossover|crossover car)\b", low):
+        preferences.append("vehicle_type:crossover")
+    elif re.search(r"\b(pick-?up|pickup|kamyonet|пикап)\b", low):
+        preferences.append("vehicle_type:pickup")
+    elif re.search(r"\b(motorcycle|motosiklet|мотоцикл)\b", low):
         preferences.append("vehicle_type:motorcycle")
+    elif re.search(r"\b(scooter|skuter|scooter|скутер)\b", low):
+        preferences.append("vehicle_type:scooter")
 
     # Named single targets can safely be canonicalized here; multi-target COMPARE
     # is handled independently by _search_market_for_vehicle_targets.
@@ -1300,6 +1369,9 @@ def fast_common_interpretation(message, resolved_targets=None):
         filters["models"] = [targets[0]["model"]]
         if targets[0].get("category"):
             filters["categories"] = [targets[0]["category"]]
+
+    # Stable de-duplication while preserving preference order.
+    preferences = list(dict.fromkeys(preferences))
 
     recognized = bool(filters or preferences or targets or compare_words or shop_words or seller_mode)
     if not recognized:
@@ -1315,7 +1387,6 @@ def fast_common_interpretation(message, resolved_targets=None):
         "decision_mode": decision_mode,
         "fast_path": True,
     }
-
 
 def interpret_market_query(message, current_filters=None, language="TR", conversation_history=None):
     if not OPENAI_API_KEY:
