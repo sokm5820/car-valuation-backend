@@ -2542,6 +2542,141 @@ def enrich_model_options_with_buyer_intelligence(
 
 
 
+
+def _format_gbp(value, language="EN"):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if language == "TR":
+        return "£" + f"{number:,.0f}".replace(",", ".")
+    return "£" + f"{number:,.0f}"
+
+
+def _fast_discover_answer(language, filters, model_options):
+    """Render the factual discovery list locally so DISCOVER needs no final writing LLM."""
+    options = list(model_options or [])[:12]
+    if not options:
+        return None
+
+    budget = filters.get("budget")
+    budget_text = _format_gbp(budget, language) if budget not in [None, ""] else None
+
+    if language == "TR":
+        intro = (
+            f"{budget_text} bütçeyle mevcut piyasada değerlendirebileceğiniz güçlü bir seçenek yelpazesi var."
+            if budget_text else
+            "Mevcut piyasada değerlendirebileceğiniz geniş bir seçenek yelpazesi var."
+        )
+    elif language == "RU":
+        intro = (
+            f"С бюджетом до {budget_text} на текущем рынке есть широкий выбор подходящих вариантов."
+            if budget_text else
+            "На текущем рынке есть широкий выбор подходящих вариантов."
+        )
+    else:
+        intro = (
+            f"With a {budget_text} ceiling, the current North Cyprus market gives you a broad range of relevant options."
+            if budget_text else
+            "The current North Cyprus market gives you a broad range of relevant options."
+        )
+
+    lines = []
+    for item in options:
+        name = f"{item.get('brand','')} {item.get('model','')}".strip()
+        year = item.get("newest_year")
+        year_price = _format_gbp(item.get("newest_year_starting_price"), language)
+        count = int(item.get("count") or 0)
+        if language == "TR":
+            if year and year_price:
+                lines.append(f"{name} — {year}'e kadar · {year} {year_price}'dan · bütçe içinde {count} ilan")
+            else:
+                lines.append(f"{name} — bütçe içinde {count} ilan")
+        elif language == "RU":
+            if year and year_price:
+                lines.append(f"{name} — до {year} · {year} от {year_price} · {count} в рамках бюджета")
+            else:
+                lines.append(f"{name} — {count} в рамках бюджета")
+        else:
+            if year and year_price:
+                lines.append(f"{name} — up to {year} · {year} from {year_price} · {count} within budget")
+            else:
+                lines.append(f"{name} — {count} matching listings")
+
+    newest = max((int(x.get("newest_year") or 0) for x in options), default=0)
+    newest_names = [
+        f"{x.get('brand','')} {x.get('model','')}".strip()
+        for x in options if int(x.get("newest_year") or 0) == newest
+    ][:3]
+    if language == "TR":
+        closing = f"En yeni seçenekler {newest} model yılına kadar çıkıyor. İsterseniz buradan belirli modelleri karşılaştırabilir veya yıl/kilometre sınırı ekleyebilirsiniz."
+    elif language == "RU":
+        closing = f"Самые новые варианты доходят до {newest} года. Дальше можно сравнить конкретные модели или задать ограничение по году и пробегу."
+    else:
+        names = ", ".join(newest_names)
+        closing = f"The newest options reach {newest}" + (f", including {names}" if names else "") + ". You can now compare specific models or add a year/mileage limit."
+
+    return intro + "\n\n" + "\n".join(lines) + "\n\n" + closing
+
+
+def _fast_shop_answer(language, filters, search_result, listing_candidates):
+    """Render listing-level results locally and always use progressive disclosure."""
+    candidates = list(listing_candidates or [])[:3]
+    if not candidates:
+        return None
+    total = int(search_result.get("count", 0) or 0)
+    budget = filters.get("budget")
+    budget_text = _format_gbp(budget, language) if budget not in [None, ""] else None
+
+    first = candidates[0]
+    vehicle_name = f"{first.get('brand','')} {first.get('model','')} {first.get('category','')}".strip()
+    vehicle_name = re.sub(r"\\s+", " ", vehicle_name)
+
+    if language == "TR":
+        intro = f"İşte" + (f" {budget_text} bütçeniz içinde" if budget_text else "") + f" üç güncel {vehicle_name} ilanı:"
+    elif language == "RU":
+        intro = f"Вот три актуальных объявления {vehicle_name}" + (f" в рамках бюджета {budget_text}:" if budget_text else ":")
+    else:
+        intro = f"Here are three current {vehicle_name} listings" + (f" within your {budget_text} budget:" if budget_text else ":")
+
+    lines=[]
+    for x in candidates:
+        name=f"{x.get('brand','')} {x.get('model','')} {x.get('category','')}".strip()
+        name=re.sub(r"\\s+", " ", name)
+        year=x.get('year') or '—'
+        price=_format_gbp(x.get('price'), language) or '—'
+        details=[]
+        if x.get('km') is not None:
+            km=int(x['km'])
+            km_txt=f"{km:,}" if language != 'TR' else f"{km:,}".replace(',', '.')
+            details.append(f"{km_txt} km")
+        for key in ('transmission','color','company','location'):
+            val=str(x.get(key) or '').strip()
+            if val:
+                details.append(val)
+        lines.append(f"{name}, {year} — {price}" + (" · " + " · ".join(details) if details else ""))
+
+    if total > 10:
+        if language == "TR":
+            closing=f"Toplam {total} eşleşme var; yüzlerce ilan sıralamak yerine aramayı daraltmak daha faydalı olur. Maksimum kilometre, minimum model yılı, konum veya galeri/bireysel satıcı tercihinizi yazabilirsiniz."
+        elif language == "RU":
+            closing=f"Всего найдено {total} вариантов. Вместо длинного списка лучше сузить поиск: укажите максимальный пробег, минимальный год, район или дилер/частный продавец."
+        else:
+            closing=f"There are {total} matches, so a long list would not be very useful. Give me a maximum mileage, minimum year, location, or dealer/private-seller preference and I'll narrow it down."
+    elif total > len(candidates):
+        closing = {
+            'TR': f"Toplam {total} eşleşme var. Daha fazlasını gösterebilir veya kilometre/yıl gibi bir kriterle daraltabilirim.",
+            'RU': f"Всего найдено {total} вариантов. Можно показать ещё или сузить поиск по пробегу/году.",
+        }.get(language, f"There are {total} matches. I can show more or narrow them by mileage, year or another preference.")
+    else:
+        closing = {
+            'TR': f"Mevcut kriterlerinize uyan {total} ilan bunlar.",
+            'RU': f"Это все {total} объявлений, соответствующих текущим критериям.",
+        }.get(language, f"These are the {total} current listings matching your criteria.")
+
+    return intro + "\n\n" + "\n".join(lines) + "\n\n" + closing
+
+
 def generate_grounded_market_answer(message, language, filters, preferences, search_result, conversation_history=None, decision_mode="DISCOVER"):
     """Progressive-disclosure buying advice grounded in deterministic market data."""
     if not OPENAI_API_KEY:
@@ -2620,6 +2755,19 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
         advisory_results, filters, max_candidates=listing_candidate_limit
     )
 
+    # Fast paths: DISCOVER and SHOP are already fully grounded by deterministic data.
+    # Avoid a second writing-model request; this removes one sequential network/LLM
+    # round trip from the two most common customer journeys.
+    if decision_mode == "DISCOVER":
+        fast_answer = _fast_discover_answer(language, filters, model_options)
+        if fast_answer:
+            return fast_answer, advisory_results, advisory_count, model_options
+
+    if decision_mode == "SHOP":
+        fast_answer = _fast_shop_answer(language, filters, search_result, listing_candidates)
+        if fast_answer:
+            return fast_answer, advisory_results, advisory_count, model_options
+
     instructions = """
 You are a premium, neutral vehicle-buying decision assistant for North Cyprus.
 Think like a helpful expert conversation, not a search form and not a salesperson.
@@ -2659,8 +2807,14 @@ CORE BEHAVIOUR — PREMIUM DECISION ASSISTANT:
 DECISION MODE — AUTHORITATIVE:
 - decision_mode is application state, not a suggestion. Follow it.
 - DISCOVER: help the buyer understand the model-family opportunity set. Do not drift into individual listings.
-- COMPARE: directly evaluate the model(s) under discussion. Use Buyer Intelligence when relevant to explain transparent trade-offs such as current supply, observed turnover and asking-price pressure. Do not collapse the comparison into a universal score.
-- SHOP: work at individual-listing level using listing_candidates. Default to 3 listings unless the latest message explicitly asks for more/all. Keep every listing statement factual and grounded.
+- COMPARE: directly evaluate the model(s) under discussion. Keep it CONSUMER-FIRST and concise.
+  Prioritize, in this order where data supports it: within-budget availability, newest affordable year,
+  whether the buyer's mileage threshold can be met, observed resale/liquidity ease, and only then
+  cautious value-retention context. Use Buyer Intelligence behind the scenes; do NOT dump raw analytics.
+  Normally give 2-4 short paragraphs/sections total. A consumer should not need to interpret exit-rate,
+  price-pressure or confidence tables. Mention at most one or two supporting figures when they materially
+  change the decision. Do not claim reliability or appearance from market data. Do not collapse the comparison into a universal score.
+- SHOP: work at individual-listing level using listing_candidates. Default to 3 listings. Never dump dozens or hundreds of listings into chat, even if the buyer asks for all of them; show a small useful batch and prompt for maximum mileage, minimum year, location, seller type or another restriction when many matches remain. Keep every listing statement factual and grounded.
 - Never change modes yourself. The application has already classified the turn.
 
 NEUTRALITY:
@@ -2802,6 +2956,7 @@ FORMAT — IMPORTANT:
 
 @app.route("/api/assistant", methods=["POST"])
 def api_ai_buying_assistant():
+    request_started = time.perf_counter()
     try:
         data = request.json or {}
 
@@ -2826,12 +2981,14 @@ def api_ai_buying_assistant():
                 "error": "MESSAGE_REQUIRED"
             }), 400
 
+        interpret_started = time.perf_counter()
         interpretation = interpret_market_query(
             message=message,
             current_filters=current_filters,
             language=language,
             conversation_history=conversation_history,
         )
+        interpret_seconds = time.perf_counter() - interpret_started
 
         decision_mode = str(
             interpretation.get("decision_mode") or "DISCOVER"
@@ -2890,6 +3047,7 @@ def api_ai_buying_assistant():
         # cross-product created by global filters such as:
         #   models=[Aqua, Note], categories=[e-Power]
         # which would wrongly require Aqua itself to be e-Power.
+        search_started = time.perf_counter()
         if decision_mode == "COMPARE" and len(resolved_targets) >= 2:
             compare_base_filters = dict(next_filters)
             for key in (
@@ -2928,6 +3086,8 @@ def api_ai_buying_assistant():
                 max_limit=5000,
             )
 
+        search_seconds = time.perf_counter() - search_started
+
         if not search_result.get("success"):
             return jsonify(search_result), 503
 
@@ -2955,6 +3115,7 @@ def api_ai_buying_assistant():
                 "stage": "narrowing",
             })
 
+        answer_started = time.perf_counter()
         answer, advisory_results, advisory_count, model_options = generate_grounded_market_answer(
             message=message,
             language=language,
@@ -2963,6 +3124,14 @@ def api_ai_buying_assistant():
             search_result=search_result,
             conversation_history=conversation_history,
             decision_mode=decision_mode,
+        )
+        answer_seconds = time.perf_counter() - answer_started
+        total_seconds = time.perf_counter() - request_started
+        print(
+            f"ASSISTANT_TIMING mode={decision_mode} "
+            f"interpret={interpret_seconds:.2f}s search={search_seconds:.2f}s "
+            f"answer={answer_seconds:.2f}s total={total_seconds:.2f}s",
+            flush=True,
         )
 
         public_results = (advisory_results or search_result.get("results") or [])[:100]
