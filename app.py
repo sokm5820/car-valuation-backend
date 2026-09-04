@@ -811,6 +811,12 @@ min_year, max_year, min_km, max_km.
 
 Important rules:
 - Return JSON only.
+- Set "decision_mode" to exactly one of DISCOVER, COMPARE or SHOP.
+  DISCOVER = broad vehicle/model discovery, recommendations, narrowing, "what can I buy?", or "more options?".
+  COMPARE = comparing two or more models/brands, evaluating a chosen model in depth, or questions about resale/liquidity/price-pressure/trade-offs for models under discussion.
+  SHOP = the buyer explicitly asks to see/find/show actual individual listings/ads/vehicles for sale, or asks about a specific advertised vehicle.
+- Do NOT use SHOP merely because the buyer wants to buy a vehicle; SHOP requires listing-level intent.
+- A bare model name that deepens the conversation is COMPARE, not SHOP.
 - "filters" must contain ONLY constraints expressed or clearly modified
   by the latest user message.
 - Do not repeat old filters merely because they appear in current_filters.
@@ -926,6 +932,10 @@ Important rules:
             },
             "needs_clarification": {"type": "boolean"},
             "clarification_question": {"type": ["string", "null"]},
+            "decision_mode": {
+                "type": "string",
+                "enum": ["DISCOVER", "COMPARE", "SHOP"],
+            },
         },
         "required": [
             "filters",
@@ -934,6 +944,7 @@ Important rules:
             "preferences",
             "needs_clarification",
             "clarification_question",
+            "decision_mode",
         ],
         "additionalProperties": False,
     }
@@ -972,6 +983,11 @@ Important rules:
         for key, value in interpreted["filters"].items()
         if value is not None
     }
+
+    decision_mode = str(interpreted.get("decision_mode") or "DISCOVER").upper()
+    if decision_mode not in {"DISCOVER", "COMPARE", "SHOP"}:
+        decision_mode = "DISCOVER"
+    interpreted["decision_mode"] = decision_mode
 
     return interpreted
 
@@ -2272,7 +2288,7 @@ def enrich_model_options_with_buyer_intelligence(
 
 
 
-def generate_grounded_market_answer(message, language, filters, preferences, search_result, conversation_history=None):
+def generate_grounded_market_answer(message, language, filters, preferences, search_result, conversation_history=None, decision_mode="DISCOVER"):
     """Progressive-disclosure buying advice grounded in deterministic market data."""
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY_NOT_CONFIGURED")
@@ -2319,7 +2335,14 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
         preferences=preferences,
         hard_results=advisory_results,
     )
-    listing_candidates = select_assistant_candidates(advisory_results, filters, max_candidates=3)
+    decision_mode = str(decision_mode or "DISCOVER").upper()
+    if decision_mode not in {"DISCOVER", "COMPARE", "SHOP"}:
+        decision_mode = "DISCOVER"
+
+    listing_candidate_limit = 12 if decision_mode == "SHOP" else 3
+    listing_candidates = select_assistant_candidates(
+        advisory_results, filters, max_candidates=listing_candidate_limit
+    )
 
     instructions = """
 You are a premium, neutral vehicle-buying decision assistant for North Cyprus.
@@ -2355,6 +2378,13 @@ CORE BEHAVIOUR — PREMIUM DECISION ASSISTANT:
    shallow "newest year + overall starting price" line.
 7. Individual listing mode is for explicit listing requests. Show up to 3 by default; show more/all
    only when the user explicitly asks. Never print raw URLs unless requested.
+
+DECISION MODE — AUTHORITATIVE:
+- decision_mode is application state, not a suggestion. Follow it.
+- DISCOVER: help the buyer understand the model-family opportunity set. Do not drift into individual listings.
+- COMPARE: directly evaluate the model(s) under discussion. Use Buyer Intelligence when relevant to explain transparent trade-offs such as current supply, observed turnover and asking-price pressure. Do not collapse the comparison into a universal score.
+- SHOP: work at individual-listing level using listing_candidates. Default to 3 listings unless the latest message explicitly asks for more/all. Keep every listing statement factual and grounded.
+- Never change modes yourself. The application has already classified the turn.
 
 NEUTRALITY:
 - Never tell the buyer to buy a specific advertised vehicle.
@@ -2445,6 +2475,7 @@ FORMAT — IMPORTANT:
 
     payload = {
         "language": language,
+        "decision_mode": decision_mode,
         "latest_message": message,
         "recent_conversation": sanitize_conversation_history(conversation_history),
         "active_hard_filters": filters,
@@ -2454,11 +2485,12 @@ FORMAT — IMPORTANT:
         "buyer_intelligence_ready": BUYER_INTELLIGENCE_READY,
         "model_options": model_options,
         "listing_candidates": listing_candidates,
-        "listing_display_limit": 3,
+        "listing_display_limit": 3 if decision_mode == "SHOP" else 0,
         "instruction_note": (
-            "Use adaptive breadth: if the request is specific enough, show the supplied model options rather "
-            "than arbitrarily limiting the answer to three. Use individual listing facts only when "
-            "the latest message explicitly asks for listing-level detail. All prices are GBP."
+            "Follow decision_mode exactly. In DISCOVER, surface useful model options. In COMPARE, directly "
+            "compare/evaluate the model(s) under discussion using grounded market and Buyer Intelligence evidence. "
+            "In SHOP, use individual listing facts; default to three unless more/all was explicitly requested. "
+            "All prices are GBP."
         ),
     }
 
@@ -2519,6 +2551,12 @@ def api_ai_buying_assistant():
             conversation_history=conversation_history,
         )
 
+        decision_mode = str(
+            interpretation.get("decision_mode") or "DISCOVER"
+        ).upper()
+        if decision_mode not in {"DISCOVER", "COMPARE", "SHOP"}:
+            decision_mode = "DISCOVER"
+
         next_filters = apply_interpretation_to_filters(
             current_filters,
             interpretation,
@@ -2543,6 +2581,7 @@ def api_ai_buying_assistant():
                 "returned": 0,
                 "results": [],
                 "interpretation": interpretation,
+                "decision_mode": decision_mode,
             })
 
         # Pull the full filtered result set for candidate selection. The public
@@ -2593,6 +2632,7 @@ def api_ai_buying_assistant():
                 "returned": len(public_results),
                 "results": public_results,
                 "interpretation": interpretation,
+                "decision_mode": "DISCOVER",
                 "stage": "narrowing",
             })
 
@@ -2603,6 +2643,7 @@ def api_ai_buying_assistant():
             preferences=next_preferences,
             search_result=search_result,
             conversation_history=conversation_history,
+            decision_mode=decision_mode,
         )
 
         public_results = (advisory_results or search_result.get("results") or [])[:100]
@@ -2617,6 +2658,7 @@ def api_ai_buying_assistant():
             "returned": len(public_results),
             "results": public_results,
             "interpretation": interpretation,
+            "decision_mode": decision_mode,
             "stage": "recommendation",
         })
 
