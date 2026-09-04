@@ -717,77 +717,74 @@ def _normalize_vehicle_phrase(value):
 
 def resolve_market_vehicle_mentions(message):
     """
-    Resolve explicitly named vehicles against the live Brand + Model + Category
-    universe without hard-coded vehicle names.
+    Resolve explicitly named vehicles against live Brand + Model + Category values.
 
-    Returns one canonical target per mentioned Brand/Model pair. Category is only
-    attached when the buyer actually names a textual category/variant in the same
-    phrase (for example Nissan Note e-Power). Numeric-only categories such as 1.2
-    are deliberately not inferred from ordinary prose.
+    This version is intentionally linear-time. The previous implementation repeatedly
+    filtered the market universe once for every model family, which could add ~20s to
+    every assistant request on the production dataset.
     """
     if not MARKET_READY or market_df is None or market_df.empty:
         return []
 
-    normalized_message = f" {_normalize_vehicle_phrase(message)} "
-    if not normalized_message.strip():
+    message_n = _normalize_vehicle_phrase(message)
+    if not message_n:
         return []
+    padded_message = f" {message_n} "
 
     universe = (
         market_df[["Brand", "Model", "Category"]]
         .fillna("")
         .astype(str)
-        .apply(lambda col: col.str.strip())
         .drop_duplicates()
     )
 
-    # Build canonical Brand/Model families first. This lets "Toyota Aqua" resolve
-    # even though the market may contain many Aqua categories.
-    families = (
-        universe[["Brand", "Model"]]
-        .drop_duplicates()
-        .to_dict(orient="records")
-    )
-
-    candidates = []
-    for family in families:
-        brand = str(family["Brand"]).strip()
-        model = str(family["Model"]).strip()
+    # Build all lookup structures in one pass instead of rescanning the dataframe
+    # for each Brand/Model candidate.
+    families = {}
+    model_to_brands = {}
+    for row in universe.itertuples(index=False):
+        brand = str(row.Brand).strip()
+        model = str(row.Model).strip()
+        category = str(row.Category).strip()
         if not brand or not model:
             continue
 
         brand_n = _normalize_vehicle_phrase(brand)
         model_n = _normalize_vehicle_phrase(model)
+        key = (brand_n, model_n)
+        family = families.setdefault(key, {
+            "brand": brand,
+            "model": model,
+            "brand_n": brand_n,
+            "model_n": model_n,
+            "categories": {},
+        })
+        model_to_brands.setdefault(model_n, set()).add(brand_n)
+        if category:
+            category_n = _normalize_vehicle_phrase(category)
+            if category_n:
+                family["categories"][category_n] = category
+
+    candidates = []
+    for family in families.values():
+        brand = family["brand"]
+        model = family["model"]
+        brand_n = family["brand_n"]
+        model_n = family["model_n"]
         full_n = f"{brand_n} {model_n}".strip()
 
-        matched = False
         match_strength = 0
-
-        # Strongest form: explicit brand + model.
-        if full_n and f" {full_n} " in normalized_message:
-            matched = True
+        if full_n and f" {full_n} " in padded_message:
             match_strength = 3
-        else:
-            # Model-only mentions are accepted only when that normalized model maps
-            # to a single brand in the live market. This safely handles terse
-            # follow-ups such as "Aqua" without guessing ambiguous model names.
-            model_rows = universe[
-                universe["Model"].map(_normalize_vehicle_phrase) == model_n
-            ]
-            unique_brands = {
-                _normalize_vehicle_phrase(v)
-                for v in model_rows["Brand"].tolist()
-                if str(v).strip()
-            }
-            if (
-                model_n
-                and len(model_n) >= 3
-                and f" {model_n} " in normalized_message
-                and len(unique_brands) == 1
-            ):
-                matched = True
-                match_strength = 2
+        elif (
+            model_n
+            and len(model_n) >= 3
+            and f" {model_n} " in padded_message
+            and len(model_to_brands.get(model_n, set())) == 1
+        ):
+            match_strength = 2
 
-        if not matched:
+        if not match_strength:
             continue
 
         target = {
@@ -798,28 +795,16 @@ def resolve_market_vehicle_mentions(message):
             "_phrase_len": len(full_n),
         }
 
-        pair_rows = universe[
-            (universe["Brand"].map(_normalize_vehicle_phrase) == brand_n)
-            & (universe["Model"].map(_normalize_vehicle_phrase) == model_n)
-        ]
-
         category_matches = []
-        for category in pair_rows["Category"].drop_duplicates().tolist():
-            category = str(category).strip()
-            category_n = _normalize_vehicle_phrase(category)
-            if not category_n:
-                continue
-
+        for category_n, category in family["categories"].items():
             # Do not infer plain engine-size categories from incidental numbers.
             if not re.search(r"[a-zçğıöşüа-яё]", category_n, flags=re.IGNORECASE):
                 continue
-
             model_category = f"{model_n} {category_n}".strip()
             full_category = f"{brand_n} {model_n} {category_n}".strip()
-
             if (
-                (full_category and f" {full_category} " in normalized_message)
-                or (model_category and f" {model_category} " in normalized_message)
+                (full_category and f" {full_category} " in padded_message)
+                or (model_category and f" {model_category} " in padded_message)
             ):
                 category_matches.append((len(category_n), category))
 
@@ -831,38 +816,31 @@ def resolve_market_vehicle_mentions(message):
 
         candidates.append(target)
 
-    # Deduplicate Brand/Model families and keep the strongest/most specific match.
-    best = {}
+    # If a longer model phrase contains a shorter model phrase from the same brand,
+    # keep the most specific family. This protects compound model names.
+    candidates.sort(key=lambda x: (-x["_match_strength"], -x["_phrase_len"]))
+    resolved = []
+    seen = set()
     for item in candidates:
-        key = (
-            _normalize_vehicle_phrase(item["brand"]),
-            _normalize_vehicle_phrase(item["model"]),
-        )
-        previous = best.get(key)
-        score = (item["_match_strength"], item["_phrase_len"])
-        previous_score = (
-            (previous["_match_strength"], previous["_phrase_len"])
-            if previous else (-1, -1)
-        )
-        if score > previous_score:
-            best[key] = item
-
-    resolved = list(best.values())
-    resolved.sort(
-        key=lambda x: (
-            -int(x["_match_strength"]),
-            -int(x["_phrase_len"]),
-            x["brand"].casefold(),
-            x["model"].casefold(),
-        )
-    )
-
-    for item in resolved:
+        key = (_normalize_vehicle_phrase(item["brand"]), _normalize_vehicle_phrase(item["model"]))
+        if key in seen:
+            continue
+        # Skip a shorter same-brand model fully contained in an already-selected model.
+        model_n = key[1]
+        brand_n = key[0]
+        if any(
+            _normalize_vehicle_phrase(x["brand"]) == brand_n
+            and model_n != _normalize_vehicle_phrase(x["model"])
+            and f" {model_n} " in f" {_normalize_vehicle_phrase(x['model'])} "
+            for x in resolved
+        ):
+            continue
+        seen.add(key)
         item.pop("_match_strength", None)
         item.pop("_phrase_len", None)
+        resolved.append(item)
 
     return resolved
-
 
 def _search_market_for_vehicle_targets(base_filters, targets):
     """
@@ -1027,6 +1005,144 @@ def sanitize_ai_filters(raw_filters):
                 clean[key] = normalized
 
     return clean
+
+
+def _parse_human_number(token):
+    token = str(token or "").strip().lower().replace(" ", "")
+    if not token:
+        return None
+    multiplier = 1
+    if token.endswith("k"):
+        multiplier = 1000
+        token = token[:-1]
+    # 15,000 / 15.000 are thousands; 15.5 is decimal when small.
+    if "," in token and "." in token:
+        token = token.replace(",", "")
+    elif token.count(",") == 1:
+        left, right = token.split(",")
+        token = left + right if len(right) == 3 else left + "." + right
+    elif token.count(".") == 1:
+        left, right = token.split(".")
+        token = left + right if len(right) == 3 and len(left) >= 1 else left + "." + right
+    try:
+        return float(token) * multiplier
+    except (TypeError, ValueError):
+        return None
+
+
+def fast_common_interpretation(message, resolved_targets=None):
+    """
+    Deterministic fast path for common, high-confidence buyer requests.
+    Ambiguous conversational turns still fall back to the LLM interpreter.
+    """
+    raw = str(message or "").strip()
+    low = raw.casefold()
+    if not raw:
+        return None
+
+    # Terse contextual replies and explicit negations/corrections are intentionally
+    # left to the conversational interpreter.
+    if low in {"yes", "no", "evet", "hayır", "more", "more?", "daha", "daha?", "all", "all of them"}:
+        return None
+    if re.search(r"\b(don't|do not|without|exclude|istemiyorum|olmasın|hariç)\b", low):
+        return None
+
+    targets = list(resolved_targets or [])
+    filters = {}
+    preferences = []
+    seller_mode = None
+
+    # Decision mode.
+    shop_words = re.search(r"\b(listings?|ads?|advert(?:s|isements?)?|for sale|show me actual|ilan(?:lar|ları)?|göster)\b", low)
+    compare_words = re.search(r"\b(compare|versus|vs\.?|karşılaştır|kıyasla|сравни)\b", low)
+    if shop_words and targets:
+        decision_mode = "SHOP"
+    elif compare_words or len(targets) >= 2:
+        decision_mode = "COMPARE"
+    elif len(targets) == 1 and re.fullmatch(r"[\w\s\-]+[?]?", raw, flags=re.UNICODE):
+        decision_mode = "COMPARE"
+    else:
+        decision_mode = "DISCOVER"
+
+    # Budget forms: £15,000, 15k GBP, 15000 pounds, 15 bin.
+    budget_match = re.search(r"£\s*([0-9][0-9.,]*\s*[kK]?)", raw)
+    if not budget_match:
+        budget_match = re.search(r"\b([0-9][0-9.,]*\s*[kK]?)\s*(?:gbp|pounds?|sterling)\b", low)
+    if not budget_match:
+        bin_match = re.search(r"\b([0-9]+(?:[.,][0-9]+)?)\s*bin\b", low)
+        if bin_match:
+            amount = _parse_human_number(bin_match.group(1))
+            if amount is not None:
+                filters["budget"] = amount * 1000
+    else:
+        amount = _parse_human_number(budget_match.group(1))
+        if amount is not None:
+            filters["budget"] = amount
+
+    # Common mileage restrictions.
+    km_match = re.search(r"(?:under|below|max(?:imum)?|less than|altında|en fazla)\s*([0-9][0-9.,]*\s*[kK]?)\s*(?:km|kilomet)", low)
+    if km_match:
+        amount = _parse_human_number(km_match.group(1))
+        if amount is not None:
+            filters["max_km"] = amount
+
+    # Common minimum-year wording.
+    year_match = re.search(r"\b((?:19|20)\d{2})\s*(?:or newer|and newer|ve üzeri|ve sonrası)\b", low)
+    if year_match:
+        filters["min_year"] = int(year_match.group(1))
+    else:
+        year_match = re.search(r"(?:minimum|min(?:imum)? year|from|since|en az)\s*((?:19|20)\d{2})", low)
+        if year_match:
+            filters["min_year"] = int(year_match.group(1))
+
+    if re.search(r"\b(automatic|otomatik|автомат)\b", low):
+        filters["transmissions"] = ["Automatic"]
+    elif re.search(r"\b(manual|manuel|механик)\b", low):
+        filters["transmissions"] = ["Manual"]
+
+    if re.search(r"\b(private seller|individual seller|bireysel|özel satıcı)\b", low):
+        seller_mode = "individual"
+    elif re.search(r"\b(dealer|dealership|gallery|galeri)\b", low):
+        seller_mode = "gallery"
+
+    # High-value soft preferences.
+    if re.search(r"\b(economical|economic|fuel efficient|fuel-efficient|economy|ekonomik|az yakan|tasarruflu)\b", low):
+        preferences.append("priority:economy")
+    if re.search(r"\b(luxury|premium|lüks)\b", low):
+        preferences.append("priority:luxury")
+    if re.search(r"\b(comfortable|comfort|konforlu|konfor)\b", low):
+        preferences.append("priority:comfort")
+    if re.search(r"\b(sporty|performance|sportif|performans)\b", low):
+        preferences.append("priority:performance")
+    if re.search(r"\b(small car|city car|küçük araba|küçük otomobil)\b", low):
+        preferences.append("vehicle_type:small_car")
+    elif re.search(r"\b(suv)\b", low):
+        preferences.append("vehicle_type:SUV")
+    elif re.search(r"\b(motorcycle|motosiklet)\b", low):
+        preferences.append("vehicle_type:motorcycle")
+
+    # Named single targets can safely be canonicalized here; multi-target COMPARE
+    # is handled independently by _search_market_for_vehicle_targets.
+    if len(targets) == 1:
+        filters["brands"] = [targets[0]["brand"]]
+        filters["models"] = [targets[0]["model"]]
+        if targets[0].get("category"):
+            filters["categories"] = [targets[0]["category"]]
+
+    recognized = bool(filters or preferences or targets or compare_words or shop_words or seller_mode)
+    if not recognized:
+        return None
+
+    return {
+        "filters": sanitize_ai_filters(filters),
+        "clear_filters": [],
+        "seller_mode": seller_mode,
+        "preferences": preferences,
+        "needs_clarification": False,
+        "clarification_question": None,
+        "decision_mode": decision_mode,
+        "fast_path": True,
+    }
 
 
 def interpret_market_query(message, current_filters=None, language="TR", conversation_history=None):
@@ -1206,6 +1322,8 @@ Important rules:
         },
         json={
             "model": OPENAI_MODEL,
+            "reasoning": {"effort": "none"},
+            "max_output_tokens": 700,
             "instructions": instructions,
             "input": json.dumps(user_payload, ensure_ascii=False),
         },
@@ -2031,6 +2149,8 @@ Rules:
                 },
                 json={
                     "model": OPENAI_MODEL,
+                    "reasoning": {"effort": "none"},
+                    "max_output_tokens": 900,
                     "instructions": instructions,
                     "input": json.dumps(payload, ensure_ascii=False),
                 },
@@ -2619,6 +2739,121 @@ def _fast_discover_answer(language, filters, model_options):
     return intro + "\n\n" + "\n".join(lines) + "\n\n" + closing
 
 
+def _fast_compare_answer(message, language, filters, model_options):
+    """Concise consumer comparison using only grounded market/Buyer Intelligence facts."""
+    options = list(model_options or [])
+    if len(options) < 2:
+        return None
+
+    targets = resolve_market_vehicle_mentions(message)
+    target_labels = {}
+    for t in targets:
+        key = (str(t.get("brand") or "").casefold(), str(t.get("model") or "").casefold())
+        label = f"{t.get('brand','')} {t.get('model','')}".strip()
+        if t.get("category"):
+            label += f" {t['category']}"
+        target_labels[key] = label
+
+    # Only compare the explicitly relevant options and keep the response compact.
+    chosen = options[:4]
+    budget = filters.get("budget")
+    budget_text = _format_gbp(budget, language) if budget not in [None, ""] else None
+
+    def label(o):
+        key = (str(o.get("brand") or "").casefold(), str(o.get("model") or "").casefold())
+        return target_labels.get(key) or f"{o.get('brand','')} {o.get('model','')}".strip()
+
+    def km_text(v):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return None
+        return f"{n:,}" if language != "TR" else f"{n:,}".replace(",", ".")
+
+    # Determine factual leaders.
+    newest_winner = max(chosen, key=lambda o: (int(o.get("newest_year") or 0), int(o.get("count") or 0)))
+    choice_winner = max(chosen, key=lambda o: int(o.get("count") or 0))
+
+    liquidity_candidates=[]
+    for o in chosen:
+        bi=o.get("buyer_intelligence") or {}
+        days=bi.get("median_observed_days_to_exit")
+        rate=bi.get("exit_60_rate")
+        if days is not None or rate is not None:
+            liquidity_candidates.append((o, days, rate))
+    liquidity_winner=None
+    if liquidity_candidates:
+        liquidity_winner=min(
+            liquidity_candidates,
+            key=lambda t: (float(t[1]) if t[1] is not None else 10**9, -(float(t[2]) if t[2] is not None else -1)),
+        )[0]
+
+    if language == "TR":
+        intro = (f"{budget_text} bütçenizde " if budget_text else "") + f"{label(choice_winner)} daha fazla seçenek sunuyor; {label(newest_winner)} ise ulaşılabilen en yeni model yılı açısından öne çıkıyor."
+    elif language == "RU":
+        intro = (f"При бюджете {budget_text} " if budget_text else "") + f"у {label(choice_winner)} больше выбора, а {label(newest_winner)} лидирует по самому новому доступному году."
+    else:
+        intro = (f"With your {budget_text} ceiling, " if budget_text else "") + f"{label(choice_winner)} gives you more choice, while {label(newest_winner)} reaches the newest affordable model year."
+
+    sections=[]
+    for o in chosen:
+        name=label(o)
+        count=int(o.get("count") or 0)
+        year=o.get("newest_year")
+        price=_format_gbp(o.get("newest_year_starting_price"), language)
+        lo=km_text(o.get("lowest_km")); hi=km_text(o.get("highest_km"))
+        bi=o.get("buyer_intelligence") or {}
+        days=bi.get("median_observed_days_to_exit")
+        rate=bi.get("exit_60_rate")
+
+        if language == "TR":
+            facts=f"{count} eşleşme"
+            if year and price: facts += f" · en yeni uygun yıl {year}, {price}'dan"
+            if lo and hi: facts += f" · km aralığı {lo}–{hi}"
+            resale=""
+            if days is not None:
+                resale=f" Tarihsel veride medyan gözlenen piyasa çıkış süresi yaklaşık {float(days):.0f} gündü; bu satış garantisi değildir."
+            sections.append(f"{name}\n{facts}.{resale}")
+        elif language == "RU":
+            facts=f"{count} подходящих вариантов"
+            if year and price: facts += f" · самый новый доступный год {year}, от {price}"
+            if lo and hi: facts += f" · пробег {lo}–{hi} км"
+            resale=""
+            if days is not None:
+                resale=f" Историческая медиана наблюдаемого времени до ухода с рынка — около {float(days):.0f} дней; это не подтверждает продажу."
+            sections.append(f"{name}\n{facts}.{resale}")
+        else:
+            facts=f"{count} matches"
+            if year and price: facts += f" · newest affordable {year} from {price}"
+            if lo and hi: facts += f" · mileage range {lo}–{hi} km"
+            resale=""
+            if days is not None:
+                resale=f" Historically, the median observed time before leaving the market was about {float(days):.0f} days; that does not prove a sale."
+            sections.append(f"{name}\n{facts}.{resale}")
+
+    if language == "TR":
+        close_parts=[]
+        close_parts.append(f"Daha fazla seçenek ve daha yeni araç bulma açısından {label(choice_winner)} öne çıkıyor.")
+        if liquidity_winner is not None:
+            close_parts.append(f"Yeniden satılabilirlik için sahip olduğumuz piyasa sinyallerinde {label(liquidity_winner)} daha hızlı gözlenen devir gösteriyor.")
+        close_parts.append("Değerini ne kadar koruyacağını bu verilerle güvenilir biçimde garanti edemeyiz. Maksimum kilometrenizi söylerseniz karşılaştırmayı doğrudan o sınırın içindeki araçlara indirebilirim.")
+        closing=" ".join(close_parts)
+    elif language == "RU":
+        close_parts=[f"По выбору и более новым машинам сильнее выглядит {label(choice_winner)}."]
+        if liquidity_winner is not None:
+            close_parts.append(f"По наблюдаемому рыночному обороту сигнал сильнее у {label(liquidity_winner)}.")
+        close_parts.append("Надёжно гарантировать сохранение стоимости по этим данным нельзя. Укажите максимальный пробег — и я сравню только варианты в этом диапазоне.")
+        closing=" ".join(close_parts)
+    else:
+        close_parts=[f"For choice and access to newer cars, {label(choice_winner)} is stronger."]
+        if liquidity_winner is not None:
+            close_parts.append(f"For resale ease, the historical market signal is stronger for {label(liquidity_winner)}, based on faster observed turnover.")
+        close_parts.append("The data cannot reliably guarantee which one will hold its value better. Give me your maximum mileage and I can compare only the cars that actually meet it.")
+        closing=" ".join(close_parts)
+
+    return intro + "\n\n" + "\n\n".join(sections) + "\n\n" + closing
+
+
 def _fast_shop_answer(language, filters, search_result, listing_candidates):
     """Render listing-level results locally and always use progressive disclosure."""
     candidates = list(listing_candidates or [])[:3]
@@ -2760,6 +2995,11 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
     # round trip from the two most common customer journeys.
     if decision_mode == "DISCOVER":
         fast_answer = _fast_discover_answer(language, filters, model_options)
+        if fast_answer:
+            return fast_answer, advisory_results, advisory_count, model_options
+
+    if decision_mode == "COMPARE":
+        fast_answer = _fast_compare_answer(message, language, filters, model_options)
         if fast_answer:
             return fast_answer, advisory_results, advisory_count, model_options
 
@@ -2938,6 +3178,8 @@ FORMAT — IMPORTANT:
         },
         json={
             "model": OPENAI_MODEL,
+            "reasoning": {"effort": "none"},
+            "max_output_tokens": 900,
             "instructions": instructions,
             "input": json.dumps(payload, ensure_ascii=False),
         },
@@ -2981,13 +3223,22 @@ def api_ai_buying_assistant():
                 "error": "MESSAGE_REQUIRED"
             }), 400
 
+        resolve_started = time.perf_counter()
+        resolved_targets = resolve_market_vehicle_mentions(message)
+        resolve_seconds = time.perf_counter() - resolve_started
+
         interpret_started = time.perf_counter()
-        interpretation = interpret_market_query(
+        interpretation = fast_common_interpretation(
             message=message,
-            current_filters=current_filters,
-            language=language,
-            conversation_history=conversation_history,
+            resolved_targets=resolved_targets,
         )
+        if interpretation is None:
+            interpretation = interpret_market_query(
+                message=message,
+                current_filters=current_filters,
+                language=language,
+                conversation_history=conversation_history,
+            )
         interpret_seconds = time.perf_counter() - interpret_started
 
         decision_mode = str(
@@ -3005,8 +3256,6 @@ def api_ai_buying_assistant():
             current_preferences,
             interpretation.get("preferences", []),
         )
-
-        resolved_targets = resolve_market_vehicle_mentions(message)
 
         # Canonicalize explicitly named single vehicles. This fixes natural compound
         # names such as "Nissan Note e-Power" without hard-coding any vehicle.
@@ -3129,8 +3378,9 @@ def api_ai_buying_assistant():
         total_seconds = time.perf_counter() - request_started
         print(
             f"ASSISTANT_TIMING mode={decision_mode} "
-            f"interpret={interpret_seconds:.2f}s search={search_seconds:.2f}s "
-            f"answer={answer_seconds:.2f}s total={total_seconds:.2f}s",
+            f"resolve={resolve_seconds:.2f}s interpret={interpret_seconds:.2f}s "
+            f"search={search_seconds:.2f}s answer={answer_seconds:.2f}s "
+            f"fast_interpret={bool(interpretation.get('fast_path'))} total={total_seconds:.2f}s",
             flush=True,
         )
 
