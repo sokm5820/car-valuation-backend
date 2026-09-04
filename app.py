@@ -1128,7 +1128,7 @@ Important rules:
         "language": language,
         "latest_message": message,
         "current_filters": current_filters,
-        "recent_conversation": sanitize_conversation_history(conversation_history),
+        "recent_conversation": sanitize_conversation_history(conversation_history, max_messages=10),
         "market_context": market_context,
         "resolved_vehicle_mentions": resolved_vehicle_mentions,
     }
@@ -2006,12 +2006,17 @@ Rules:
 - Keep reason extremely short and neutral. It is internal context, not advertising copy.
 """
 
+    # Keep the qualification request compact. The deterministic market grouping is
+    # already ordered by current representation/newness, so a generous cap preserves
+    # useful choice while avoiding sending hundreds of model families to the LLM.
+    qualification_market = model_market[:160]
+
     payload = {
         "language": language,
         "latest_message": message,
         "hard_filters": filters,
         "soft_preferences": relevant_preferences,
-        "model_market": model_market,
+        "model_market": qualification_market,
     }
 
     response = None
@@ -2054,7 +2059,7 @@ Rules:
 
     market_by_key = {
         (m["brand"].casefold(), m["model"].casefold()): m
-        for m in model_market
+        for m in qualification_market
     }
     selected_keys = []
     reasons = []
@@ -2553,20 +2558,33 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
         }
         return fallback.get(language, fallback["TR"]), [], 0, []
 
-    qualified_results, model_reasons, qualified_summaries = shortlist_models_for_preferences(
-        message=message,
-        language=language,
-        filters=filters,
-        preferences=preferences,
-        results=hard_results,
-    )
+    decision_mode = str(decision_mode or "DISCOVER").upper()
+    if decision_mode not in {"DISCOVER", "COMPARE", "SHOP"}:
+        decision_mode = "DISCOVER"
+
+    # Model qualification is useful during DISCOVER because soft ideas such as
+    # economical/small/luxury need model-level automotive knowledge. Once the buyer
+    # explicitly moves to COMPARE or SHOP, the named market targets are already known.
+    # Re-running that extra LLM step adds latency and can only narrow relevant evidence.
+    if decision_mode == "DISCOVER":
+        qualified_results, model_reasons, qualified_summaries = shortlist_models_for_preferences(
+            message=message,
+            language=language,
+            filters=filters,
+            preferences=preferences,
+            results=hard_results,
+        )
+    else:
+        qualified_results = list(hard_results)
+        model_reasons = []
+        qualified_summaries = _group_market_models(hard_results)
 
     has_soft_pref = any(
         str(p).casefold().startswith(("vehicle_type:", "priority:", "use_case:"))
         for p in (preferences or [])
     )
 
-    if has_soft_pref and not qualified_results:
+    if decision_mode == "DISCOVER" and has_soft_pref and not qualified_results:
         fallback = {
             "TR": "Belirttiğiniz kriterlerle bu tercihi karşılayan bir model bulamadım. İsterseniz bütçe, yıl, kilometre veya araç tipi kriterlerinden birini esnetebiliriz.",
             "EN": "I couldn't find a model that matches both those filters and that preference. We can loosen the budget, year, mileage or vehicle type.",
@@ -2584,10 +2602,19 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
         preferences=preferences,
         hard_results=advisory_results,
     )
-    decision_mode = str(decision_mode or "DISCOVER").upper()
-    if decision_mode not in {"DISCOVER", "COMPARE", "SHOP"}:
-        decision_mode = "DISCOVER"
 
+    # Make buyer relevance explicit for the response model. `count`, `newest_year`
+    # and the newest-year price above are calculated from the ACTIVE deterministic
+    # search result, so when a budget exists they describe what that budget can buy.
+    budget_ceiling = filters.get("budget")
+    for option in model_options:
+        option["active_filter_context"] = {
+            "budget_ceiling": budget_ceiling,
+            "matching_listing_count": option.get("count"),
+            "newest_matching_year": option.get("newest_year"),
+            "newest_matching_year_starting_price": option.get("newest_year_starting_price"),
+            "lowest_matching_asking_price": option.get("starting_price"),
+        }
     listing_candidate_limit = 12 if decision_mode == "SHOP" else 3
     listing_candidates = select_assistant_candidates(
         advisory_results, filters, max_candidates=listing_candidate_limit
@@ -2621,10 +2648,11 @@ CORE BEHAVIOUR — PREMIUM DECISION ASSISTANT:
    chosen brand/model -> useful model-market summary
    explicit listing request -> concrete listings
    specific listing question -> factual listing discussion
-6. For a chosen model, give genuinely useful market context from the supplied facts: matching count,
-   newest matching year, price of the cheapest listing IN THAT NEWEST YEAR, overall asking-price
-   floor/range, mileage range if available, and transmissions if available. Do not merely repeat one
-   shallow "newest year + overall starting price" line.
+6. For a chosen model, prioritize facts that are relevant to the buyer's ACTIVE filters. If a budget
+   ceiling exists, clearly distinguish what is available WITHIN that budget from any broader market
+   context. Never present an out-of-budget year/price as though it satisfies the buyer's budget.
+   Useful facts include matching count, newest matching year, cheapest listing IN THAT NEWEST YEAR,
+   mileage range and transmissions. Broader market context is secondary and must be clearly labelled.
 7. Individual listing mode is for explicit listing requests. Show up to 3 by default; show more/all
    only when the user explicitly asks. Never print raw URLs unless requested.
 
@@ -2685,15 +2713,20 @@ GROUNDING:
 - model_options and listing_candidates come from the live deterministic market search.
 - Never invent a model, price, year, mileage, seller, location, transmission or count.
 - Never mention a model that is not in model_options during discovery.
-- "starting_price" is the lowest asking price across ALL matching listings for that model.
-- "starting_price_year" is the model year attached to that overall cheapest asking-price level.
+- "starting_price" is the lowest asking price across matching listings for that model.
+- "starting_price_year" is the model year attached to that cheapest asking-price level.
 - "newest_year" is the newest matching model year.
 - "newest_year_starting_price" is the cheapest asking price specifically among listings of newest_year.
-- These facts are intentionally separate. NEVER write "up to 2021, starting from £11,000" when
-  £11,000 belongs to an older year. That wording falsely implies a 2021 can be bought for £11,000.
-- Preferred concise model line in English:
-  Mazda CX-3 — newest: 2021 from £X · overall from £Y · N listings
-  Omit any component whose supplied value is null.
+- `active_filter_context` repeats the buyer-relevant facts from the deterministic active search.
+- If active_hard_filters contains a budget, DISCOVER is about WHAT THAT BUDGET BUYS. Do NOT mention
+  the model's low-end/overall `starting_price` unless the buyer explicitly asks for the cheapest/low-end
+  market. A £2,900 old example is not useful merely because the buyer can spend £15,000.
+- With a budget, preferred concise DISCOVER line in English:
+  Mazda CX-3 — up to 2021 · 2021 from £X · N within budget
+  or natural equivalent. The year and price MUST belong together.
+- Without a budget, an overall starting price may be used when useful.
+- In COMPARE with a budget, lead with each model's within-budget matching count and newest affordable
+  year/price. Broader/out-of-budget inventory can be mentioned only as clearly labelled market context.
 - Equivalent natural phrasing should be used in Turkish/Russian.
 - If a requested vehicle type is present, all surfaced models must satisfy it.
 
@@ -2716,8 +2749,8 @@ FORMAT — IMPORTANT:
   one model per line, with NO blank lines between model lines
   BLANK LINE
   one concise synthesis/next-step paragraph only when it adds value
-- Keep terminology stable inside one conversation. Prefer "newest" + "overall from" consistently in
-  English rather than alternating among "up to", "newest year" and "starting from".
+- Keep terminology stable inside one conversation. When a budget exists, prefer concise
+  buyer-relevant wording such as "up to 2024 · 2024 from £13,500" rather than "overall from".
 - Do not hide useful options merely to make the answer shorter.
 - Do not explain the system or database to the buyer.
 """
