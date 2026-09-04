@@ -737,6 +737,14 @@ def resolve_market_vehicle_mentions(message):
         .astype(str)
         .drop_duplicates()
     )
+    # A dirty-data row can occasionally have a brand name in the Model column
+    # (for example Brand=Çekici, Model=Nissan). Never treat a model-only token as
+    # a vehicle mention when that token is itself a real brand name.
+    known_brand_norms = {
+        _normalize_vehicle_phrase(x)
+        for x in universe["Brand"].tolist()
+        if str(x).strip()
+    }
 
     # Build all lookup structures in one pass instead of rescanning the dataframe
     # for each Brand/Model candidate.
@@ -779,6 +787,7 @@ def resolve_market_vehicle_mentions(message):
         elif (
             model_n
             and len(model_n) >= 3
+            and model_n not in known_brand_norms
             and f" {model_n} " in padded_message
             and len(model_to_brands.get(model_n, set())) == 1
         ):
@@ -2749,8 +2758,16 @@ def _fast_compare_answer(message, language, filters, model_options):
             label += f" {t['category']}"
         target_labels[key] = label
 
-    # Only compare the explicitly relevant options and keep the response compact.
+    # Only compare explicitly named targets. This is also a defensive barrier
+    # against malformed market rows ever surfacing as a third comparison vehicle.
+    if target_labels:
+        options = [
+            o for o in options
+            if (str(o.get("brand") or "").casefold(), str(o.get("model") or "").casefold()) in target_labels
+        ]
     chosen = options[:4]
+    if len(chosen) < 2:
+        return None
     budget = filters.get("budget")
     budget_text = _format_gbp(budget, language) if budget not in [None, ""] else None
 
@@ -2849,6 +2866,39 @@ def _fast_compare_answer(message, language, filters, model_options):
     return intro + "\n\n" + "\n\n".join(sections) + "\n\n" + closing
 
 
+def _localize_listing_value(value, field, language):
+    """Localize common structured market values without altering seller names."""
+    text = str(value or "").strip()
+    if not text or language == "TR":
+        return text
+    key = _normalize_vehicle_phrase(text)
+    if language == "EN":
+        maps = {
+            "transmission": {"otomatik": "Automatic", "manuel": "Manual"},
+            "company": {"bireysel": "Individual seller"},
+            "color": {
+                "siyah": "Black", "beyaz": "White", "gumus": "Silver",
+                "gri": "Grey", "fume": "Dark grey", "mavi": "Blue",
+                "kirmizi": "Red", "yesil": "Green", "sari": "Yellow",
+                "bej": "Beige", "kahverengi": "Brown", "turuncu": "Orange",
+                "lacivert": "Navy", "bordo": "Burgundy"
+            },
+        }
+        return maps.get(field, {}).get(key, text)
+    if language == "RU":
+        maps = {
+            "transmission": {"otomatik": "автомат", "manuel": "механика"},
+            "company": {"bireysel": "частный продавец"},
+            "color": {
+                "siyah": "чёрный", "beyaz": "белый", "gumus": "серебристый",
+                "gri": "серый", "fume": "тёмно-серый", "mavi": "синий",
+                "kirmizi": "красный", "yesil": "зелёный", "sari": "жёлтый"
+            },
+        }
+        return maps.get(field, {}).get(key, text)
+    return text
+
+
 def _fast_shop_answer(language, filters, search_result, listing_candidates):
     """Render listing-level results locally and always use progressive disclosure."""
     candidates = list(listing_candidates or [])[:3]
@@ -2881,7 +2931,7 @@ def _fast_shop_answer(language, filters, search_result, listing_candidates):
             km_txt=f"{km:,}" if language != 'TR' else f"{km:,}".replace(',', '.')
             details.append(f"{km_txt} km")
         for key in ('transmission','color','company','location'):
-            val=str(x.get(key) or '').strip()
+            val = _localize_listing_value(x.get(key), key, language)
             if val:
                 details.append(val)
         lines.append(f"{name}, {year} — {price}" + (" · " + " · ".join(details) if details else ""))
@@ -3292,7 +3342,7 @@ def api_ai_buying_assistant():
         #   models=[Aqua, Note], categories=[e-Power]
         # which would wrongly require Aqua itself to be e-Power.
         search_started = time.perf_counter()
-        if decision_mode == "COMPARE" and len(resolved_targets) >= 2:
+        if decision_mode in {"COMPARE", "SHOP"} and len(resolved_targets) >= 2:
             compare_base_filters = dict(next_filters)
             for key in (
                 "brands", "exclude_brands",
