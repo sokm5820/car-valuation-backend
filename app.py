@@ -10,6 +10,7 @@ import time
 import json
 import math
 import re
+from datetime import datetime, timezone
 
 # AI interpreter configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -122,6 +123,18 @@ buyer_model_df = pd.DataFrame()
 buyer_category_df = pd.DataFrame()
 BUYER_INTELLIGENCE_READY = False
 
+# Stable model-level buyer profiles keep DISCOVER deterministic and fast.
+# These are generated offline by build_buyer_model_profiles_v1.py and committed
+# beside the other production intelligence CSVs.
+BUYER_MODEL_PROFILE_CSV_URL = (
+    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
+    "buyer_model_profiles.csv"
+)
+model_profile_df = pd.DataFrame()
+MODEL_PROFILE_READY = False
+MODEL_PROFILE_LOOKUP = {}
+ASSISTANT_PROFILE_VERSION = "1.0"
+
 
 def _prepare_buyer_intelligence_frame(frame):
     frame = frame.copy()
@@ -228,6 +241,153 @@ def load_buyer_intelligence():
             BUYER_INTELLIGENCE_READY = False
 
 
+def load_model_profiles():
+    global model_profile_df, MODEL_PROFILE_READY, MODEL_PROFILE_LOOKUP
+
+    try:
+        r = requests.get(BUYER_MODEL_PROFILE_CSV_URL, timeout=15)
+        r.raise_for_status()
+        new_profiles = pd.read_csv(io.StringIO(r.text), low_memory=False).fillna("")
+        required = {
+            "Brand", "Model", "VehicleType", "BodyStyle", "SizeClass",
+            "Economy", "Luxury", "Comfort", "Performance", "Practicality",
+            "Family", "Commute", "Confidence"
+        }
+        missing = required - set(new_profiles.columns)
+        if missing:
+            raise ValueError(f"buyer_model_profiles.csv missing columns: {sorted(missing)}")
+
+        for col in required:
+            new_profiles[col] = new_profiles[col].fillna("").astype(str).str.strip()
+
+        lookup = {}
+        for row in new_profiles.to_dict("records"):
+            brand = str(row.get("Brand") or "").strip()
+            model = str(row.get("Model") or "").strip()
+            if not brand or not model:
+                continue
+            lookup[(brand.casefold(), model.casefold())] = row
+
+        model_profile_df = new_profiles
+        MODEL_PROFILE_LOOKUP = lookup
+        MODEL_PROFILE_READY = bool(lookup)
+        print(f"Model Buyer Profiles loaded successfully: {len(lookup)} model families")
+    except Exception as e:
+        print("MODEL BUYER PROFILE LOAD FAILED:", e)
+        # Preserve the last successful snapshot if one already exists.
+        if not MODEL_PROFILE_LOOKUP:
+            model_profile_df = pd.DataFrame()
+            MODEL_PROFILE_READY = False
+
+
+def _profile_level(value):
+    return {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}.get(str(value or "").strip().upper(), 0)
+
+
+def _profile_matches_vehicle_type(profile, requested_type):
+    requested = str(requested_type or "").strip().casefold()
+    if not requested:
+        return True
+    vt = str(profile.get("VehicleType") or "").strip().upper()
+    body = str(profile.get("BodyStyle") or "").strip().upper()
+    size = str(profile.get("SizeClass") or "").strip().upper()
+
+    if requested == "small_car":
+        return vt == "CAR" and size in {"MICRO", "SMALL", "COMPACT"} and body not in {"SUV", "CROSSOVER", "PICKUP", "VAN", "MPV"}
+    if requested in {"suv"}:
+        return vt == "CAR" and body in {"SUV", "CROSSOVER"}
+    if requested in {"crossover"}:
+        return vt == "CAR" and body == "CROSSOVER"
+    if requested in {"pickup", "pick-up"}:
+        return vt == "PICKUP" or body == "PICKUP"
+    if requested in {"motorcycle", "motosiklet"}:
+        return vt in {"MOTORCYCLE", "SCOOTER"}
+    if requested == "scooter":
+        return vt == "SCOOTER" or body == "SCOOTER"
+    return True
+
+
+def _profile_preference_score(profile, preferences):
+    score = 0
+    hard_type_seen = False
+    for pref in preferences or []:
+        p = str(pref or "").strip().casefold()
+        if p.startswith("vehicle_type:"):
+            hard_type_seen = True
+            requested = p.split(":", 1)[1]
+            if not _profile_matches_vehicle_type(profile, requested):
+                return None
+            score += 6
+        elif p == "priority:economy":
+            level = _profile_level(profile.get("Economy"))
+            if level < 2:
+                return None
+            score += level * 3
+        elif p == "priority:luxury":
+            level = _profile_level(profile.get("Luxury"))
+            if level < 2:
+                return None
+            score += level * 3
+        elif p == "priority:comfort":
+            level = _profile_level(profile.get("Comfort"))
+            if level < 2:
+                return None
+            score += level * 2
+        elif p == "priority:performance":
+            level = _profile_level(profile.get("Performance"))
+            if level < 2:
+                return None
+            score += level * 2
+        elif p == "priority:practicality":
+            level = _profile_level(profile.get("Practicality"))
+            if level < 2:
+                return None
+            score += level * 2
+        elif p == "use_case:family":
+            level = _profile_level(profile.get("Family"))
+            if level < 2:
+                return None
+            score += level * 2
+        elif p == "use_case:commute":
+            level = _profile_level(profile.get("Commute"))
+            if level < 2:
+                return None
+            score += level * 2
+
+    confidence = str(profile.get("Confidence") or "").strip().upper()
+    if confidence == "HIGH":
+        score += 2
+    elif confidence == "MEDIUM":
+        score += 1
+    return score
+
+
+def _deterministic_profile_shortlist(model_market, preferences, max_models=30):
+    if not MODEL_PROFILE_READY or not MODEL_PROFILE_LOOKUP:
+        return []
+    scored = []
+    for summary in model_market:
+        key = (str(summary.get("brand") or "").casefold(), str(summary.get("model") or "").casefold())
+        profile = MODEL_PROFILE_LOOKUP.get(key)
+        if not profile:
+            continue
+        score = _profile_preference_score(profile, preferences)
+        if score is None:
+            continue
+        ranked_summary = dict(summary)
+        ranked_summary["_profile_score"] = score
+        scored.append((
+            -score,
+            -int(summary.get("newest_year") or 0),
+            -min(int(summary.get("count") or 0), 100),
+            str(summary.get("brand") or "").casefold(),
+            str(summary.get("model") or "").casefold(),
+            ranked_summary,
+        ))
+    scored.sort(key=lambda x: x[:-1])
+    return [x[-1] for x in scored[:max_models]]
+
+
 def load_market_data():
     global market_df, MARKET_READY
 
@@ -332,6 +492,7 @@ def load_market_data():
 
 load_market_data()
 load_buyer_intelligence()
+load_model_profiles()
 
 
 # =========================================================
@@ -347,6 +508,8 @@ def refresh_market_data_loop():
         load_market_data()
         print("Refreshing Buyer Intelligence from GitHub...")
         load_buyer_intelligence()
+        print("Refreshing Model Buyer Profiles from GitHub...")
+        load_model_profiles()
 
 
 threading.Thread(
@@ -1336,7 +1499,7 @@ Important rules:
             "instructions": instructions,
             "input": json.dumps(user_payload, ensure_ascii=False),
         },
-        timeout=30,
+        timeout=(1.0, 4.0),
     )
 
     response.raise_for_status()
@@ -2070,7 +2233,12 @@ def _qualification_cache_key(filters, preferences, model_market):
 
 
 def shortlist_models_for_preferences(message, language, filters, preferences, results):
-    """Qualify/rank only real model families against soft intent and vehicle type."""
+    """Qualify/rank real model families against soft intent.
+
+    Production path is deterministic via buyer_model_profiles.csv. A bounded LLM
+    fallback exists only while profiles are unavailable/incomplete and is never
+    allowed to hold a live request for tens of seconds.
+    """
     preferences = list(preferences or [])
     relevant_preferences = [
         p for p in preferences
@@ -2080,154 +2248,85 @@ def shortlist_models_for_preferences(message, language, filters, preferences, re
     model_market = _group_market_models(results)
     if not model_market:
         return [], [], []
+    if not relevant_preferences:
+        return list(results or []), [], model_market
 
+    deterministic = _deterministic_profile_shortlist(model_market, relevant_preferences, max_models=30)
+    if deterministic:
+        selected_keys = {(m["brand"].casefold(), m["model"].casefold()) for m in deterministic}
+        qualified = [
+            item for item in (results or [])
+            if (str(item.get("brand") or "").strip().casefold(), str(item.get("model") or "").strip().casefold()) in selected_keys
+        ]
+        reasons = [{"brand": m["brand"], "model": m["model"], "reason": "profile_match"} for m in deterministic]
+        return qualified, reasons, deterministic
+
+    # If the production profile catalogue is loaded but nothing matches, respect that
+    # result rather than asking a live generative model to override stable taxonomy.
+    if MODEL_PROFILE_READY:
+        return [], [], []
+
+    # Temporary resilience path for deployments before buyer_model_profiles.csv exists.
+    # Keep the latency budget tight; if the external model is slow, return the hard-filtered
+    # market immediately rather than making the product appear broken.
     cache_key = _qualification_cache_key(filters, preferences, model_market)
     cached = _MODEL_QUALIFICATION_CACHE.get(cache_key)
     if cached is not None:
         selected_keys, reasons, selected_summaries = cached
         selected_set = set(selected_keys)
-        qualified = [
-            item for item in (results or [])
-            if (
-                str(item.get("brand") or "").strip().casefold(),
-                str(item.get("model") or "").strip().casefold(),
-            ) in selected_set
-        ]
+        qualified = [item for item in (results or []) if (str(item.get("brand") or "").strip().casefold(), str(item.get("model") or "").strip().casefold()) in selected_set]
         return qualified, list(reasons), list(selected_summaries)
 
-    # If there is no soft preference, every hard-filtered model family remains eligible.
-    if not relevant_preferences:
-        return list(results or []), [], model_market
-
-    instructions = """
-You are the model-qualification layer for a North Cyprus vehicle buying assistant.
-
-The supplied model_candidates contains ONLY model families that already satisfy the buyer's
-hard filters such as budget, year, mileage, brand, transmission and location.
-Use general automotive knowledge only to qualify and rank these REAL model families
-against the buyer's soft intent.
-
-Return JSON only:
-{"models":[{"brand":"...","model":"...","reason":"..."}]}
-
-Rules:
-- Select ONLY exact brand/model pairs present in model_candidates.
-- vehicle_type:SUV / crossover / pickup / motorcycle / small_car is a REQUIRED qualification.
-  Never include the wrong body/vehicle type.
-- priority:economy: favour model families generally associated with economical use/ownership.
-- priority:luxury: favour premium/luxury-positioned brands or model families.
-- priority:reliability, performance, comfort and practicality are model-level positioning only.
-- use_case:family and use_case:commute may be used as broad model-level reasoning.
-- Never make claims about the condition or quality of an individual advertised vehicle.
-- Select up to 20 qualifying model families, ordered by relevance.
-- Keep reason extremely short and neutral. It is internal context, not advertising copy.
-"""
-
-    # Keep the qualification request compact. The deterministic market grouping is
-    # already ordered by current representation/newness, so a generous cap preserves
-    # useful choice while avoiding sending hundreds of model families to the LLM.
     qualification_market = model_market[:120]
-
+    instructions = """
+Return JSON only: {"models":[{"brand":"...","model":"...","reason":"..."}]}.
+Select only exact supplied model candidates matching the soft preferences.
+Vehicle type is mandatory. Economy/luxury/comfort/performance/practicality/family/commute are broad model-level positioning only.
+Never infer listing condition, reliability or value retention. Select up to 20.
+"""
     payload = {
-        "language": language,
-        "latest_message": message,
-        "hard_filters": filters,
         "soft_preferences": relevant_preferences,
-        # The LLM only needs the identity of each real candidate to judge soft intent.
-        # Price/year/count/KM facts are deterministic and are deliberately NOT sent here.
-        "model_candidates": [
-            {"brand": m["brand"], "model": m["model"]}
-            for m in qualification_market
-        ],
+        "model_candidates": [{"brand": m["brand"], "model": m["model"]} for m in qualification_market],
     }
-
-    response = None
-    last_error = None
-    for attempt in range(2):
-        try:
-            response = requests.post(
-                "https://api.openai.com/v1/responses",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": OPENAI_MODEL,
-                    "reasoning": {"effort": "none"},
-                    "max_output_tokens": 450,
-                    "instructions": instructions,
-                    "input": json.dumps(payload, ensure_ascii=False),
-                },
-                timeout=45,
-            )
-            response.raise_for_status()
-            break
-        except requests.RequestException as exc:
-            last_error = exc
-            if attempt == 0:
-                time.sleep(0.6)
-
-    if response is None or not response.ok:
-        print(f"Model qualification request failed: {last_error}")
-        return [], [], []
-
-    response_text = extract_response_text(response.json()).strip()
-    if not response_text:
-        return [], [], []
-
     try:
-        parsed = json.loads(response_text)
-        selected = parsed.get("models", []) if isinstance(parsed, dict) else []
-    except Exception:
-        return [], [], []
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": OPENAI_MODEL, "reasoning": {"effort": "none"},
+                "max_output_tokens": 450, "instructions": instructions,
+                "input": json.dumps(payload, ensure_ascii=False),
+            },
+            timeout=(1.0, 3.0),
+        )
+        response.raise_for_status()
+        parsed = json.loads(extract_response_text(response.json()).strip())
+    except Exception as exc:
+        print(f"MODEL_QUALIFICATION_FAST_FALLBACK: {exc}", flush=True)
+        # Hard-filtered candidates are safer than a long timeout. The response remains
+        # grounded; it is simply less preference-specific until profiles are deployed.
+        return list(results or []), [], model_market[:20]
 
-    market_by_key = {
-        (m["brand"].casefold(), m["model"].casefold()): m
-        for m in qualification_market
-    }
-    selected_keys = []
-    reasons = []
-    selected_summaries = []
-
-    for item in selected:
+    market_by_key = {(m["brand"].casefold(), m["model"].casefold()): m for m in qualification_market}
+    selected_keys, reasons, selected_summaries = [], [], []
+    for item in parsed.get("models", []) if isinstance(parsed, dict) else []:
         if not isinstance(item, dict):
             continue
-        brand = str(item.get("brand") or "").strip()
-        model = str(item.get("model") or "").strip()
+        brand, model = str(item.get("brand") or "").strip(), str(item.get("model") or "").strip()
         key = (brand.casefold(), model.casefold())
-        if brand and model and key in market_by_key and key not in selected_keys:
-            selected_keys.append(key)
-            selected_summaries.append(market_by_key[key])
-            reasons.append({
-                "brand": brand,
-                "model": model,
-                "reason": str(item.get("reason") or "").strip(),
-            })
+        if key in market_by_key and key not in selected_keys:
+            selected_keys.append(key); selected_summaries.append(market_by_key[key])
+            reasons.append({"brand": brand, "model": model, "reason": str(item.get("reason") or "").strip()})
         if len(selected_keys) >= 20:
             break
 
     if not selected_keys:
-        return [], [], []
-
+        return list(results or []), [], model_market[:20]
     selected_set = set(selected_keys)
-    qualified = [
-        item for item in (results or [])
-        if (
-            str(item.get("brand") or "").strip().casefold(),
-            str(item.get("model") or "").strip().casefold(),
-        ) in selected_set
-    ]
-
-    # Cache the qualification for identical market/filter/preference state so the same
-    # buyer request does not produce a different eligible model universe on every turn.
+    qualified = [item for item in (results or []) if (str(item.get("brand") or "").strip().casefold(), str(item.get("model") or "").strip().casefold()) in selected_set]
     if len(_MODEL_QUALIFICATION_CACHE) >= _MODEL_QUALIFICATION_CACHE_MAX:
         _MODEL_QUALIFICATION_CACHE.pop(next(iter(_MODEL_QUALIFICATION_CACHE)))
-    _MODEL_QUALIFICATION_CACHE[cache_key] = (
-        tuple(selected_keys),
-        tuple(reasons),
-        tuple(selected_summaries),
-    )
-
+    _MODEL_QUALIFICATION_CACHE[cache_key] = (tuple(selected_keys), tuple(reasons), tuple(selected_summaries))
     return qualified, reasons, selected_summaries
 
 
@@ -2261,10 +2360,19 @@ def _select_model_options(model_summaries, reasons, filters, max_options=8):
             ceiling = None
 
         def qualified_rank(x):
+            profile_score = int(x.get("_profile_score") or 0)
             newest = int(x.get("newest_year") or 0)
-            start = float(x.get("starting_price") or 10**12)
-            budget_distance = abs(ceiling - start) if ceiling is not None else start
-            return (-newest, budget_distance, -int(x.get("count") or 0), x["brand"].casefold(), x["model"].casefold())
+            # For budgeted discovery, compare the price of the newest reachable year,
+            # not the cheapest old example in the model family.
+            anchor_price = x.get("newest_year_starting_price")
+            if anchor_price in [None, ""]:
+                anchor_price = x.get("starting_price")
+            try:
+                anchor_price = float(anchor_price)
+            except (TypeError, ValueError):
+                anchor_price = 10**12
+            budget_distance = abs(ceiling - anchor_price) if ceiling is not None else anchor_price
+            return (-profile_score, -newest, budget_distance, -min(int(x.get("count") or 0), 100), x["brand"].casefold(), x["model"].casefold())
 
         enriched.sort(key=qualified_rank)
         return enriched[:max_options]
@@ -2851,7 +2959,7 @@ def _fast_compare_answer(message, language, filters, model_options):
             if lo and hi: facts += f" · km aralığı {lo}–{hi}"
             resale=""
             if days is not None:
-                resale=f" Tarihsel veride medyan gözlenen piyasa çıkış süresi yaklaşık {float(days):.0f} gündü; bu satış garantisi değildir."
+                resale=f" Tarihsel veride ilanların medyan gözlenen piyasa süresi yaklaşık {float(days):.0f} gündü."
             sections.append(f"{name}\n{facts}.{resale}")
         elif language == "RU":
             facts=f"{count} подходящих вариантов"
@@ -2859,7 +2967,7 @@ def _fast_compare_answer(message, language, filters, model_options):
             if lo and hi: facts += f" · пробег {lo}–{hi} км"
             resale=""
             if days is not None:
-                resale=f" Историческая медиана наблюдаемого времени до ухода с рынка — около {float(days):.0f} дней; это не подтверждает продажу."
+                resale=f" Историческая медиана наблюдаемого присутствия объявления на рынке составляла около {float(days):.0f} дней."
             sections.append(f"{name}\n{facts}.{resale}")
         else:
             facts=f"{count} matches"
@@ -2867,7 +2975,7 @@ def _fast_compare_answer(message, language, filters, model_options):
             if lo and hi: facts += f" · mileage range {lo}–{hi} km"
             resale=""
             if days is not None:
-                resale=f" Historically, the median observed time before leaving the market was about {float(days):.0f} days; that does not prove a sale."
+                resale=f" Historically, its listings showed a median observed market presence of about {float(days):.0f} days."
             sections.append(f"{name}\n{facts}.{resale}")
 
     if language == "TR":
@@ -2875,19 +2983,19 @@ def _fast_compare_answer(message, language, filters, model_options):
         close_parts.append(f"Daha fazla seçenek ve daha yeni araç bulma açısından {label(choice_winner)} öne çıkıyor.")
         if liquidity_winner is not None:
             close_parts.append(f"Yeniden satılabilirlik için sahip olduğumuz piyasa sinyallerinde {label(liquidity_winner)} daha hızlı gözlenen devir gösteriyor.")
-        close_parts.append("Değerini ne kadar koruyacağını bu verilerle güvenilir biçimde garanti edemeyiz. Maksimum kilometrenizi söylerseniz karşılaştırmayı doğrudan o sınırın içindeki araçlara indirebilirim.")
+        close_parts.append("Değerini ne kadar koruyacağını bu verilerle güvenilir biçimde garanti edemeyiz. Piyasa devri, ilanların gözlemden çıkışını ölçer; doğrulanmış satış anlamına gelmez. Maksimum kilometrenizi söylerseniz karşılaştırmayı doğrudan o sınırın içindeki araçlara indirebilirim.")
         closing=" ".join(close_parts)
     elif language == "RU":
         close_parts=[f"По выбору и более новым машинам сильнее выглядит {label(choice_winner)}."]
         if liquidity_winner is not None:
             close_parts.append(f"По наблюдаемому рыночному обороту сигнал сильнее у {label(liquidity_winner)}.")
-        close_parts.append("Надёжно гарантировать сохранение стоимости по этим данным нельзя. Укажите максимальный пробег — и я сравню только варианты в этом диапазоне.")
+        close_parts.append("Надёжно гарантировать сохранение стоимости по этим данным нельзя. Рыночный оборот отражает исчезновение объявления из наблюдаемого рынка, а не подтверждённую продажу. Укажите максимальный пробег — и я сравню только варианты в этом диапазоне.")
         closing=" ".join(close_parts)
     else:
         close_parts=[f"For choice and access to newer cars, {label(choice_winner)} is stronger."]
         if liquidity_winner is not None:
             close_parts.append(f"For resale ease, the historical market signal is stronger for {label(liquidity_winner)}, based on faster observed turnover.")
-        close_parts.append("The data cannot reliably guarantee which one will hold its value better. Give me your maximum mileage and I can compare only the cars that actually meet it.")
+        close_parts.append("The data cannot reliably guarantee which one will hold its value better. Market turnover reflects listing disappearance from the observed market, not confirmed sales. Give me your maximum mileage and I can compare only the cars that actually meet it.")
         closing=" ".join(close_parts)
 
     return intro + "\n\n" + "\n\n".join(sections) + "\n\n" + closing
@@ -2929,6 +3037,24 @@ def _localize_listing_value(value, field, language):
     return text
 
 
+def _listing_mileage_anomaly(item):
+    """Flag implausibly low advertised mileage without asserting the listing is wrong."""
+    try:
+        year = int(item.get("year"))
+        km = float(item.get("km"))
+    except (TypeError, ValueError):
+        return False
+    current_year = datetime.now(timezone.utc).year
+    age = max(0, current_year - year)
+    if km < 0:
+        return True
+    if age >= 2 and km < 500:
+        return True
+    if age >= 5 and km < 1500:
+        return True
+    return False
+
+
 def _select_shop_representatives(results, max_candidates=3):
     """Pick a small, useful SHOP set: newest, lowest-mileage and lower-priced.
 
@@ -2968,8 +3094,11 @@ def _select_shop_representatives(results, max_candidates=3):
     take(newest[0] if newest else None)
 
     # 2) Lowest-mileage remaining example.
+    low_km_pool = [x for x in clean if x.get("km") is not None and not _listing_mileage_anomaly(x)]
+    if not low_km_pool:
+        low_km_pool = [x for x in clean if x.get("km") is not None]
     low_km = sorted(
-        [x for x in clean if x.get("km") is not None],
+        low_km_pool,
         key=lambda x: (int(x.get("km") or 0), -int(x.get("year") or 0), float(x.get("price") or 10**12)),
     )
     for item in low_km:
@@ -3027,7 +3156,15 @@ def _fast_shop_answer(language, filters, search_result, listing_candidates):
         if x.get('km') is not None:
             km=int(x['km'])
             km_txt=f"{km:,}" if language != 'TR' else f"{km:,}".replace(',', '.')
-            details.append(f"{km_txt} km")
+            if _listing_mileage_anomaly(x):
+                if language == "TR":
+                    details.append(f"ilan km: {km_txt} (doğrulayın)")
+                elif language == "RU":
+                    details.append(f"заявленный пробег: {km_txt} км (проверьте)")
+                else:
+                    details.append(f"advertised {km_txt} km (verify)")
+            else:
+                details.append(f"{km_txt} km")
         for key in ('transmission','color','company','location'):
             val = _localize_listing_value(x.get(key), key, language)
             if val:
@@ -3057,9 +3194,6 @@ def _fast_shop_answer(language, filters, search_result, listing_candidates):
 
 def generate_grounded_market_answer(message, language, filters, preferences, search_result, conversation_history=None, decision_mode="DISCOVER"):
     """Progressive-disclosure buying advice grounded in deterministic market data."""
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY_NOT_CONFIGURED")
-
     hard_count = int(search_result.get("count", 0) or 0)
     hard_results = search_result.get("results", []) or []
 
@@ -3328,7 +3462,7 @@ FORMAT — IMPORTANT:
             "instructions": instructions,
             "input": json.dumps(payload, ensure_ascii=False),
         },
-        timeout=45,
+        timeout=(1.0, 4.0),
     )
     response.raise_for_status()
 
@@ -3378,12 +3512,26 @@ def api_ai_buying_assistant():
             resolved_targets=resolved_targets,
         )
         if interpretation is None:
-            interpretation = interpret_market_query(
-                message=message,
-                current_filters=current_filters,
-                language=language,
-                conversation_history=conversation_history,
-            )
+            try:
+                interpretation = interpret_market_query(
+                    message=message,
+                    current_filters=current_filters,
+                    language=language,
+                    conversation_history=conversation_history,
+                )
+            except Exception as exc:
+                print(f"INTERPRETER_DEGRADED_FALLBACK: {exc}", flush=True)
+                question = {
+                    "TR": "Bu değişikliği net uygulayabilmem için bütçe, model, yıl, kilometre veya satıcı tercihinizi biraz daha açık yazar mısınız?",
+                    "RU": "Чтобы точно применить изменение, уточните бюджет, модель, год, пробег или тип продавца.",
+                    "EN": "To apply that accurately, please rephrase it with the budget, model, year, mileage or seller preference you want to change.",
+                }.get(language, "To apply that accurately, please rephrase the restriction you want to change.")
+                interpretation = {
+                    "filters": {}, "clear_filters": [], "seller_mode": None, "preferences": [],
+                    "needs_clarification": True, "clarification_question": question,
+                    "decision_mode": "COMPARE" if resolved_targets else "DISCOVER",
+                    "fast_path": False, "degraded": True,
+                }
         interpret_seconds = time.perf_counter() - interpret_started
 
         decision_mode = str(
@@ -3416,6 +3564,20 @@ def api_ai_buying_assistant():
             next_filters.pop("exclude_brands", None)
             next_filters.pop("exclude_models", None)
             next_filters.pop("exclude_categories", None)
+
+        if interpretation.get("degraded") and interpretation.get("clarification_question"):
+            return jsonify({
+                "success": True,
+                "answer": interpretation["clarification_question"],
+                "filters": next_filters,
+                "preferences": next_preferences,
+                "count": None,
+                "returned": 0,
+                "results": [],
+                "interpretation": interpretation,
+                "decision_mode": decision_mode,
+                "stage": "clarification",
+            })
 
         if (
             interpretation.get("needs_clarification")
@@ -3528,6 +3690,12 @@ def api_ai_buying_assistant():
             f"fast_interpret={bool(interpretation.get('fast_path'))} total={total_seconds:.2f}s",
             flush=True,
         )
+        if total_seconds > 5.0:
+            print(
+                f"ASSISTANT_SLO_WARN mode={decision_mode} total={total_seconds:.2f}s "
+                f"profile_ready={MODEL_PROFILE_READY}",
+                flush=True,
+            )
 
         public_results = (advisory_results or search_result.get("results") or [])[:100]
         return jsonify({
@@ -3750,6 +3918,13 @@ def market_health():
         "buyer_intelligence_ready": BUYER_INTELLIGENCE_READY,
         "buyer_model_rows": len(buyer_model_df),
         "buyer_category_rows": len(buyer_category_df),
+        "model_profiles_ready": MODEL_PROFILE_READY,
+        "model_profile_rows": len(MODEL_PROFILE_LOOKUP),
+        "model_profile_coverage": (
+            round(len(MODEL_PROFILE_LOOKUP) / max(1, len(market_df[["Brand", "Model"]].drop_duplicates())), 4)
+            if MARKET_READY and market_df is not None and not market_df.empty else 0
+        ),
+        "assistant_profile_version": ASSISTANT_PROFILE_VERSION,
     })
 
 # =========================================================
