@@ -704,6 +704,245 @@ def compact_market_context():
     }
 
 
+def _normalize_vehicle_phrase(value):
+    """
+    Normalize user/market vehicle names for deterministic mention matching.
+    Hyphens and punctuation are treated as spaces so forms such as
+    "e-Power", "e power" and "E-POWER" can resolve to the same market value.
+    """
+    value = str(value or "").casefold()
+    value = re.sub(r"[^a-z0-9çğıöşüа-яё]+", " ", value, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def resolve_market_vehicle_mentions(message):
+    """
+    Resolve explicitly named vehicles against the live Brand + Model + Category
+    universe without hard-coded vehicle names.
+
+    Returns one canonical target per mentioned Brand/Model pair. Category is only
+    attached when the buyer actually names a textual category/variant in the same
+    phrase (for example Nissan Note e-Power). Numeric-only categories such as 1.2
+    are deliberately not inferred from ordinary prose.
+    """
+    if not MARKET_READY or market_df is None or market_df.empty:
+        return []
+
+    normalized_message = f" {_normalize_vehicle_phrase(message)} "
+    if not normalized_message.strip():
+        return []
+
+    universe = (
+        market_df[["Brand", "Model", "Category"]]
+        .fillna("")
+        .astype(str)
+        .apply(lambda col: col.str.strip())
+        .drop_duplicates()
+    )
+
+    # Build canonical Brand/Model families first. This lets "Toyota Aqua" resolve
+    # even though the market may contain many Aqua categories.
+    families = (
+        universe[["Brand", "Model"]]
+        .drop_duplicates()
+        .to_dict(orient="records")
+    )
+
+    candidates = []
+    for family in families:
+        brand = str(family["Brand"]).strip()
+        model = str(family["Model"]).strip()
+        if not brand or not model:
+            continue
+
+        brand_n = _normalize_vehicle_phrase(brand)
+        model_n = _normalize_vehicle_phrase(model)
+        full_n = f"{brand_n} {model_n}".strip()
+
+        matched = False
+        match_strength = 0
+
+        # Strongest form: explicit brand + model.
+        if full_n and f" {full_n} " in normalized_message:
+            matched = True
+            match_strength = 3
+        else:
+            # Model-only mentions are accepted only when that normalized model maps
+            # to a single brand in the live market. This safely handles terse
+            # follow-ups such as "Aqua" without guessing ambiguous model names.
+            model_rows = universe[
+                universe["Model"].map(_normalize_vehicle_phrase) == model_n
+            ]
+            unique_brands = {
+                _normalize_vehicle_phrase(v)
+                for v in model_rows["Brand"].tolist()
+                if str(v).strip()
+            }
+            if (
+                model_n
+                and len(model_n) >= 3
+                and f" {model_n} " in normalized_message
+                and len(unique_brands) == 1
+            ):
+                matched = True
+                match_strength = 2
+
+        if not matched:
+            continue
+
+        target = {
+            "brand": brand,
+            "model": model,
+            "category": None,
+            "_match_strength": match_strength,
+            "_phrase_len": len(full_n),
+        }
+
+        pair_rows = universe[
+            (universe["Brand"].map(_normalize_vehicle_phrase) == brand_n)
+            & (universe["Model"].map(_normalize_vehicle_phrase) == model_n)
+        ]
+
+        category_matches = []
+        for category in pair_rows["Category"].drop_duplicates().tolist():
+            category = str(category).strip()
+            category_n = _normalize_vehicle_phrase(category)
+            if not category_n:
+                continue
+
+            # Do not infer plain engine-size categories from incidental numbers.
+            if not re.search(r"[a-zçğıöşüа-яё]", category_n, flags=re.IGNORECASE):
+                continue
+
+            model_category = f"{model_n} {category_n}".strip()
+            full_category = f"{brand_n} {model_n} {category_n}".strip()
+
+            if (
+                (full_category and f" {full_category} " in normalized_message)
+                or (model_category and f" {model_category} " in normalized_message)
+            ):
+                category_matches.append((len(category_n), category))
+
+        if category_matches:
+            category_matches.sort(reverse=True)
+            target["category"] = category_matches[0][1]
+            target["_match_strength"] = 4
+            target["_phrase_len"] += category_matches[0][0]
+
+        candidates.append(target)
+
+    # Deduplicate Brand/Model families and keep the strongest/most specific match.
+    best = {}
+    for item in candidates:
+        key = (
+            _normalize_vehicle_phrase(item["brand"]),
+            _normalize_vehicle_phrase(item["model"]),
+        )
+        previous = best.get(key)
+        score = (item["_match_strength"], item["_phrase_len"])
+        previous_score = (
+            (previous["_match_strength"], previous["_phrase_len"])
+            if previous else (-1, -1)
+        )
+        if score > previous_score:
+            best[key] = item
+
+    resolved = list(best.values())
+    resolved.sort(
+        key=lambda x: (
+            -int(x["_match_strength"]),
+            -int(x["_phrase_len"]),
+            x["brand"].casefold(),
+            x["model"].casefold(),
+        )
+    )
+
+    for item in resolved:
+        item.pop("_match_strength", None)
+        item.pop("_phrase_len", None)
+
+    return resolved
+
+
+def _search_market_for_vehicle_targets(base_filters, targets):
+    """
+    Search each explicit vehicle target independently, then merge the results.
+
+    This is essential for comparisons where each target can have its own category,
+    e.g. Toyota Aqua versus Nissan Note e-Power. A single global Category filter
+    would incorrectly apply e-Power to both models.
+    """
+    merged = []
+    seen_links = set()
+    total = 0
+
+    neutral = dict(base_filters or {})
+    for key in (
+        "brands", "exclude_brands",
+        "models", "exclude_models",
+        "categories", "exclude_categories",
+    ):
+        neutral.pop(key, None)
+
+    for target in targets or []:
+        target_filters = dict(neutral)
+        target_filters["brands"] = [target["brand"]]
+        target_filters["models"] = [target["model"]]
+        if target.get("category"):
+            target_filters["categories"] = [target["category"]]
+
+        result = market_search(
+            budget=target_filters.get("budget"),
+            min_budget=target_filters.get("min_budget"),
+            brands=target_filters.get("brands"),
+            exclude_brands=target_filters.get("exclude_brands"),
+            models=target_filters.get("models"),
+            exclude_models=target_filters.get("exclude_models"),
+            categories=target_filters.get("categories"),
+            exclude_categories=target_filters.get("exclude_categories"),
+            locations=target_filters.get("locations"),
+            exclude_locations=target_filters.get("exclude_locations"),
+            companies=target_filters.get("companies"),
+            exclude_companies=target_filters.get("exclude_companies"),
+            transmissions=target_filters.get("transmissions"),
+            colors=target_filters.get("colors"),
+            min_year=target_filters.get("min_year"),
+            max_year=target_filters.get("max_year"),
+            min_km=target_filters.get("min_km"),
+            max_km=target_filters.get("max_km"),
+            limit=5000,
+            max_limit=5000,
+        )
+
+        if not result.get("success"):
+            return result
+
+        total += int(result.get("count", 0) or 0)
+
+        for item in result.get("results", []) or []:
+            link = str(item.get("link") or "").strip()
+            dedupe_key = link or json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if dedupe_key in seen_links:
+                continue
+            seen_links.add(dedupe_key)
+            merged.append(item)
+
+    merged.sort(
+        key=lambda x: (
+            float(x.get("price") or 10**12),
+            -(int(x.get("year") or 0)),
+        )
+    )
+
+    return {
+        "success": True,
+        "count": len(merged),
+        "returned": len(merged),
+        "results": merged,
+        "target_raw_count": total,
+    }
+
+
 def extract_response_text(payload):
     """
     Extract the text returned by the Responses API without requiring
@@ -832,6 +1071,13 @@ Important rules:
 - If the user explicitly removes a previous constraint, put its field name
   in "clear_filters".
 - Preserve real market spellings when they are supplied in market_context.
+- resolved_vehicle_mentions is deterministic application evidence from the live market.
+  When it contains a named vehicle, use its canonical Brand/Model spelling rather than
+  inventing a compound model name. Example: a resolved target may be
+  Brand=Nissan, Model=Note, Category=e-Power even if the buyer wrote "Nissan Note e-Power".
+- For COMPARE turns with multiple resolved_vehicle_mentions, do NOT try to express
+  per-vehicle categories as one global categories filter; the application searches
+  those targets independently.
 - Do not translate brand/model names.
 - Do not turn subjective ideas such as reliable, sporty, economical,
   family-friendly, small, luxurious, or good value into unsupported hard
@@ -876,12 +1122,15 @@ Important rules:
   availability intent and clear any contradictory brand exclusion introduced by the prior turn.
 """
 
+    resolved_vehicle_mentions = resolve_market_vehicle_mentions(message)
+
     user_payload = {
         "language": language,
         "latest_message": message,
         "current_filters": current_filters,
         "recent_conversation": sanitize_conversation_history(conversation_history),
         "market_context": market_context,
+        "resolved_vehicle_mentions": resolved_vehicle_mentions,
     }
 
     schema = {
@@ -2567,6 +2816,23 @@ def api_ai_buying_assistant():
             interpretation.get("preferences", []),
         )
 
+        resolved_targets = resolve_market_vehicle_mentions(message)
+
+        # Canonicalize explicitly named single vehicles. This fixes natural compound
+        # names such as "Nissan Note e-Power" without hard-coding any vehicle.
+        if len(resolved_targets) == 1 and decision_mode in {"COMPARE", "SHOP"}:
+            target = resolved_targets[0]
+            next_filters["brands"] = [target["brand"]]
+            next_filters["models"] = [target["model"]]
+            if target.get("category"):
+                next_filters["categories"] = [target["category"]]
+            else:
+                next_filters.pop("categories", None)
+
+            next_filters.pop("exclude_brands", None)
+            next_filters.pop("exclude_models", None)
+            next_filters.pop("exclude_categories", None)
+
         if (
             interpretation.get("needs_clarification")
             and interpretation.get("clarification_question")
@@ -2584,30 +2850,50 @@ def api_ai_buying_assistant():
                 "decision_mode": decision_mode,
             })
 
-        # Pull the full filtered result set for candidate selection. The public
-        # response is still capped below so the frontend is not flooded with rows.
-        search_result = market_search(
-            budget=next_filters.get("budget"),
-            min_budget=next_filters.get("min_budget"),
-            brands=next_filters.get("brands"),
-            exclude_brands=next_filters.get("exclude_brands"),
-            models=next_filters.get("models"),
-            exclude_models=next_filters.get("exclude_models"),
-            categories=next_filters.get("categories"),
-            exclude_categories=next_filters.get("exclude_categories"),
-            locations=next_filters.get("locations"),
-            exclude_locations=next_filters.get("exclude_locations"),
-            companies=next_filters.get("companies"),
-            exclude_companies=next_filters.get("exclude_companies"),
-            transmissions=next_filters.get("transmissions"),
-            colors=next_filters.get("colors"),
-            min_year=next_filters.get("min_year"),
-            max_year=next_filters.get("max_year"),
-            min_km=next_filters.get("min_km"),
-            max_km=next_filters.get("max_km"),
-            limit=5000,
-            max_limit=5000,
-        )
+        # Pull the full filtered result set for candidate selection.
+        #
+        # Explicit multi-vehicle comparisons are searched target-by-target so each
+        # named vehicle can carry its own category/variant. This avoids the invalid
+        # cross-product created by global filters such as:
+        #   models=[Aqua, Note], categories=[e-Power]
+        # which would wrongly require Aqua itself to be e-Power.
+        if decision_mode == "COMPARE" and len(resolved_targets) >= 2:
+            compare_base_filters = dict(next_filters)
+            for key in (
+                "brands", "exclude_brands",
+                "models", "exclude_models",
+                "categories", "exclude_categories",
+            ):
+                compare_base_filters.pop(key, None)
+
+            next_filters = compare_base_filters
+            search_result = _search_market_for_vehicle_targets(
+                base_filters=compare_base_filters,
+                targets=resolved_targets,
+            )
+        else:
+            search_result = market_search(
+                budget=next_filters.get("budget"),
+                min_budget=next_filters.get("min_budget"),
+                brands=next_filters.get("brands"),
+                exclude_brands=next_filters.get("exclude_brands"),
+                models=next_filters.get("models"),
+                exclude_models=next_filters.get("exclude_models"),
+                categories=next_filters.get("categories"),
+                exclude_categories=next_filters.get("exclude_categories"),
+                locations=next_filters.get("locations"),
+                exclude_locations=next_filters.get("exclude_locations"),
+                companies=next_filters.get("companies"),
+                exclude_companies=next_filters.get("exclude_companies"),
+                transmissions=next_filters.get("transmissions"),
+                colors=next_filters.get("colors"),
+                min_year=next_filters.get("min_year"),
+                max_year=next_filters.get("max_year"),
+                min_km=next_filters.get("min_km"),
+                max_km=next_filters.get("max_km"),
+                limit=5000,
+                max_limit=5000,
+            )
 
         if not search_result.get("success"):
             return jsonify(search_result), 503
@@ -2658,6 +2944,7 @@ def api_ai_buying_assistant():
             "returned": len(public_results),
             "results": public_results,
             "interpretation": interpretation,
+            "resolved_vehicle_targets": resolved_targets,
             "decision_mode": decision_mode,
             "stage": "recommendation",
         })
