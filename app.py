@@ -4355,6 +4355,38 @@ def api_ai_buying_assistant():
                 ]
                 next_preferences.append(explicit_type)
 
+                # "Forget <old vehicle class>, I want <new class>" is an explicit
+                # replacement of that earlier recommendation brief. Soft buyer-fit
+                # preferences attached to the abandoned brief must not silently
+                # survive unless the user states them again in the correction turn.
+                #
+                # Keep this deliberately narrower than generic "actually make it
+                # an SUV": that wording can legitimately retain preferences such
+                # as economical/family-friendly.
+                explicit_forget_old_class = bool(re.search(
+                    r"\\b(?:forget|unut|забудь)\\b.*\\b"
+                    r"(?:small\\s+cars?|city\\s+cars?|cars?|suvs?|crossovers?|"
+                    r"motorcycles?|motorbikes?|motosiklet(?:ler)?|мотоцикл(?:ы|ов)?|"
+                    r"pick(?:-|\\s*)ups?)\\b",
+                    low_message,
+                ))
+
+                if explicit_forget_old_class:
+                    incoming_pref_keys = {
+                        str(p).casefold()
+                        for p in (interpretation.get("preferences", []) or [])
+                        if str(p).strip()
+                        and not str(p).casefold().startswith("vehicle_type:")
+                        and str(p).casefold() != "any_vehicle_type"
+                    }
+
+                    next_preferences = [
+                        p for p in next_preferences
+                        if str(p).casefold().startswith("vehicle_type:")
+                        or str(p).casefold() == "any_vehicle_type"
+                        or str(p).casefold() in incoming_pref_keys
+                    ]
+
             # Preserve the already-validated budget parser as the source of truth,
             # but ensure a replacement budget in a compound scope-change sentence
             # is applied even if the conversational interpreter omitted it.
