@@ -1373,7 +1373,7 @@ def fast_common_interpretation(message, resolved_targets=None):
         r"с минимальным пробегом|сам(?:ый|ая|ое) дешев\w*|сам(?:ый|ая|ое) нов\w*)\b",
         low,
     )
-    if (shop_words and targets) or (listing_superlative and targets):
+    if (shop_words and targets) or listing_superlative:
         decision_mode = "SHOP"
     elif compare_words or len(targets) >= 2:
         decision_mode = "COMPARE"
@@ -1500,7 +1500,7 @@ def fast_common_interpretation(message, resolved_targets=None):
     # Vehicle/body type. Note the natural Turkish/Russian variants that were
     # previously missed (e.g. "küçük bir araç", "небольшую машину").
     if re.search(
-        r"\b(small(?:\s+[a-z-]+){0,2}\s+(?:car|vehicle)|city car|compact car|"
+        r"\b(small(?:\s+[a-z-]+){0,2}\s+(?:cars?|vehicles?)|city cars?|compact cars?|"
         r"küçük(?:\s+bir)?(?:\s+[a-zçğıöşü-]+){0,2}\s+(?:araba|otomobil|araç)|şehir arabası|sehir arabasi|kompakt araba|"
         r"маленьк\w*\s+(?:машин\w*|автомобил\w*)|небольш\w*\s+(?:машин\w*|автомобил\w*)|"
         r"компактн\w*\s+(?:машин\w*|автомобил\w*)|городск\w*\s+автомобил\w*)\b",
@@ -3836,6 +3836,58 @@ FORMAT — IMPORTANT:
     return answer, advisory_results, advisory_count, model_options
 
 
+
+def _recover_recent_compare_targets(message, conversation_history):
+    """
+    Recover the most recent explicit multi-model comparison only for a genuine
+    constraint-only continuation. This preserves COMPARE state across turns such
+    as "Only consider cars below 80,000 km" without carrying stale targets into
+    unrelated new searches.
+    """
+    low = str(message or "").strip().casefold()
+    if not low or not conversation_history:
+        return []
+
+    continuation_cue = re.search(
+        r"\b(?:only consider|consider only|only include|within|under|below|"
+        r"maximum|max\b|up to|from\s+(?:19|20)\d{2}|"
+        r"automatic only|manual only|"
+        r"sadece|yalnızca|yalnizca|altında|altinda|"
+        r"только|до\s+[0-9]|не более)\b",
+        low,
+    )
+    if not continuation_cue:
+        return []
+
+    # Clear scope changes should start a new search rather than revive old models.
+    scope_switch = re.search(
+        r"\b(?:make it|instead|actually i want|i want|"
+        r"suvs?|crossovers?|pick-?ups?|motorcycles?|scooters?|"
+        r"small cars?|small vehicles?|"
+        r"motosiklet(?:ler)?|мотоцикл(?:ы)?|скутер(?:ы)?)\b",
+        low,
+    )
+    if scope_switch:
+        return []
+
+    for item in reversed(conversation_history or []):
+        if str(item.get("role") or "").casefold() != "user":
+            continue
+        content = str(item.get("content") or "")
+        content_low = content.casefold()
+        if not re.search(
+            r"\b(?:compare|comparison|versus|vs\.?|karşılaştır|karsilastir|kıyasla|kiyasla|"
+            r"сравни(?:ть|те)?|сравнение|против)\b",
+            content_low,
+        ):
+            continue
+        targets = resolve_market_vehicle_mentions(content)
+        if len(targets) >= 2:
+            return targets
+
+    return []
+
+
 @app.route("/api/assistant", methods=["POST"])
 def api_ai_buying_assistant():
     request_started = time.perf_counter()
@@ -3865,6 +3917,11 @@ def api_ai_buying_assistant():
 
         resolve_started = time.perf_counter()
         resolved_targets = resolve_market_vehicle_mentions(message)
+        if not resolved_targets:
+            resolved_targets = _recover_recent_compare_targets(
+                message,
+                conversation_history,
+            )
         resolve_seconds = time.perf_counter() - resolve_started
 
         interpret_started = time.perf_counter()
