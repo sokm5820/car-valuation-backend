@@ -3873,7 +3873,7 @@ def _recover_recent_compare_targets(message, conversation_history):
     for item in reversed(conversation_history or []):
         if str(item.get("role") or "").casefold() != "user":
             continue
-        content = str(item.get("content") or "")
+        content = str(item.get("text") or item.get("content") or "")
         content_low = content.casefold()
         if not re.search(
             r"\b(?:compare|comparison|versus|vs\.?|karşılaştır|karsilastir|kıyasla|kiyasla|"
