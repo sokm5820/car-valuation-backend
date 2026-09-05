@@ -3181,7 +3181,7 @@ def _fast_discover_answer(language, filters, model_options):
         closing = f"Самые новые варианты доходят до {newest} года. Дальше можно сравнить конкретные модели или задать ограничение по году и пробегу."
     else:
         names = ", ".join(newest_names)
-        closing = f"The newest options reach {newest}" + (f", including {names}" if names else "") + ". You can now compare specific models or add a year/mileage limit."
+        closing = f"The newest options reach {newest}" + (f", including {names}" if names else "") + ". You can now compare specific models or narrow the search further."
 
     return intro + "\n\n" + "\n".join(lines) + "\n\n" + closing
 
@@ -3307,7 +3307,7 @@ def _fast_compare_answer(message, language, filters, model_options):
         else:
             facts=f"{count} matches"
             if year and price: facts += f" · newest affordable {year} from {price}"
-            if lo and hi: facts += f" · mileage range {lo}–{hi} km"
+            if lo and hi: facts += f" · advertised mileage range {lo}–{hi} km"
             resale=""
             if days is not None:
                 resale=f" Historically, its listings showed a median observed market presence of about {float(days):.0f} days."
@@ -3483,7 +3483,7 @@ def _fast_shop_answer(language, filters, search_result, listing_candidates, pref
 
     sort_mode = _listing_sort_mode(preferences)
     first = candidates[0]
-    vehicle_name = f"{first.get('brand','')} {first.get('model','')} {first.get('category','')}".strip()
+    vehicle_name = f"{first.get('brand','')} {first.get('model','')}".strip()
     vehicle_name = re.sub(r"\\s+", " ", vehicle_name)
 
     if language == "TR":
@@ -3498,7 +3498,7 @@ def _fast_shop_answer(language, filters, search_result, listing_candidates, pref
 
     lines=[]
     for x in candidates:
-        name=f"{x.get('brand','')} {x.get('model','')} {x.get('category','')}".strip()
+        name=f"{x.get('brand','')} {x.get('model','')}".strip()
         name=re.sub(r"\\s+", " ", name)
         year=x.get('year') or '—'
         price=_format_gbp(x.get('price'), language) or '—'
