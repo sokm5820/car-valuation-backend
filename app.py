@@ -1347,7 +1347,7 @@ def fast_common_interpretation(message, resolved_targets=None):
     }
     if low in terse:
         return None
-    if re.search(r"\b(don't|do not|without|exclude|istemiyorum|olmasın|hariç|istemem|без|исключи|не хочу)\b", low):
+    if re.search(r"\b(don't|do not|without|exclude|forget|istemiyorum|olmasın|hariç|istemem|unut|без|исключи|не хочу|забудь)\b", low):
         return None
 
     targets = list(resolved_targets or [])
@@ -1373,7 +1373,7 @@ def fast_common_interpretation(message, resolved_targets=None):
         r"с минимальным пробегом|сам(?:ый|ая|ое) дешев\w*|сам(?:ый|ая|ое) нов\w*)\b",
         low,
     )
-    if (shop_words and targets) or listing_superlative:
+    if shop_words or listing_superlative:
         decision_mode = "SHOP"
     elif compare_words or len(targets) >= 2:
         decision_mode = "COMPARE"
@@ -4074,6 +4074,43 @@ def _recover_recent_compare_targets(message, conversation_history):
     return []
 
 
+def _recover_recent_recommendation_target(message, conversation_history):
+    """
+    Resolve contextual references such as "your first recommendation" or
+    "the first option" to the first vehicle named in the most recent assistant
+    recommendation. This is intentionally narrow so stale models are not carried
+    into unrelated turns.
+    """
+    low = str(message or "").strip().casefold()
+    if not low or not conversation_history:
+        return []
+
+    first_ref = re.search(
+        r"\b(?:first recommendation|first option|first one|top recommendation|"
+        r"ilk öneri(?:niz|n)?|ilk seçenek|ilk secenek|"
+        r"первая рекомендация|первый вариант)\b",
+        low,
+    )
+    listing_ref = re.search(
+        r"\b(?:listings?|ads?|show me actual|for sale|"
+        r"ilan(?:lar|ları|lari)?|göster|goster|"
+        r"объявлен(?:ие|ия|ий)|покажи|показать)\b",
+        low,
+    )
+    if not (first_ref and listing_ref):
+        return []
+
+    for item in reversed(conversation_history or []):
+        if str(item.get("role") or "").casefold() != "assistant":
+            continue
+        content = str(item.get("text") or item.get("content") or "")
+        targets = resolve_market_vehicle_mentions(content)
+        if targets:
+            return [targets[0]]
+
+    return []
+
+
 @app.route("/api/assistant", methods=["POST"])
 def api_ai_buying_assistant():
     request_started = time.perf_counter()
@@ -4105,6 +4142,11 @@ def api_ai_buying_assistant():
         resolved_targets = resolve_market_vehicle_mentions(message)
         if not resolved_targets:
             resolved_targets = _recover_recent_compare_targets(
+                message,
+                conversation_history,
+            )
+        if not resolved_targets:
+            resolved_targets = _recover_recent_recommendation_target(
                 message,
                 conversation_history,
             )
