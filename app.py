@@ -1165,6 +1165,7 @@ def _search_market_for_vehicle_targets(base_filters, targets):
             max_km=target_filters.get("max_km"),
             limit=5000,
             max_limit=5000,
+            analysis_mode=True,
         )
 
         if not result.get("success"):
@@ -1912,7 +1913,8 @@ def market_search(
     min_km=None,
     max_km=None,
     limit=20,
-    max_limit=100
+    max_limit=100,
+    analysis_mode=False
 ):
     if not MARKET_READY or market_df is None or market_df.empty:
         return {
@@ -2187,7 +2189,10 @@ def market_search(
         min(limit, max_limit)
     )
 
-    results_df = filtered.head(limit).copy()
+    # Assistant market intelligence must be calculated from the COMPLETE matching
+    # market, never from a display-sized/truncated sample. Public listing endpoints
+    # still use the normal limit/max_limit behavior.
+    results_df = filtered.copy() if analysis_mode else filtered.head(limit).copy()
 
     # -----------------------
     # JSON-SAFE RESULTS
@@ -4364,10 +4369,10 @@ def api_ai_buying_assistant():
                 # an SUV": that wording can legitimately retain preferences such
                 # as economical/family-friendly.
                 explicit_forget_old_class = bool(re.search(
-                    r"\b(?:forget|unut|забудь)\b.*\b"
-                    r"(?:small\s+cars?|city\s+cars?|cars?|suvs?|crossovers?|"
+                    r"\\b(?:forget|unut|забудь)\\b.*\\b"
+                    r"(?:small\\s+cars?|city\\s+cars?|cars?|suvs?|crossovers?|"
                     r"motorcycles?|motorbikes?|motosiklet(?:ler)?|мотоцикл(?:ы|ов)?|"
-                    r"pick(?:-|\s*)ups?)\b",
+                    r"pick(?:-|\\s*)ups?)\\b",
                     low_message,
                 ))
 
@@ -4511,6 +4516,7 @@ def api_ai_buying_assistant():
                 max_km=next_filters.get("max_km"),
                 limit=5000,
                 max_limit=5000,
+                analysis_mode=True,
             )
 
         search_seconds = time.perf_counter() - search_started
