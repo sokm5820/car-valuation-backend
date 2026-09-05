@@ -4196,6 +4196,48 @@ def api_ai_buying_assistant():
             interpretation.get("preferences", []),
         )
 
+        # Deterministic scope-reset guard for explicit physical-class changes.
+        # The interpreter remains responsible for soft use-cases, but phrases such
+        # as "forget small cars, I want an SUV" must not preserve the old class or
+        # an old budget simply because the conversational interpreter missed part
+        # of a compound correction.
+        low_message = message.casefold()
+        explicit_scope_reset = bool(re.search(
+            r"\b(?:forget|actually|instead|rather|unut|aslında|aslinda|yerine|"
+            r"забудь|на самом деле|вместо)\b",
+            low_message,
+        ))
+
+        if explicit_scope_reset:
+            explicit_type = None
+            if re.search(r"\b(?:suv|4x4|crossover)\b", low_message):
+                explicit_type = "vehicle_type:SUV"
+            elif re.search(r"\b(?:motorcycle|motorbike|motosiklet|мотоцикл)\b", low_message):
+                explicit_type = "vehicle_type:motorcycle"
+            elif re.search(r"\b(?:pickup|pick-up|pick up)\b", low_message):
+                explicit_type = "vehicle_type:pickup"
+
+            if explicit_type:
+                next_preferences = [
+                    p for p in next_preferences
+                    if not str(p).casefold().startswith("vehicle_type:")
+                    and str(p).casefold() != "any_vehicle_type"
+                ]
+                next_preferences.append(explicit_type)
+
+            # Preserve the already-validated budget parser as the source of truth,
+            # but ensure a replacement budget in a compound scope-change sentence
+            # is applied even if the conversational interpreter omitted it.
+            fast_reset = fast_common_interpretation(
+                message=message,
+                resolved_targets=resolved_targets,
+            )
+            if fast_reset:
+                reset_filters = sanitize_ai_filters(fast_reset.get("filters", {}))
+                for key in ("budget", "min_budget", "min_year", "max_year", "min_km", "max_km"):
+                    if key in reset_filters:
+                        next_filters[key] = reset_filters[key]
+
         # Canonicalize explicitly named single vehicles. This fixes natural compound
         # names such as "Nissan Note e-Power" without hard-coding any vehicle.
         if len(resolved_targets) == 1 and decision_mode in {"COMPARE", "SHOP"}:
