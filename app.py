@@ -1377,8 +1377,6 @@ def fast_common_interpretation(message, resolved_targets=None):
         decision_mode = "SHOP"
     elif compare_words or len(targets) >= 2:
         decision_mode = "COMPARE"
-    elif len(targets) == 1 and re.fullmatch(r"[\w\s\-]+[?]?", raw, flags=re.UNICODE):
-        decision_mode = "COMPARE"
     else:
         decision_mode = "DISCOVER"
 
@@ -1409,6 +1407,23 @@ def fast_common_interpretation(message, resolved_targets=None):
         if amount is not None:
             filters["budget"] = amount
 
+    # Common currency-less shorthand: "15k budget", "around 15k max",
+    # "under 15k". Guard it with price/budget language so mileage such as
+    # "under 60k km" is never mistaken for a purchase budget.
+    if "budget" not in filters:
+        shorthand_budget = re.search(
+            r"(?:(?:budget|price|spend|cost|around|max(?:imum)?|under|below|up to|"
+            r"bütçe|butce|bütçem|butcem|fiyat|до|бюджет)\D{0,18})"
+            r"([0-9]+(?:[.,][0-9]+)?)\s*[kK]\b",
+            low,
+        )
+        if shorthand_budget:
+            tail = low[shorthand_budget.end():shorthand_budget.end() + 12]
+            if not re.match(r"\s*(?:km|kilomet|км)", tail):
+                amount = _parse_human_number(shorthand_budget.group(1))
+                if amount is not None:
+                    filters["budget"] = amount * 1000
+
     # Common mileage restrictions, including both prefix and suffix forms.
     km_patterns = [
         r"(?:under|below|max(?:imum)?|less than|altında|en fazla|maksimum|до|максимум|не более)\s*([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)\s*(?:km|kilomet(?:er|re)?|км)",
@@ -1425,7 +1440,7 @@ def fast_common_interpretation(message, resolved_targets=None):
     # Common minimum-year wording in EN/TR/RU.
     year_patterns = [
         r"\bс\s*((?:19|20)\d{2})\s*(?:года|г\.?|и новее)?\b",
-        r"\b((?:19|20)\d{2})\s*(?:or newer|and newer|ve üzeri|ve uzeri|ve sonrası|ve sonrasi|и новее|или новее)\b",
+        r"\b((?:19|20)\d{2})\s*(?:onwards|or newer|and newer|ve üzeri|ve uzeri|ve sonrası|ve sonrasi|и новее|или новее)\b",
         r"(?:minimum|min(?:imum)? year|from|since|en az|minimum yıl|min yıl|от|не старше)\s*((?:19|20)\d{2})",
         r"((?:19|20)\d{2})\s*(?:model ve üstü|model ve ustu|modelden yeni|года и новее)",
     ]
@@ -1476,7 +1491,7 @@ def fast_common_interpretation(message, resolved_targets=None):
     ):
         preferences.append("priority:economy")
 
-    if re.search(r"\b(reliable|reliability|most reliable|güvenilir|guvenilir|dayanıklı|dayanikli|надёжн\w*|надежн\w*)\b", low):
+    if re.search(r"\b(reliable|reliability|most reliable|güvenilir|guvenilir|dayanıklı|dayanikli|sorunsuz|надёжн\w*|надежн\w*)\b", low):
         preferences.append("priority:reliability")
 
     if re.search(r"\b(luxury|premium|luxurious|lüks|luks|премиальн\w*|роскошн\w*)\b", low):
@@ -1502,7 +1517,7 @@ def fast_common_interpretation(message, resolved_targets=None):
     if re.search(
         r"\b(small(?:\s+[a-z-]+){0,2}\s+(?:cars?|vehicles?)|city cars?|compact cars?|"
         r"küçük(?:\s+bir)?(?:\s+[a-zçğıöşü-]+){0,2}\s+(?:araba|otomobil|araç)|şehir arabası|sehir arabasi|kompakt araba|"
-        r"маленьк\w*\s+(?:машин\w*|автомобил\w*)|небольш\w*\s+(?:машин\w*|автомобил\w*)|"
+        r"маленьк\w*(?:\s+[а-яё-]+){0,2}\s+(?:машин\w*|автомобил\w*)|небольш\w*(?:\s+[а-яё-]+){0,2}\s+(?:машин\w*|автомобил\w*)|"
         r"компактн\w*\s+(?:машин\w*|автомобил\w*)|городск\w*\s+автомобил\w*)\b",
         low,
     ):
