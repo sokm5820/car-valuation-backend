@@ -4111,6 +4111,71 @@ def _recover_recent_recommendation_target(message, conversation_history):
     return []
 
 
+def _looks_like_unknown_explicit_vehicle_shop_request(message, resolved_targets, current_filters, conversation_history):
+    """
+    Detect a fresh SHOP request that appears to name a specific vehicle, but that
+    name cannot be resolved against the live Brand+Model universe.
+
+    This prevents e.g. "Show me listings for Zorblax Hypercar 9000" from silently
+    falling back to the entire market. Broad requests such as "show me SUV listings"
+    and contextual follow-ups are deliberately excluded.
+    """
+    if resolved_targets:
+        return False
+    if current_filters or conversation_history:
+        return False
+
+    raw = str(message or "").strip()
+    if not raw:
+        return False
+
+    patterns = [
+        r"(?i)\b(?:listings?|ads?|adverts?|advertisements?)\s+(?:for|of)\s+(.+?)\s*[?.!]*$",
+        r"(?i)\bshow\s+me\s+(?:actual\s+)?(.+?)\s+(?:listings?|ads?|adverts?|advertisements?)\s*[?.!]*$",
+    ]
+    candidate = None
+    for pattern in patterns:
+        m = re.search(pattern, raw)
+        if m:
+            candidate = m.group(1).strip(" \t\r\n.,!?")
+            break
+
+    if not candidate:
+        return False
+
+    candidate_n = _normalize_vehicle_phrase(candidate)
+    generic = {
+        "car", "cars", "vehicle", "vehicles", "suv", "suvs", "crossover", "crossovers",
+        "motorcycle", "motorcycles", "motorbike", "motorbikes", "bike", "bikes",
+        "pickup", "pickups", "pick up", "pick ups", "4x4", "4x4s",
+        "family car", "family cars", "small car", "small cars", "city car", "city cars",
+        "economical car", "economical cars", "automatic car", "automatic cars",
+    }
+    if candidate_n in generic:
+        return False
+
+    # If the phrase contains a real market brand, it can still be a legitimate
+    # broad brand request even when no particular model was named.
+    if MARKET_READY and market_df is not None and not market_df.empty:
+        known_brands = {
+            _normalize_vehicle_phrase(x)
+            for x in market_df["Brand"].dropna().astype(str).unique().tolist()
+            if str(x).strip()
+        }
+        padded = f" {candidate_n} "
+        if any(f" {brand_n} " in padded for brand_n in known_brands if brand_n):
+            return False
+
+    # Treat it as an attempted specific name only when it looks name-like:
+    # multiple title-cased words and/or a model-number token.
+    words = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşüА-Яа-яЁё0-9-]+", candidate)
+    alpha_words = [w for w in words if re.search(r"[A-Za-zÇĞİÖŞÜçğıöşüА-Яа-яЁё]", w)]
+    titleish = sum(1 for w in alpha_words if w[:1].isupper())
+    has_number = any(re.search(r"\d", w) for w in words)
+
+    return (titleish >= 2 and len(alpha_words) >= 2) or (titleish >= 1 and has_number)
+
+
 @app.route("/api/assistant", methods=["POST"])
 def api_ai_buying_assistant():
     request_started = time.perf_counter()
@@ -4185,6 +4250,36 @@ def api_ai_buying_assistant():
         ).upper()
         if decision_mode not in {"DISCOVER", "COMPARE", "SHOP"}:
             decision_mode = "DISCOVER"
+
+        if (
+            decision_mode == "SHOP"
+            and _looks_like_unknown_explicit_vehicle_shop_request(
+                message,
+                resolved_targets,
+                current_filters,
+                conversation_history,
+            )
+        ):
+            unknown_answer = {
+                "TR": "Bu araç adını güncel Kıbrıs piyasa verilerimde eşleştiremedim. Marka ve modeli kontrol edip tekrar yazar mısınız?",
+                "RU": "Я не смог сопоставить это название автомобиля с актуальными данными рынка Кипра. Проверьте, пожалуйста, марку и модель.",
+                "EN": "I couldn't match that vehicle name to the current Cyprus market data. Please check the make and model and try again.",
+            }.get(language, "I couldn't match that vehicle name to the current Cyprus market data. Please check the make and model and try again.")
+
+            return jsonify({
+                "success": True,
+                "answer": unknown_answer,
+                "filters": current_filters,
+                "preferences": current_preferences,
+                "count": 0,
+                "returned": 0,
+                "results": [],
+                "model_options": [],
+                "interpretation": interpretation,
+                "decision_mode": "SHOP",
+                "stage": "clarification",
+                "resolved_vehicle_targets": [],
+            })
 
         next_filters = apply_interpretation_to_filters(
             current_filters,
