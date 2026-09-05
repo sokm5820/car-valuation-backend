@@ -292,6 +292,8 @@ def _profile_matches_vehicle_type(profile, requested_type):
     body = str(profile.get("BodyStyle") or "").strip().upper()
     size = str(profile.get("SizeClass") or "").strip().upper()
 
+    if requested == "car":
+        return vt == "CAR"
     if requested == "small_car":
         return vt == "CAR" and size in {"MICRO", "SMALL", "COMPACT"} and body not in {"SUV", "CROSSOVER", "PICKUP", "VAN", "MPV"}
     if requested in {"suv"}:
@@ -315,6 +317,12 @@ def _canonicalize_buyer_preferences(preferences):
     """
     aliases = {
         # vehicle profile
+        "vehicle_type:car": "vehicle_type:car",
+        "vehicle_type:automobile": "vehicle_type:car",
+        "vehicle_type:otomobil": "vehicle_type:car",
+        "vehicle_type:araba": "vehicle_type:car",
+        "vehicle_type:автомобиль": "vehicle_type:car",
+        "vehicle_type:машина": "vehicle_type:car",
         "vehicle_type:small_car": "vehicle_type:small_car",
         "vehicle_type:small car": "vehicle_type:small_car",
         "vehicle_type:küçük araç": "vehicle_type:small_car",
@@ -376,7 +384,7 @@ def _profile_preference_score(profile, preferences):
             requested = p.split(":", 1)[1]
             # Explicit physical classes are genuine constraints. "small_car" is a
             # buyer profile/size preference and is therefore scored rather than fatal.
-            if requested in {"suv", "crossover", "pickup", "pick-up", "motorcycle", "motosiklet", "scooter"}:
+            if requested in {"car", "suv", "crossover", "pickup", "pick-up", "motorcycle", "motosiklet", "scooter"}:
                 if not _profile_matches_vehicle_type(profile, requested):
                     return None
                 score += 8
@@ -1268,6 +1276,28 @@ def sanitize_ai_filters(raw_filters):
                     normalized.append(text)
                     seen.add(key_text)
 
+            if key == "transmissions" and normalized:
+                # market_base.csv stores transmission values in the source-market
+                # vocabulary. Normalize multilingual/user-facing variants to those
+                # canonical stored values before deterministic filtering.
+                transmission_aliases = {
+                    "automatic": "Otomatik", "auto": "Otomatik", "otomatik": "Otomatik",
+                    "автомат": "Otomatik", "акпп": "Otomatik",
+                    "manual": "Düz", "manuel": "Düz", "düz": "Düz", "duz": "Düz",
+                    "механика": "Düz", "мкпп": "Düz",
+                    "semi automatic": "Yarı Otomatik", "semi-automatic": "Yarı Otomatik",
+                    "yarı otomatik": "Yarı Otomatik", "yari otomatik": "Yarı Otomatik",
+                }
+                mapped = []
+                mapped_seen = set()
+                for value in normalized:
+                    canonical = transmission_aliases.get(value.casefold(), value)
+                    k = canonical.casefold()
+                    if k not in mapped_seen:
+                        mapped.append(canonical)
+                        mapped_seen.add(k)
+                normalized = mapped
+
             if normalized:
                 clean[key] = normalized
 
@@ -1337,7 +1367,13 @@ def fast_common_interpretation(message, resolved_targets=None):
         r"сравни(?:ть|те)?|сравнение|против)\b",
         low,
     )
-    if shop_words and targets:
+    listing_superlative = re.search(
+        r"\b(lowest[- ]?mileage|lowest km|cheapest|lowest[- ]?priced|newest|"
+        r"en düşük kilometreli|en dusuk kilometreli|en az kilometreli|en ucuz|en yeni|"
+        r"с минимальным пробегом|сам(?:ый|ая|ое) дешев\w*|сам(?:ый|ая|ое) нов\w*)\b",
+        low,
+    )
+    if (shop_words and targets) or (listing_superlative and targets):
         decision_mode = "SHOP"
     elif compare_words or len(targets) >= 2:
         decision_mode = "COMPARE"
@@ -1396,6 +1432,25 @@ def fast_common_interpretation(message, resolved_targets=None):
             filters["min_year"] = int(year_match.group(1))
             break
 
+    # A bare model year attached to a vehicle-class noun means that exact model
+    # year (e.g. "2026 SUVs", "2024 cars"). Do not reinterpret this as a
+    # minimum-year request.
+    if "min_year" not in filters and "max_year" not in filters:
+        exact_year = re.search(
+            r"\b((?:19|20)\d{2})\s*(?:model\s*)?(?:cars?|automobiles?|suvs?|crossovers?|pick-?ups?|motorcycles?|scooters?|"
+            r"arabalar?|otomobiller?|suv|motosikletler?|скутеры?|мотоциклы?|автомобили?)\b",
+            low,
+        )
+        if not exact_year:
+            exact_year = re.search(
+                r"\b(?:cars?|automobiles?|suvs?|crossovers?|pick-?ups?|motorcycles?|scooters?|"
+                r"arabalar?|otomobiller?|suv|motosikletler?|скутеры?|мотоциклы?|автомобили?)\s*(?:model\s*)?((?:19|20)\d{2})\b",
+                low,
+            )
+        if exact_year:
+            filters["min_year"] = int(exact_year.group(1))
+            filters["max_year"] = int(exact_year.group(1))
+
     # Transmission.
     if re.search(r"\b(automatic|otomatik|автомат(?:ическая|ический)?|акпп)\b", low):
         filters["transmissions"] = ["Automatic"]
@@ -1403,9 +1458,9 @@ def fast_common_interpretation(message, resolved_targets=None):
         filters["transmissions"] = ["Manual"]
 
     # Seller type.
-    if re.search(r"\b(private seller|individual seller|bireysel|özel satıcı|ozel satici|частн(?:ый|ого) продавец|частник)\b", low):
+    if re.search(r"\b(private sellers?|individual sellers?|bireysel|özel satıcı(?:lar)?|ozel satici(?:lar)?|частн(?:ый|ого|ые) продав(?:ец|цы)|частник(?:и)?)\b", low):
         seller_mode = "individual"
-    elif re.search(r"\b(dealer|dealership|gallery|galeri|дилер|автосалон)\b", low):
+    elif re.search(r"\b(dealers?|dealerships?|galler(?:y|ies)|galeri(?:ler)?|дилер(?:ы)?|автосалон(?:ы)?)\b", low):
         seller_mode = "gallery"
 
     # Buyer-oriented soft preferences. These map to the precomputed profile layer,
@@ -1417,6 +1472,9 @@ def fast_common_interpretation(message, resolved_targets=None):
         low,
     ):
         preferences.append("priority:economy")
+
+    if re.search(r"\b(reliable|reliability|most reliable|güvenilir|guvenilir|dayanıklı|dayanikli|надёжн\w*|надежн\w*)\b", low):
+        preferences.append("priority:reliability")
 
     if re.search(r"\b(luxury|premium|luxurious|lüks|luks|премиальн\w*|роскошн\w*)\b", low):
         preferences.append("priority:luxury")
@@ -1439,23 +1497,34 @@ def fast_common_interpretation(message, resolved_targets=None):
     # Vehicle/body type. Note the natural Turkish/Russian variants that were
     # previously missed (e.g. "küçük bir araç", "небольшую машину").
     if re.search(
-        r"\b(small car|small vehicle|city car|compact car|"
-        r"küçük(?:\s+bir)?\s+(?:araba|otomobil|araç)|şehir arabası|sehir arabasi|kompakt araba|"
+        r"\b(small(?:\s+[a-z-]+){0,2}\s+(?:car|vehicle)|city car|compact car|"
+        r"küçük(?:\s+bir)?(?:\s+[a-zçğıöşü-]+){0,2}\s+(?:araba|otomobil|araç)|şehir arabası|sehir arabasi|kompakt araba|"
         r"маленьк\w*\s+(?:машин\w*|автомобил\w*)|небольш\w*\s+(?:машин\w*|автомобил\w*)|"
         r"компактн\w*\s+(?:машин\w*|автомобил\w*)|городск\w*\s+автомобил\w*)\b",
         low,
     ):
         preferences.append("vehicle_type:small_car")
-    elif re.search(r"\b(suv|кроссовер|внедорожник)\b", low):
+    elif re.search(r"\b(cars?|automobiles?|araba(?:lar)?|otomobil(?:ler)?|машин\w*|автомобил\w*)\b", low):
+        preferences.append("vehicle_type:car")
+    elif re.search(r"\b(suvs?|кроссовер(?:ы)?|внедорожник(?:и)?)\b", low):
         preferences.append("vehicle_type:SUV")
-    elif re.search(r"\b(crossover|crossover car)\b", low):
+    elif re.search(r"\b(crossovers?|crossover cars?)\b", low):
         preferences.append("vehicle_type:crossover")
-    elif re.search(r"\b(pick-?up|pickup|kamyonet|пикап)\b", low):
+    elif re.search(r"\b(pick-?ups?|pickups?|kamyonet(?:ler)?|пикап(?:ы)?)\b", low):
         preferences.append("vehicle_type:pickup")
-    elif re.search(r"\b(motorcycle|motosiklet|мотоцикл)\b", low):
+    elif re.search(r"\b(motorcycles?|motosiklet(?:ler)?|мотоцикл(?:ы)?)\b", low):
         preferences.append("vehicle_type:motorcycle")
-    elif re.search(r"\b(scooter|skuter|scooter|скутер)\b", low):
+    elif re.search(r"\b(scooters?|skuters?|скутер(?:ы)?)\b", low):
         preferences.append("vehicle_type:scooter")
+
+    # Listing-level ordering requests are deterministic state, not subjective
+    # recommendations. They are applied only after every hard market filter.
+    if re.search(r"\b(lowest[- ]?mileage|lowest km|en düşük kilometreli|en dusuk kilometreli|en az kilometreli|с минимальным пробегом)\b", low):
+        preferences.append("listing_sort:lowest_km")
+    elif re.search(r"\b(cheapest|lowest[- ]?priced|en ucuz|сам(?:ый|ая|ое) дешев\w*)\b", low):
+        preferences.append("listing_sort:cheapest")
+    elif re.search(r"\b(newest|en yeni|сам(?:ый|ая|ое) нов\w*)\b", low):
+        preferences.append("listing_sort:newest")
 
     # Named single targets can safely be canonicalized here; multi-target COMPARE
     # is handled independently by _search_market_for_vehicle_targets.
@@ -1536,13 +1605,14 @@ Important rules:
 - Do not turn subjective ideas such as reliable, sporty, economical,
   family-friendly, small, luxurious, or good value into unsupported hard
   filters. Put those concepts in "preferences".
-- IMPORTANT: vehicle body/type requests such as SUV, crossover, pick-up, small car,
-  normal car/automobile, motorcycle or scooter are SOFT preferences, not Category filters.
-  Put them in "preferences" using the canonical vehicle_type tags below. Never place
-  SUV/pick-up/motorcycle/etc. into categories unless that exact value is explicitly
-  confirmed as a real market Category value.
+- IMPORTANT: vehicle classes are represented as canonical vehicle_type tags in "preferences"
+  because market_base Category is variant-level, not a trustworthy body-type field. The application
+  enforces explicit physical classes (car/SUV/crossover/pick-up/motorcycle/scooter) as STRICT
+  constraints using the validated model-profile VehicleType/BodyStyle layer. "small car" remains
+  a softer size/profile preference. Never place vehicle classes into Category unless that exact
+  value is explicitly confirmed as a real market Category value.
 - Use short canonical preference tags whenever possible so they persist cleanly across turns:
-  vehicle_type:SUV, vehicle_type:crossover, vehicle_type:pickup, vehicle_type:small_car,
+  vehicle_type:car, vehicle_type:SUV, vehicle_type:crossover, vehicle_type:pickup, vehicle_type:small_car,
   vehicle_type:motorcycle, use_case:commute, use_case:family, priority:economy,
   priority:reliability, priority:performance, priority:luxury, priority:comfort,
   priority:practicality.
@@ -2151,6 +2221,12 @@ def merge_preferences(previous_preferences, new_preferences):
         v for v in incoming if v.casefold().startswith("vehicle_type:")
     ]
     incoming_any_vehicle = "any_vehicle_type" in incoming_cf
+    incoming_listing_sorts = [
+        v for v in incoming if v.casefold().startswith("listing_sort:")
+    ]
+
+    if incoming_listing_sorts:
+        previous = [v for v in previous if not v.casefold().startswith("listing_sort:")]
 
     # A new explicit vehicle type replaces the old one. "Any vehicle type"
     # clears all old vehicle-type restrictions.
@@ -2184,6 +2260,99 @@ def _preference_flags(preferences):
         "any_brand_model": "any_brand_model" in prefs,
         "any_year_km": "any_year_km" in prefs,
     }
+
+
+def _strict_vehicle_type_from_preferences(preferences):
+    """Return the explicit physical vehicle class, if one is active."""
+    for pref in reversed(_canonicalize_buyer_preferences(preferences)):
+        p = str(pref or "").strip().casefold()
+        if not p.startswith("vehicle_type:"):
+            continue
+        requested = p.split(":", 1)[1]
+        if requested == "small_car":
+            return "car"
+        if requested in {"car", "suv", "crossover", "pickup", "pick-up", "motorcycle", "motosiklet", "scooter"}:
+            return requested
+    return None
+
+
+def _apply_strict_vehicle_type_to_search_result(search_result, preferences):
+    """Enforce explicit physical vehicle classes with the validated model profiles.
+
+    This is deliberately separate from market_base Category: Category is variant-level
+    and must never be repurposed/inferred as a body type.
+    """
+    requested = _strict_vehicle_type_from_preferences(preferences)
+    if not requested or not search_result.get("success"):
+        return search_result
+    if not MODEL_PROFILE_READY or not MODEL_PROFILE_LOOKUP:
+        # Fail closed for class-sensitive discovery rather than leaking boats/bikes
+        # into a car request when the taxonomy layer is unavailable.
+        result = dict(search_result)
+        result["count"] = 0
+        result["returned"] = 0
+        result["results"] = []
+        result["vehicle_type_filter_unavailable"] = True
+        return result
+
+    kept = []
+    for item in search_result.get("results", []) or []:
+        key = (str(item.get("brand") or "").strip().casefold(), str(item.get("model") or "").strip().casefold())
+        profile = MODEL_PROFILE_LOOKUP.get(key)
+        if profile and _profile_matches_vehicle_type(profile, requested):
+            kept.append(item)
+
+    result = dict(search_result)
+    result["count"] = len(kept)
+    result["returned"] = len(kept)
+    result["results"] = kept
+    result["strict_vehicle_type"] = requested
+    return result
+
+
+def _asks_reliability_question(message):
+    low = str(message or "").casefold()
+    return bool(re.search(r"\b(reliable|reliability|most reliable|güvenilir|guvenilir|dayanıklı|dayanikli|надёжн\w*|надежн\w*)\b", low))
+
+
+def _reliability_scope_answer(language, filters):
+    budget = filters.get("budget")
+    budget_text = _format_gbp(budget, language) if budget not in [None, ""] else None
+    if language == "TR":
+        scope = f" {budget_text} bütçeniz içindeki" if budget_text else ""
+        return (
+            "Güvenilirliği yalnızca Kuzey Kıbrıs ilan verilerinden güvenilir biçimde belirleyemem; "
+            "bunun için uzun dönem güvenilirlik, arıza/servis ve kullanıcı verileri gibi dış kaynaklar gerekir. "
+            f"Yine de{scope} seçenekleri güncel fiyat, yaş, kilometre ve gözlenen yeniden satış piyasası davranışına göre karşılaştırabilirim; "
+            "dış güvenilirlik kanıtı olmadan bir modeli ‘en güvenilir’ diye etiketlemem."
+        )
+    if language == "RU":
+        scope = f" в пределах бюджета {budget_text}" if budget_text else ""
+        return (
+            "Надёжность нельзя достоверно определить только по объявлениям Северного Кипра: для этого нужны внешние данные "
+            "о долгосрочной надёжности, ремонтах/сервисе и опыте владельцев. "
+            f"Я могу сравнить варианты{scope} по текущей цене, возрасту, пробегу и наблюдаемому поведению на рынке перепродажи, "
+            "но не буду называть модель «самой надёжной» без таких внешних доказательств."
+        )
+    scope = f" within your {budget_text} budget" if budget_text else ""
+    return (
+        "Reliability isn't something I can determine reliably from North Cyprus listing data alone; "
+        "it requires external evidence such as long-term reliability, repair/service and owner data. "
+        f"I can still compare the options{scope} by current price, age, mileage and observed resale-market behaviour, "
+        "but I won't label one model ‘most reliable’ without that external evidence."
+    )
+
+
+def _listing_sort_mode(preferences):
+    for pref in reversed(preferences or []):
+        p = str(pref or "").strip().casefold()
+        if p == "listing_sort:lowest_km":
+            return "lowest_km"
+        if p == "listing_sort:cheapest":
+            return "cheapest"
+        if p == "listing_sort:newest":
+            return "newest"
+    return None
 
 
 def guided_narrowing_question(filters, preferences, count, language="TR"):
@@ -3221,8 +3390,8 @@ def _listing_mileage_anomaly(item):
     return False
 
 
-def _select_shop_representatives(results, max_candidates=3):
-    """Pick a small, useful SHOP set: newest, lowest-mileage and lower-priced.
+def _select_shop_representatives(results, max_candidates=3, sort_mode=None):
+    """Pick a small useful SHOP set, or honor an explicit listing-level sort.
 
     All rows have already passed the deterministic active filters. Selection is
     presentation-only and never relaxes budget/model/year/KM/location/seller rules.
@@ -3230,6 +3399,17 @@ def _select_shop_representatives(results, max_candidates=3):
     clean = list(results or [])
     if not clean:
         return []
+
+    if sort_mode == "lowest_km":
+        ranked = [x for x in clean if x.get("km") is not None]
+        ranked.sort(key=lambda x: (int(x.get("km")), -int(x.get("year") or 0), float(x.get("price") or 10**12)))
+        return ranked[:max_candidates]
+    if sort_mode == "cheapest":
+        ranked = sorted(clean, key=lambda x: (float(x.get("price") or 10**12), -int(x.get("year") or 0), int(x.get("km")) if x.get("km") is not None else 10**12))
+        return ranked[:max_candidates]
+    if sort_mode == "newest":
+        ranked = sorted(clean, key=lambda x: (-int(x.get("year") or 0), int(x.get("km")) if x.get("km") is not None else 10**12, float(x.get("price") or 10**12)))
+        return ranked[:max_candidates]
 
     chosen, seen = [], set()
 
@@ -3292,7 +3472,7 @@ def _select_shop_representatives(results, max_candidates=3):
     return chosen[:max_candidates]
 
 
-def _fast_shop_answer(language, filters, search_result, listing_candidates):
+def _fast_shop_answer(language, filters, search_result, listing_candidates, preferences=None):
     """Render listing-level results locally and always use progressive disclosure."""
     candidates = list(listing_candidates or [])[:3]
     if not candidates:
@@ -3301,16 +3481,20 @@ def _fast_shop_answer(language, filters, search_result, listing_candidates):
     budget = filters.get("budget")
     budget_text = _format_gbp(budget, language) if budget not in [None, ""] else None
 
+    sort_mode = _listing_sort_mode(preferences)
     first = candidates[0]
     vehicle_name = f"{first.get('brand','')} {first.get('model','')} {first.get('category','')}".strip()
     vehicle_name = re.sub(r"\\s+", " ", vehicle_name)
 
     if language == "TR":
-        intro = f"İşte" + (f" {budget_text} bütçeniz içinde" if budget_text else "") + f" üç güncel {vehicle_name} ilanı:"
+        qualifier = {"lowest_km": "en düşük kilometreli", "cheapest": "en düşük fiyatlı", "newest": "en yeni"}.get(sort_mode, "güncel")
+        intro = f"İşte" + (f" {budget_text} bütçeniz içinde" if budget_text else "") + f" {qualifier} {vehicle_name} ilanları:"
     elif language == "RU":
-        intro = f"Вот три актуальных объявления {vehicle_name}" + (f" в рамках бюджета {budget_text}:" if budget_text else ":")
+        qualifier = {"lowest_km": "с минимальным пробегом", "cheapest": "с самой низкой ценой", "newest": "самые новые"}.get(sort_mode, "актуальные")
+        intro = f"Вот {qualifier} объявления {vehicle_name}" + (f" в рамках бюджета {budget_text}:" if budget_text else ":")
     else:
-        intro = f"Here are three current {vehicle_name} listings" + (f" within your {budget_text} budget:" if budget_text else ":")
+        qualifier = {"lowest_km": "lowest-mileage", "cheapest": "lowest-priced", "newest": "newest"}.get(sort_mode, "current")
+        intro = f"Here are the {qualifier} {vehicle_name} listings" + (f" within your {budget_text} budget:" if budget_text else ":")
 
     lines=[]
     for x in candidates:
@@ -3331,7 +3515,8 @@ def _fast_shop_answer(language, filters, search_result, listing_candidates):
                     details.append(f"advertised {km_txt} km (verify)")
             else:
                 details.append(f"{km_txt} km")
-        for key in ('transmission','color','company','location'):
+        # Colour stays available as a filter, but is omitted from default replies.
+        for key in ('transmission','company','location'):
             val = _localize_listing_value(x.get(key), key, language)
             if val:
                 details.append(val)
@@ -3362,6 +3547,9 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
     """Progressive-disclosure buying advice grounded in deterministic market data."""
     hard_count = int(search_result.get("count", 0) or 0)
     hard_results = search_result.get("results", []) or []
+
+    if _asks_reliability_question(message):
+        return _reliability_scope_answer(language, filters), hard_results, hard_count, []
 
     if hard_count == 0:
         fallback = {
@@ -3429,7 +3617,9 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
             "lowest_matching_asking_price": option.get("starting_price"),
         }
     if decision_mode == "SHOP":
-        listing_candidates = _select_shop_representatives(advisory_results, max_candidates=3)
+        listing_candidates = _select_shop_representatives(
+            advisory_results, max_candidates=3, sort_mode=_listing_sort_mode(preferences)
+        )
     else:
         listing_candidates = select_assistant_candidates(
             advisory_results, filters, max_candidates=3
@@ -3449,7 +3639,7 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
             return fast_answer, advisory_results, advisory_count, model_options
 
     if decision_mode == "SHOP":
-        fast_answer = _fast_shop_answer(language, filters, search_result, listing_candidates)
+        fast_answer = _fast_shop_answer(language, filters, search_result, listing_candidates, preferences)
         if fast_answer:
             return fast_answer, advisory_results, advisory_count, model_options
 
@@ -3813,14 +4003,23 @@ def api_ai_buying_assistant():
         if not search_result.get("success"):
             return jsonify(search_result), 503
 
+        # Explicit physical vehicle classes are authoritative. Apply them after
+        # the normal market filters using the validated model-profile taxonomy,
+        # never by guessing from listing titles or CategoryDetail.
+        search_result = _apply_strict_vehicle_type_to_search_result(
+            search_result, next_preferences
+        )
+
         # Guided buying flow: broad searches get a compact group of useful
         # narrowing dimensions; only later do we offer secondary refinements.
-        guide_question = guided_narrowing_question(
-            filters=next_filters,
-            preferences=next_preferences,
-            count=search_result.get("count", 0),
-            language=language,
-        )
+        guide_question = None
+        if decision_mode == "DISCOVER" and not _asks_reliability_question(message):
+            guide_question = guided_narrowing_question(
+                filters=next_filters,
+                preferences=next_preferences,
+                count=search_result.get("count", 0),
+                language=language,
+            )
 
         if guide_question:
             public_results = (search_result.get("results") or [])[:100]
