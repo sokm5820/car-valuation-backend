@@ -1305,7 +1305,7 @@ def sanitize_ai_filters(raw_filters):
 
 
 def _parse_human_number(token):
-    token = str(token or "").strip().lower().replace(" ", "")
+    token = str(token or "").strip().lower().replace(" ", "").rstrip(".,;:")
     if not token:
         return None
     multiplier = 1
@@ -1385,6 +1385,8 @@ def fast_common_interpretation(message, resolved_targets=None):
     # Budget forms: £15,000; 15k GBP; 15000 pounds; 15 bin; 15 тыс.
     budget_match = re.search(r"£\s*([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)", raw)
     if not budget_match:
+        budget_match = re.search(r"\b([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)\s*£", raw)
+    if not budget_match:
         budget_match = re.search(
             r"\b([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)\s*(?:gbp|pounds?|sterling|sterlin|sterlinlik|"
             r"фунт(?:ов|а)?|стерлинг(?:ов|а)?)\b",
@@ -1422,6 +1424,7 @@ def fast_common_interpretation(message, resolved_targets=None):
 
     # Common minimum-year wording in EN/TR/RU.
     year_patterns = [
+        r"\bс\s*((?:19|20)\d{2})\s*(?:года|г\.?|и новее)?\b",
         r"\b((?:19|20)\d{2})\s*(?:or newer|and newer|ve üzeri|ve uzeri|ve sonrası|ve sonrasi|и новее|или новее)\b",
         r"(?:minimum|min(?:imum)? year|from|since|en az|minimum yıl|min yıl|от|не старше)\s*((?:19|20)\d{2})",
         r"((?:19|20)\d{2})\s*(?:model ve üstü|model ve ustu|modelden yeni|года и новее)",
@@ -1452,15 +1455,15 @@ def fast_common_interpretation(message, resolved_targets=None):
             filters["max_year"] = int(exact_year.group(1))
 
     # Transmission.
-    if re.search(r"\b(automatic|otomatik|автомат(?:ическая|ический)?|акпп)\b", low):
+    if re.search(r"\b(automatic|otomatik|автомат(?:ическ\w*)?|акпп)\b", low):
         filters["transmissions"] = ["Automatic"]
     elif re.search(r"\b(manual|manuel|механик(?:а|ическая)?|мкпп)\b", low):
         filters["transmissions"] = ["Manual"]
 
     # Seller type.
-    if re.search(r"\b(private sellers?|individual sellers?|bireysel|özel satıcı(?:lar)?|ozel satici(?:lar)?|частн(?:ый|ого|ые) продав(?:ец|цы)|частник(?:и)?)\b", low):
+    if re.search(r"\b(private sellers?|private cars?|individual sellers?|bireysel|özel satıcı(?:lar)?|ozel satici(?:lar)?|частн(?:ый|ого|ые) продав(?:ец|цы)|частник(?:и)?)\b", low):
         seller_mode = "individual"
-    elif re.search(r"\b(dealers?|dealerships?|galler(?:y|ies)|galeri(?:ler)?|дилер(?:ы)?|автосалон(?:ы)?)\b", low):
+    elif re.search(r"\b(dealers?|dealerships?|galler(?:y|ies)|galeri(?:ler)?(?:den)?|дилер(?:ы)?|автосалон(?:ы)?)\b", low):
         seller_mode = "gallery"
 
     # Buyer-oriented soft preferences. These map to the precomputed profile layer,
@@ -2047,11 +2050,13 @@ def market_search(
     # -----------------------
 
     if transmissions:
+        wanted = set(normalize_list(transmissions))
         filtered = filtered[
-            contains_any(
-                filtered["Transmission"],
-                transmissions
-            )
+            filtered["Transmission"]
+            .fillna("")
+            .astype(str)
+            .map(normalize)
+            .isin(wanted)
         ]
 
     # -----------------------
