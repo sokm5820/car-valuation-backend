@@ -1451,20 +1451,26 @@ def fast_common_interpretation(message, resolved_targets=None):
 
     # When the user has already established that the number is mileage,
     # accept shorthand such as "not crazy mileage, like max 60k".
-    if "max_km" not in filters and re.search(
-        r"\b(?:mileage|kilomet(?:er|re)s?|km|kilometre|kilometer|пробег)\b",
-        low,
-    ):
-        implied_km = re.search(
-            r"\b(?:max(?:imum)?|under|below|less than|up to|"
-            r"en fazla|altında|altinda|до|максимум|не более)\s*"
-            r"([0-9]+(?:[.,][0-9]+)?\s*[kK])\b",
+    if "max_km" not in filters:
+        mileage_context = re.search(
+            r"\b(?:mileage|kilomet(?:er|re)s?|kilometre|kilometer|пробег)\b",
             low,
         )
-        if implied_km:
-            amount = _parse_human_number(implied_km.group(1))
-            if amount is not None:
-                filters["max_km"] = amount
+        if mileage_context:
+            # Only inspect text AFTER the mileage cue. This prevents a budget
+            # such as "under 15k" earlier in the sentence from being reused as
+            # max_km in "under 15k and not crazy mileage, like max 60k".
+            mileage_tail = low[mileage_context.end():]
+            implied_km = re.search(
+                r"\b(?:max(?:imum)?|under|below|less than|up to|"
+                r"en fazla|altında|altinda|до|максимум|не более)\s*"
+                r"([0-9]+(?:[.,][0-9]+)?\s*[kK])\b",
+                mileage_tail,
+            )
+            if implied_km:
+                amount = _parse_human_number(implied_km.group(1))
+                if amount is not None:
+                    filters["max_km"] = amount
 
     # Common minimum-year wording in EN/TR/RU.
     year_patterns = [
