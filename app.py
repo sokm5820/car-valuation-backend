@@ -2863,9 +2863,10 @@ def _buyer_vehicle_type_matches(series, requested_type):
     normalized = series.fillna("").astype(str).str.strip().str.casefold()
 
     exact_map = {
-        "suv": {"suv, pick-up"},
-        "pickup": {"suv, pick-up"},
-        "pick-up": {"suv, pick-up"},
+        # SUV / pickup / crossover / small-car are model-profile/body-class
+        # qualifications. They have already been enforced before enrichment,
+        # so do not re-filter Buyer Intelligence using Category Master's broader
+        # VehicleType field here.
         "motorcycle": {"motosiklet"},
         "motosiklet": {"motosiklet"},
         "atv": {"atv & utv"},
