@@ -1424,6 +1424,18 @@ def fast_common_interpretation(message, resolved_targets=None):
                 if amount is not None:
                     filters["budget"] = amount * 1000
 
+    if "budget" not in filters:
+        shorthand_budget_after = re.search(
+            r"\b([0-9]+(?:[.,][0-9]+)?)\s*[kK]\s*"
+            r"(?:budget|max(?:imum)?|to spend|spend|price|"
+            r"bütçe|butce|bütçem|butcem|бюджет)\b",
+            low,
+        )
+        if shorthand_budget_after:
+            amount = _parse_human_number(shorthand_budget_after.group(1))
+            if amount is not None:
+                filters["budget"] = amount * 1000
+
     # Common mileage restrictions, including both prefix and suffix forms.
     km_patterns = [
         r"(?:under|below|max(?:imum)?|less than|altında|en fazla|maksimum|до|максимум|не более)\s*([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)\s*(?:km|kilomet(?:er|re)?|км)",
@@ -1436,6 +1448,23 @@ def fast_common_interpretation(message, resolved_targets=None):
             if amount is not None:
                 filters["max_km"] = amount
             break
+
+    # When the user has already established that the number is mileage,
+    # accept shorthand such as "not crazy mileage, like max 60k".
+    if "max_km" not in filters and re.search(
+        r"\b(?:mileage|kilomet(?:er|re)s?|km|kilometre|kilometer|пробег)\b",
+        low,
+    ):
+        implied_km = re.search(
+            r"\b(?:max(?:imum)?|under|below|less than|up to|"
+            r"en fazla|altında|altinda|до|максимум|не более)\s*"
+            r"([0-9]+(?:[.,][0-9]+)?\s*[kK])\b",
+            low,
+        )
+        if implied_km:
+            amount = _parse_human_number(implied_km.group(1))
+            if amount is not None:
+                filters["max_km"] = amount
 
     # Common minimum-year wording in EN/TR/RU.
     year_patterns = [
@@ -2332,7 +2361,7 @@ def _apply_strict_vehicle_type_to_search_result(search_result, preferences):
 
 def _asks_reliability_question(message):
     low = str(message or "").casefold()
-    return bool(re.search(r"\b(reliable|reliability|most reliable|güvenilir|guvenilir|dayanıklı|dayanikli|надёжн\w*|надежн\w*)\b", low))
+    return bool(re.search(r"\b(reliable|reliability|most reliable|güvenilir|guvenilir|dayanıklı|dayanikli|sorunsuz|надёжн\w*|надежн\w*)\b", low))
 
 
 def _reliability_scope_answer(language, filters):
