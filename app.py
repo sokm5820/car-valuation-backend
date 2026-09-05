@@ -3330,6 +3330,32 @@ def _fast_discover_answer(language, filters, model_options):
         f"{x.get('brand','')} {x.get('model','')}".strip()
         for x in options if int(x.get("newest_year") or 0) == newest
     ][:3]
+    confidences = [
+        str((x.get("buyer_intelligence") or {}).get("liquidity_confidence") or "").strip().upper()
+        for x in options
+    ]
+    thin_evidence_group = bool(confidences) and all(
+        c in {"LOW", "INSUFFICIENT", ""} for c in confidences
+    )
+
+    caveat = None
+    if thin_evidence_group:
+        if language == "TR":
+            caveat = (
+                "Bu grupta geçmiş piyasa verisi daha sınırlı; bu nedenle sıralamayı daha düşük güvenle "
+                "değerlendirip tek tek ilanları yakından karşılaştırmak daha doğru olur."
+            )
+        elif language == "RU":
+            caveat = (
+                "По этой группе исторических рыночных данных меньше, поэтому к порядку рекомендаций "
+                "стоит относиться с меньшей уверенностью и внимательнее сравнивать конкретные объявления."
+            )
+        else:
+            caveat = (
+                "Market-history evidence is thinner for this group, so I’d treat the ordering as "
+                "lower-confidence and compare individual listings closely."
+            )
+
     if language == "TR":
         closing = f"En yeni seçenekler {newest} model yılına kadar çıkıyor. İsterseniz buradan belirli modelleri karşılaştırabilir veya yıl/kilometre sınırı ekleyebilirsiniz."
     elif language == "RU":
@@ -3338,7 +3364,11 @@ def _fast_discover_answer(language, filters, model_options):
         names = ", ".join(newest_names)
         closing = f"The newest options reach {newest}" + (f", including {names}" if names else "") + ". You can now compare specific models or narrow the search further."
 
-    return intro + "\n\n" + "\n".join(lines) + "\n\n" + closing
+    parts = [intro, "\n".join(lines)]
+    if caveat:
+        parts.append(caveat)
+    parts.append(closing)
+    return "\n\n".join(parts)
 
 
 def _fast_compare_answer(message, language, filters, model_options):
