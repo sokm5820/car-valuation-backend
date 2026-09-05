@@ -4286,6 +4286,41 @@ def api_ai_buying_assistant():
             interpretation,
         )
 
+        # Deterministic explicit-constraint clearing.
+        # Conversational phrases such as "mileage doesn't matter anymore" are
+        # unambiguous state changes and should not depend on the LLM returning
+        # clear_filters correctly.
+        low_message_for_clear = message.casefold()
+
+        clear_mileage = bool(
+            re.search(
+                r"\b(?:mileage|kilomet(?:er|re)s?|km)\s+"
+                r"(?:doesn['’]?t|does not|doesnt)\s+matter(?:\s+anymore)?\b",
+                low_message_for_clear,
+            )
+            or re.search(
+                r"\b(?:any|whatever)\s+(?:mileage|kilomet(?:er|re)s?|km)\b",
+                low_message_for_clear,
+            )
+            or re.search(
+                r"\b(?:forget|remove|clear|ignore)\s+(?:the\s+)?"
+                r"(?:mileage|kilomet(?:er|re)s?|km)(?:\s+(?:limit|restriction))?\b",
+                low_message_for_clear,
+            )
+            or re.search(
+                r"\bkilometre\s+(?:önemli\s+değil|onemli\s+degil)\b",
+                low_message_for_clear,
+            )
+            or re.search(
+                r"\b(?:пробег\s+не\s+важен|любой\s+пробег)\b",
+                low_message_for_clear,
+            )
+        )
+
+        if clear_mileage:
+            next_filters.pop("min_km", None)
+            next_filters.pop("max_km", None)
+
         next_preferences = merge_preferences(
             current_preferences,
             interpretation.get("preferences", []),
