@@ -4364,10 +4364,10 @@ def api_ai_buying_assistant():
                 # an SUV": that wording can legitimately retain preferences such
                 # as economical/family-friendly.
                 explicit_forget_old_class = bool(re.search(
-                    r"\\b(?:forget|unut|забудь)\\b.*\\b"
-                    r"(?:small\\s+cars?|city\\s+cars?|cars?|suvs?|crossovers?|"
+                    r"\b(?:forget|unut|забудь)\b.*\b"
+                    r"(?:small\s+cars?|city\s+cars?|cars?|suvs?|crossovers?|"
                     r"motorcycles?|motorbikes?|motosiklet(?:ler)?|мотоцикл(?:ы|ов)?|"
-                    r"pick(?:-|\\s*)ups?)\\b",
+                    r"pick(?:-|\s*)ups?)\b",
                     low_message,
                 ))
 
