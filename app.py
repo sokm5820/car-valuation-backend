@@ -3165,6 +3165,105 @@ def enrich_model_options_with_buyer_intelligence(
 
 
 
+
+def _confidence_rank(value):
+    text = str(value or "").strip().casefold()
+    if text in {"high", "yüksek", "yuksek", "высокая", "высокий"}:
+        return 3
+    if text in {"medium", "moderate", "orta", "средняя", "средний"}:
+        return 2
+    if text in {"low", "düşük", "dusuk", "низкая", "низкий"}:
+        return 1
+    return 0
+
+
+def _rerank_discover_options_with_buyer_intelligence(model_options, filters):
+    """
+    Evidence-aware DISCOVER ordering.
+
+    This is deliberately NOT a universal vehicle score. It is a lexicographic
+    ordering of already-qualified market options:
+      1) preserve buyer-fit/profile qualification as the primary signal;
+      2) prefer stronger historical evidence;
+      3) among similarly qualified/evidenced models, prefer stronger observed
+         market-turnover signals and deeper historical evidence;
+      4) retain current-market relevance through newest affordable year,
+         budget proximity and active choice.
+
+    Reliability and value retention are intentionally absent because those are
+    not established by OtoDeğer's proprietary market data.
+    """
+    options = [dict(x) for x in (model_options or [])]
+    if len(options) < 2:
+        return options
+
+    budget = filters.get("budget")
+    try:
+        ceiling = float(budget) if budget not in [None, ""] else None
+    except (TypeError, ValueError):
+        ceiling = None
+
+    def finite_float(value, default):
+        try:
+            value = float(value)
+            if pd.isna(value):
+                return default
+            return value
+        except (TypeError, ValueError):
+            return default
+
+    def rank_key(item):
+        bi = item.get("buyer_intelligence") or {}
+
+        profile_score = int(item.get("_profile_score") or 0)
+
+        confidence = _confidence_rank(
+            bi.get("liquidity_confidence")
+        )
+        eligible_60 = int(bi.get("exit_60_eligible") or 0)
+        exit_60 = finite_float(bi.get("exit_60_rate"), -1.0)
+        median_days = finite_float(
+            bi.get("median_observed_days_to_exit"), 10**9
+        )
+        historical_depth = int(
+            bi.get("historical_distinct_listings") or 0
+        )
+
+        # Do not let tiny cohorts create a misleading liquidity advantage.
+        # Below 10 mature 60-day observations, use the signal only after
+        # stronger-evidence options have already ranked ahead.
+        mature_liquidity = exit_60 if eligible_60 >= 10 else -1.0
+        mature_days = median_days if eligible_60 >= 10 else 10**9
+
+        newest = int(item.get("newest_year") or 0)
+        active_count = int(item.get("count") or 0)
+
+        anchor_price = item.get("newest_year_starting_price")
+        if anchor_price in [None, ""]:
+            anchor_price = item.get("starting_price")
+        anchor_price = finite_float(anchor_price, 10**12)
+
+        budget_distance = (
+            abs(ceiling - anchor_price)
+            if ceiling is not None else anchor_price
+        )
+
+        return (
+            -profile_score,
+            -confidence,
+            -mature_liquidity,
+            mature_days,
+            -historical_depth,
+            -newest,
+            budget_distance,
+            -min(active_count, 100),
+            str(item.get("brand") or "").casefold(),
+            str(item.get("model") or "").casefold(),
+        )
+
+    options.sort(key=rank_key)
+    return options
+
 def _format_gbp(value, language="EN"):
     try:
         number = float(value)
@@ -3658,6 +3757,12 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
         preferences=preferences,
         hard_results=advisory_results,
     )
+
+    if decision_mode == "DISCOVER":
+        model_options = _rerank_discover_options_with_buyer_intelligence(
+            model_options=model_options,
+            filters=filters,
+        )
 
     # Make buyer relevance explicit for the response model. `count`, `newest_year`
     # and the newest-year price above are calculated from the ACTIVE deterministic
