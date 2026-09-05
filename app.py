@@ -1438,7 +1438,7 @@ def fast_common_interpretation(message, resolved_targets=None):
 
     # Common mileage restrictions, including both prefix and suffix forms.
     km_patterns = [
-        r"(?:under|below|max(?:imum)?|less than|altında|en fazla|maksimum|до|максимум|не более)\s*([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)\s*(?:km|kilomet(?:er|re)?|км)",
+        r"(?:under|below|max(?:imum)?|less than|no more than|altında|en fazla|maksimum|до|максимум|не более)\s*([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)\s*(?:km|kilomet(?:er|re)?|км)",
         r"([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)\s*(?:km|kilomet(?:er|re)?|км)\s*(?:altında|altinda|ve altı|ve alti|or less|or below|maximum|максимум|или меньше)",
     ]
     for pattern in km_patterns:
