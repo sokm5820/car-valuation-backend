@@ -4228,15 +4228,36 @@ def api_ai_buying_assistant():
             # Preserve the already-validated budget parser as the source of truth,
             # but ensure a replacement budget in a compound scope-change sentence
             # is applied even if the conversational interpreter omitted it.
-            fast_reset = fast_common_interpretation(
-                message=message,
-                resolved_targets=resolved_targets,
+            # Do not call fast_common_interpretation() here: explicit correction
+            # turns are intentionally excluded from that fast path. Extract only
+            # the replacement budget deterministically from the correction text.
+            reset_budget = None
+
+            budget_match = re.search(
+                r"£\s*([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)",
+                message,
             )
-            if fast_reset:
-                reset_filters = sanitize_ai_filters(fast_reset.get("filters", {}))
-                for key in ("budget", "min_budget", "min_year", "max_year", "min_km", "max_km"):
-                    if key in reset_filters:
-                        next_filters[key] = reset_filters[key]
+            if not budget_match:
+                budget_match = re.search(
+                    r"\b([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)\s*£",
+                    message,
+                )
+            if not budget_match:
+                budget_match = re.search(
+                    r"\b([0-9]+(?:[.,][0-9]+)?)\s*[kK]\b",
+                    low_message,
+                )
+
+            if budget_match:
+                reset_budget = _parse_human_number(budget_match.group(1))
+                if (
+                    reset_budget is not None
+                    and re.search(r"[kK]\s*$", budget_match.group(1).strip())
+                ):
+                    reset_budget *= 1000
+
+            if reset_budget is not None:
+                next_filters["budget"] = reset_budget
 
         # Canonicalize explicitly named single vehicles. This fixes natural compound
         # names such as "Nissan Note e-Power" without hard-coding any vehicle.
