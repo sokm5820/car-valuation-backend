@@ -3722,47 +3722,60 @@ def _select_shop_representatives(results, max_candidates=3, sort_mode=None):
             chosen.append(item)
             seen.add(key)
 
-    # 1) Newest available example; among the newest year prefer lower mileage,
-    # then lower asking price.
-    newest = sorted(
-        clean,
-        key=lambda x: (
-            -(int(x.get("year") or 0)),
-            int(x.get("km")) if x.get("km") is not None else 10**12,
-            float(x.get("price") or 10**12),
-        ),
-    )
-    take(newest[0] if newest else None)
+    # Default "best matching" presentation:
+    # - every row already satisfies the buyer's hard filters, including budget;
+    # - prefer recent model years;
+    # - within the recent band, prefer plausible/lower advertised mileage;
+    # - use asking price only as a final factual tie-break.
+    #
+    # This deliberately avoids using "cheapest remaining" as the third default
+    # representative, which could surface an ancient bargain beside two modern
+    # cars even though the buyer asked for the best matches rather than cheapest.
+    valid_years = [
+        int(x.get("year"))
+        for x in clean
+        if x.get("year") not in [None, ""]
+    ]
+    newest_year = max(valid_years) if valid_years else None
+    recent_floor = (newest_year - 5) if newest_year is not None else None
 
-    # 2) Lowest-mileage remaining example.
-    low_km_pool = [x for x in clean if x.get("km") is not None and not _listing_mileage_anomaly(x)]
-    if not low_km_pool:
-        low_km_pool = [x for x in clean if x.get("km") is not None]
-    low_km = sorted(
-        low_km_pool,
-        key=lambda x: (int(x.get("km") or 0), -int(x.get("year") or 0), float(x.get("price") or 10**12)),
-    )
-    for item in low_km:
-        if identity(item) not in seen:
-            take(item)
-            break
+    def default_rank_key(item):
+        year = int(item.get("year") or 0)
+        km_missing = item.get("km") is None
+        km_value = int(item.get("km")) if item.get("km") is not None else 10**12
+        price = float(item.get("price") or 10**12)
+        return (
+            -year,
+            bool(_listing_mileage_anomaly(item)),
+            km_missing,
+            km_value,
+            price,
+        )
 
-    # 3) Lower-priced remaining example. This is a factual price distinction,
-    # not a claim that the listing is better value.
-    lower_price = sorted(
-        clean,
-        key=lambda x: (float(x.get("price") or 10**12), -int(x.get("year") or 0), int(x.get("km")) if x.get("km") is not None else 10**12),
-    )
-    for item in lower_price:
-        if identity(item) not in seen:
-            take(item)
-            break
+    recent_pool = [
+        x for x in clean
+        if recent_floor is None
+        or (
+            x.get("year") not in [None, ""]
+            and int(x.get("year")) >= recent_floor
+        )
+    ]
+    recent_ranked = sorted(recent_pool, key=default_rank_key)
 
-    # Defensive fill for tiny/duplicate datasets.
-    for item in newest:
+    for item in recent_ranked:
         if len(chosen) >= max_candidates:
             break
         take(item)
+
+    # Defensive fill only when the market genuinely has fewer than the requested
+    # number of recent examples. Older rows remain eligible rather than being
+    # silently excluded from SHOP.
+    if len(chosen) < max_candidates:
+        all_ranked = sorted(clean, key=default_rank_key)
+        for item in all_ranked:
+            if len(chosen) >= max_candidates:
+                break
+            take(item)
 
     return chosen[:max_candidates]
 
