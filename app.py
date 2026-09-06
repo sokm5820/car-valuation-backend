@@ -4447,6 +4447,47 @@ def api_ai_buying_assistant():
         if decision_mode not in {"DISCOVER", "COMPARE", "SHOP"}:
             decision_mode = "DISCOVER"
 
+        # Preserve listing-level intent while a buyer refines one already-selected
+        # vehicle. A follow-up such as "only 2020 or newer", "private sellers
+        # only", or "galleries are fine too; show me the best 3" changes the
+        # listing filters; it does not move the conversation back to DISCOVER.
+        current_brands = list(current_filters.get("brands") or [])
+        current_models = list(current_filters.get("models") or [])
+        refinement_shop_cue = re.search(
+            r"\b(?:only show|show me|private sellers?|private cars?|individual sellers?|"
+            r"galleries?|dealers?|best\s+\d+|best matches?|"
+            r"or newer|onwards|less than|under|maximum|max(?:imum)? mileage|"
+            r"bireysel|galeri(?:ler)?|sadece|göster|goster|"
+            r"частн(?:ый|ые|ого)|дилер(?:ы|ов)?|покажи)\b",
+            message.casefold(),
+        )
+        if (
+            decision_mode == "DISCOVER"
+            and len(current_brands) == 1
+            and len(current_models) == 1
+            and refinement_shop_cue
+        ):
+            decision_mode = "SHOP"
+            interpretation["decision_mode"] = "SHOP"
+
+        # Carry the canonical single vehicle forward for listing refinements even
+        # when the follow-up does not repeat its name. This also keeps exact model
+        # matching active, so Honda Fit cannot broaden to Honda Fit Aria.
+        if (
+            decision_mode == "SHOP"
+            and not resolved_targets
+            and len(current_brands) == 1
+            and len(current_models) == 1
+        ):
+            carried_target = {
+                "brand": current_brands[0],
+                "model": current_models[0],
+            }
+            current_categories = list(current_filters.get("categories") or [])
+            if len(current_categories) == 1:
+                carried_target["category"] = current_categories[0]
+            resolved_targets = [carried_target]
+
         if (
             decision_mode == "SHOP"
             and _looks_like_unknown_explicit_vehicle_shop_request(
