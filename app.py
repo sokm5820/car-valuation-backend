@@ -4456,6 +4456,7 @@ def api_ai_buying_assistant():
         refinement_shop_cue = re.search(
             r"\b(?:only show|show me|private sellers?|private cars?|individual sellers?|"
             r"galleries?|dealers?|best\s+\d+|best matches?|"
+            r"increase|raise|decrease|lower|change|set|budget|spend|ceiling|"
             r"or newer|onwards|less than|under|maximum|max(?:imum)? mileage|"
             r"bireysel|galeri(?:ler)?|sadece|göster|goster|"
             r"частн(?:ый|ые|ого)|дилер(?:ы|ов)?|покажи)\b",
