@@ -4323,6 +4323,29 @@ def api_ai_buying_assistant():
 
         resolve_started = time.perf_counter()
         resolved_targets = resolve_market_vehicle_mentions(message)
+
+        # Contextual English pronoun "one" must not be mistaken for the real
+        # vehicle model MINI One. Preserve genuine explicit MINI One requests,
+        # but let phrases such as "which one would you choose?" and
+        # "the one you recommend" resolve from conversation history instead.
+        low_message = str(message or "").casefold()
+        contextual_one = bool(
+            conversation_history
+            and re.search(
+                r"\b(?:which one|the one|one you|your recommendation|your choice)\b",
+                low_message,
+            )
+        )
+        if contextual_one and resolved_targets:
+            non_mini_one_targets = [
+                target for target in resolved_targets
+                if not (
+                    str(target.get("brand") or "").casefold() == "mini"
+                    and str(target.get("model") or "").casefold() == "one"
+                )
+            ]
+            resolved_targets = non_mini_one_targets
+
         if not resolved_targets:
             resolved_targets = _recover_recent_compare_targets(
                 message,
