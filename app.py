@@ -4457,6 +4457,8 @@ def api_ai_buying_assistant():
             r"\b(?:only show|show me|private sellers?|private cars?|individual sellers?|"
             r"galleries?|dealers?|best\s+\d+|best matches?|"
             r"increase|raise|decrease|lower|change|set|budget|spend|ceiling|"
+            r"older cars?|older vehicles?|older is fine|older are fine|"
+            r"automatic|manual|transmission|"
             r"or newer|onwards|less than|under|maximum|max(?:imum)? mileage|"
             r"bireysel|galeri(?:ler)?|sadece|göster|goster|"
             r"частн(?:ый|ые|ого)|дилер(?:ы|ов)?|покажи)\b",
@@ -4558,6 +4560,34 @@ def api_ai_buying_assistant():
         if clear_mileage:
             next_filters.pop("min_km", None)
             next_filters.pop("max_km", None)
+
+        # Deterministic year-floor clearing for natural corrections such as
+        # "older cars are fine too". This means remove the existing minimum-year
+        # restriction only; keep the selected vehicle, budget, and other filters.
+        clear_min_year = bool(
+            re.search(
+                r"\b(?:older (?:cars?|vehicles?) (?:are|is) fine(?: too)?|"
+                r"older (?:cars?|vehicles?) (?:are|is) okay(?: too)?|"
+                r"older (?:cars?|vehicles?) (?:are|is) ok(?: too)?|"
+                r"older is fine(?: too)?|older are fine(?: too)?|"
+                r"any year is fine|year doesn['’]?t matter(?: anymore)?|"
+                r"forget (?:the )?(?:minimum|min) year|"
+                r"remove (?:the )?(?:minimum|min) year(?: limit| restriction)?)\b",
+                low_message_for_clear,
+            )
+            or re.search(
+                r"\b(?:eski araçlar da olur|eski araclar da olur|"
+                r"yıl önemli değil|yil onemli degil)\b",
+                low_message_for_clear,
+            )
+            or re.search(
+                r"\b(?:старые машины тоже подойдут|год не важен|любой год)\b",
+                low_message_for_clear,
+            )
+        )
+
+        if clear_min_year:
+            next_filters.pop("min_year", None)
 
         next_preferences = merge_preferences(
             current_preferences,
