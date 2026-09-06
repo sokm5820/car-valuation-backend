@@ -4470,6 +4470,13 @@ def api_ai_buying_assistant():
         # there must not accidentally turn into listing search.
         recent_shop_context = False
         for history_item in reversed((conversation_history or [])[-8:]):
+            # Only prior USER intent can establish listing-level context.
+            # Assistant explanations may naturally mention "listings" while
+            # discussing market evidence, which must not silently switch a
+            # DISCOVER/COMPARE journey into SHOP.
+            history_role = str(history_item.get("role") or "").casefold()
+            if history_role != "user":
+                continue
             history_content = str(
                 history_item.get("text")
                 or history_item.get("content")
