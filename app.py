@@ -4243,6 +4243,25 @@ def _recover_recent_recommendation_target(message, conversation_history):
             opening_targets = resolve_market_vehicle_mentions(opening)
             if len(opening_targets) == 1:
                 return [opening_targets[0]]
+            if len(opening_targets) >= 2:
+                opening_cf = opening.casefold()
+                ranked_opening_targets = []
+                for target in opening_targets:
+                    brand = str(target.get("brand") or "").strip()
+                    model = str(target.get("model") or "").strip()
+                    full_name = f"{brand} {model}".strip().casefold()
+                    model_name = model.casefold()
+                    full_count = opening_cf.count(full_name) if full_name else 0
+                    model_count = opening_cf.count(model_name) if model_name else 0
+                    ranked_opening_targets.append(
+                        (max(full_count, model_count), target)
+                    )
+                ranked_opening_targets.sort(key=lambda x: x[0], reverse=True)
+                if (
+                    ranked_opening_targets
+                    and ranked_opening_targets[0][0] > ranked_opening_targets[1][0]
+                ):
+                    return [ranked_opening_targets[0][1]]
 
         targets = resolve_market_vehicle_mentions(content)
         if targets:
@@ -4354,7 +4373,8 @@ def api_ai_buying_assistant():
         contextual_one = bool(
             conversation_history
             and re.search(
-                r"\b(?:which one|the one|one you|your recommendation|your choice)\b",
+                r"\b(?:which one|the one|one you|your recommendation|your choice|"
+                r"(?:the )?(?:stronger|better|strongest|best) (?:one|option))\b",
                 low_message,
             )
         )
