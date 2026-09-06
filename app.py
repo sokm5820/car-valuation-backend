@@ -3436,6 +3436,91 @@ def _fast_compare_answer(message, language, filters, model_options):
     same_market_winner = label(choice_winner) == label(newest_winner)
     liquidity_label = label(liquidity_winner) if liquidity_winner is not None else None
 
+    # Natural follow-up: "Which one would you choose based on the North Cyprus market?"
+    # Keep this deterministic and evidence-bounded. A vehicle is recommended only
+    # when it leads a majority of the market signals we actually support here:
+    # current choice, newest affordable year, and observed historical turnover.
+    low_message = str(message or "").casefold()
+    asks_market_choice = bool(re.search(
+        r"\b(?:which (?:one )?(?:would you|do you) (?:choose|recommend|pick|prefer)|"
+        r"which (?:one )?is (?:better|stronger) based on (?:the )?(?:north cyprus )?market|"
+        r"hangisini (?:seçer|secer|önerir|onerir)sin(?:iz)?|"
+        r"piyasaya göre hangisi|piyasaya gore hangisi|"
+        r"какую (?:выбрать|порекомендуете)|какой (?:выбрать|порекомендуете))\b",
+        low_message,
+    ))
+
+    if asks_market_choice:
+        votes = {}
+        def add_vote(option):
+            if option is None:
+                return
+            key = (str(option.get("brand") or "").casefold(), str(option.get("model") or "").casefold())
+            votes[key] = votes.get(key, 0) + 1
+
+        add_vote(choice_winner)
+        add_vote(newest_winner)
+        add_vote(liquidity_winner)
+
+        selected = max(
+            chosen,
+            key=lambda o: (
+                votes.get((str(o.get("brand") or "").casefold(), str(o.get("model") or "").casefold()), 0),
+                int(o.get("count") or 0),
+                int(o.get("newest_year") or 0),
+            ),
+        )
+        selected_key = (str(selected.get("brand") or "").casefold(), str(selected.get("model") or "").casefold())
+        selected_votes = votes.get(selected_key, 0)
+        selected_name = label(selected)
+
+        reasons = []
+        if selected is choice_winner:
+            reasons.append("more current choice")
+        if selected is newest_winner:
+            reasons.append("access to a newer affordable model year")
+        if liquidity_winner is not None and selected is liquidity_winner:
+            reasons.append("the stronger observed historical turnover signal")
+
+        if language == "TR":
+            if selected_votes >= 2:
+                reason_text = ", ".join(reasons)
+                return (
+                    f"Kuzey Kıbrıs piyasa verilerine göre {selected_name} tercih ederdim. "
+                    f"Bu karşılaştırmada {reason_text} açısından daha güçlü görünüyor. "
+                    "Bu, aracın doğası gereği daha iyi veya daha güvenilir olduğu anlamına gelmez; "
+                    "tercih yalnızca elimizdeki yerel piyasa verilerine dayanıyor."
+                )
+            return (
+                "Yalnızca mevcut Kuzey Kıbrıs piyasa verilerine dayanarak ikisinden birini net biçimde "
+                "üstün ilan etmezdim; güçlü oldukları piyasa sinyalleri farklı."
+            )
+        if language == "RU":
+            if selected_votes >= 2:
+                reason_text = ", ".join(reasons)
+                return (
+                    f"По данным рынка Северного Кипра я бы выбрал {selected_name}. "
+                    f"В этом сравнении он сильнее по следующим сигналам: {reason_text}. "
+                    "Это не означает, что автомобиль сам по себе лучше или надёжнее; "
+                    "выбор основан только на доступных локальных рыночных данных."
+                )
+            return (
+                "Только по текущим данным рынка Северного Кипра я бы не называл один из этих вариантов "
+                "однозначно лучшим: они сильнее по разным рыночным сигналам."
+            )
+        if selected_votes >= 2:
+            reason_text = ", ".join(reasons)
+            return (
+                f"Based on the North Cyprus market data, I'd choose {selected_name}. "
+                f"In this comparison it has {reason_text}. "
+                "That doesn't mean it is inherently the better or more reliable vehicle; "
+                "the choice is based only on the local market evidence we have."
+            )
+        return (
+            "Based only on the current North Cyprus market data, I wouldn't call either one the clear winner; "
+            "they lead on different market signals."
+        )
+
     if language == "TR":
         prefix = f"{budget_text} bütçenizde " if budget_text else ""
         if same_market_winner:
@@ -4047,7 +4132,15 @@ def _recover_recent_compare_targets(message, conversation_history):
         r"только|до\s+[0-9]|не более)\b",
         low,
     )
-    if not continuation_cue:
+    recommendation_cue = re.search(
+        r"\b(?:which (?:one )?(?:would you|do you) (?:choose|recommend|pick|prefer)|"
+        r"which (?:one )?is (?:better|stronger) based on (?:the )?(?:north cyprus )?market|"
+        r"hangisini (?:seçer|secer|önerir|onerir)sin(?:iz)?|"
+        r"piyasaya göre hangisi|piyasaya gore hangisi|"
+        r"какую (?:выбрать|порекомендуете)|какой (?:выбрать|порекомендуете))\b",
+        low,
+    )
+    if not (continuation_cue or recommendation_cue):
         return []
 
     # Clear scope changes should start a new search rather than revive old models.
@@ -4092,8 +4185,10 @@ def _recover_recent_recommendation_target(message, conversation_history):
 
     first_ref = re.search(
         r"\b(?:first recommendation|first option|first one|top recommendation|"
-        r"ilk öneri(?:niz|n)?|ilk seçenek|ilk secenek|"
-        r"первая рекомендация|первый вариант)\b",
+        r"(?:the )?one you (?:recommend|recommended|chose|choose|picked|pick|prefer)|"
+        r"your recommendation|your choice|"
+        r"önerdiğin(?:iz)?|onerdigin(?:iz)?|seçtiğin(?:iz)?|sectigin(?:iz)?|"
+        r"рекомендованн\w+|ваш выбор|котор\w+ вы (?:рекомендуете|выбрали))\b",
         low,
     )
     listing_ref = re.search(
@@ -4105,10 +4200,28 @@ def _recover_recent_recommendation_target(message, conversation_history):
     if not (first_ref and listing_ref):
         return []
 
+    contextual_choice_ref = re.search(
+        r"\b(?:(?:the )?one you (?:recommend|recommended|chose|choose|picked|pick|prefer)|"
+        r"your recommendation|your choice|"
+        r"önerdiğin(?:iz)?|onerdigin(?:iz)?|seçtiğin(?:iz)?|sectigin(?:iz)?|"
+        r"рекомендованн\w+|ваш выбор|котор\w+ вы (?:рекомендуете|выбрали))\b",
+        low,
+    )
+
     for item in reversed(conversation_history or []):
         if str(item.get("role") or "").casefold() != "assistant":
             continue
         content = str(item.get("text") or item.get("content") or "")
+
+        if contextual_choice_ref:
+            # v11.5.12 recommendation answers deliberately name the selected
+            # vehicle in the opening paragraph. Resolve that paragraph first so
+            # other compared vehicles later in the answer cannot steal the reference.
+            opening = re.split(r"\n\s*\n|(?<=[.!?])\s+", content.strip(), maxsplit=1)[0]
+            opening_targets = resolve_market_vehicle_mentions(opening)
+            if len(opening_targets) == 1:
+                return [opening_targets[0]]
+
         targets = resolve_market_vehicle_mentions(content)
         if targets:
             return [targets[0]]
