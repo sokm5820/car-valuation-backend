@@ -4709,6 +4709,35 @@ def api_ai_buying_assistant():
             search_result, next_preferences
         )
 
+        # A single explicitly resolved COMPARE/SHOP target is a canonical vehicle,
+        # not a fuzzy model search. market_search intentionally keeps substring
+        # matching for the public search API, so "Honda Fit" can also match
+        # "Honda Fit Aria". Remove those fuzzy neighbours here before counts,
+        # model options, SHOP representatives, and the public assistant response
+        # are produced.
+        if decision_mode in {"COMPARE", "SHOP"} and len(resolved_targets) == 1:
+            target = resolved_targets[0]
+            target_brand_cf = str(target.get("brand") or "").strip().casefold()
+            target_model_cf = str(target.get("model") or "").strip().casefold()
+            target_category_cf = str(target.get("category") or "").strip().casefold()
+
+            exact_results = []
+            for item in search_result.get("results", []) or []:
+                item_brand_cf = str(item.get("brand") or "").strip().casefold()
+                item_model_cf = str(item.get("model") or "").strip().casefold()
+                item_category_cf = str(item.get("category") or "").strip().casefold()
+
+                if item_brand_cf != target_brand_cf or item_model_cf != target_model_cf:
+                    continue
+                if target_category_cf and item_category_cf != target_category_cf:
+                    continue
+                exact_results.append(item)
+
+            search_result = dict(search_result)
+            search_result["results"] = exact_results
+            search_result["count"] = len(exact_results)
+            search_result["returned"] = len(exact_results)
+
         # Guided buying flow: broad searches get a compact group of useful
         # narrowing dimensions; only later do we offer secondary refinements.
         guide_question = None
