@@ -4464,11 +4464,32 @@ def api_ai_buying_assistant():
             r"частн(?:ый|ые|ого)|дилер(?:ы|ов)?|покажи)\b",
             message.casefold(),
         )
+        # Only inherit SHOP from an implicit refinement when the recent
+        # conversation was actually listing-level. A single recommended model can
+        # also exist during DISCOVER/COMPARE; budget/transmission/year follow-ups
+        # there must not accidentally turn into listing search.
+        recent_shop_context = False
+        for history_item in reversed((conversation_history or [])[-8:]):
+            history_content = str(
+                history_item.get("text")
+                or history_item.get("content")
+                or ""
+            ).casefold()
+            if re.search(
+                r"\b(?:listings?|actual listings?|"
+                r"ilan(?:lar|ları|lari|ları)?|"
+                r"объявлен(?:ие|ия|ий|иям|иях)?)\b",
+                history_content,
+            ):
+                recent_shop_context = True
+                break
+
         if (
             decision_mode == "DISCOVER"
             and len(current_brands) == 1
             and len(current_models) == 1
             and refinement_shop_cue
+            and recent_shop_context
         ):
             decision_mode = "SHOP"
             interpretation["decision_mode"] = "SHOP"
