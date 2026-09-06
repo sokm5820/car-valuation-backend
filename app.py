@@ -1171,9 +1171,29 @@ def _search_market_for_vehicle_targets(base_filters, targets):
         if not result.get("success"):
             return result
 
-        total += int(result.get("count", 0) or 0)
+        # Explicit named comparison/shop targets must be exact Brand + Model
+        # matches. market_search intentionally supports broader substring matching
+        # for the public search API, but that would make "Honda Fit" also include
+        # "Honda Fit Aria" inside a named comparison.
+        target_brand_cf = str(target.get("brand") or "").strip().casefold()
+        target_model_cf = str(target.get("model") or "").strip().casefold()
+        target_category_cf = str(target.get("category") or "").strip().casefold()
 
+        exact_items = []
         for item in result.get("results", []) or []:
+            item_brand_cf = str(item.get("brand") or "").strip().casefold()
+            item_model_cf = str(item.get("model") or "").strip().casefold()
+            item_category_cf = str(item.get("category") or "").strip().casefold()
+
+            if item_brand_cf != target_brand_cf or item_model_cf != target_model_cf:
+                continue
+            if target_category_cf and item_category_cf != target_category_cf:
+                continue
+            exact_items.append(item)
+
+        total += len(exact_items)
+
+        for item in exact_items:
             link = str(item.get("link") or "").strip()
             dedupe_key = link or json.dumps(item, ensure_ascii=False, sort_keys=True)
             if dedupe_key in seen_links:
@@ -4185,6 +4205,7 @@ def _recover_recent_recommendation_target(message, conversation_history):
 
     first_ref = re.search(
         r"\b(?:first recommendation|first option|first one|top recommendation|"
+        r"(?:the )?(?:stronger|better|strongest|best) (?:one|option)|"
         r"(?:the )?one you (?:recommend|recommended|chose|choose|picked|pick|prefer)|"
         r"your recommendation|your choice|"
         r"önerdiğin(?:iz)?|onerdigin(?:iz)?|seçtiğin(?:iz)?|sectigin(?:iz)?|"
@@ -4201,7 +4222,8 @@ def _recover_recent_recommendation_target(message, conversation_history):
         return []
 
     contextual_choice_ref = re.search(
-        r"\b(?:(?:the )?one you (?:recommend|recommended|chose|choose|picked|pick|prefer)|"
+        r"\b(?:(?:the )?(?:stronger|better|strongest|best) (?:one|option)|"
+        r"(?:the )?one you (?:recommend|recommended|chose|choose|picked|pick|prefer)|"
         r"your recommendation|your choice|"
         r"önerdiğin(?:iz)?|onerdigin(?:iz)?|seçtiğin(?:iz)?|sectigin(?:iz)?|"
         r"рекомендованн\w+|ваш выбор|котор\w+ вы (?:рекомендуете|выбрали))\b",
