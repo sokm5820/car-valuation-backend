@@ -4160,7 +4160,11 @@ def _recover_recent_compare_targets(message, conversation_history):
     continuation_cue = re.search(
         r"\b(?:only consider|consider only|only include|within|under|below|"
         r"maximum|max\b|up to|from\s+(?:19|20)\d{2}|"
-        r"automatic only|manual only|"
+        r"(?:19|20)\d{2}\s+(?:or newer|onwards)|"
+        r"automatic only|manual only|only automatic|only manual|"
+        r"increase (?:my |the )?budget|raise (?:my |the )?budget|"
+        r"decrease (?:my |the )?budget|lower (?:my |the )?budget|"
+        r"change (?:my |the )?budget|set (?:my |the )?budget|"
         r"sadece|yalnızca|yalnizca|altında|altinda|"
         r"только|до\s+[0-9]|не более)\b",
         low,
