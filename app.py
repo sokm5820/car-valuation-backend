@@ -4165,6 +4165,9 @@ def _recover_recent_compare_targets(message, conversation_history):
         r"increase (?:my |the )?budget|raise (?:my |the )?budget|"
         r"decrease (?:my |the )?budget|lower (?:my |the )?budget|"
         r"change (?:my |the )?budget|set (?:my |the )?budget|"
+        r"which (?:one )?(?:has|shows) (?:the )?(?:stronger|better) "
+        r"(?:resale(?:-market)? activity|resale|market activity|turnover)|"
+        r"which (?:one )?is (?:stronger|better) for resale|"
         r"sadece|yalnızca|yalnizca|altında|altinda|"
         r"только|до\s+[0-9]|не более)\b",
         low,
@@ -4253,9 +4256,29 @@ def _recover_recent_recommendation_target(message, conversation_history):
         content = str(item.get("text") or item.get("content") or "")
 
         if contextual_choice_ref:
-            # v11.5.12 recommendation answers deliberately name the selected
-            # vehicle in the opening paragraph. Resolve that paragraph first so
-            # other compared vehicles later in the answer cannot steal the reference.
+            # If the preceding comparison explicitly states which model has the
+            # stronger resale/turnover signal, resolve that winner first. This is
+            # more reliable than taking the first model named in a multi-model
+            # comparison paragraph.
+            resale_sentences = re.split(r"(?<=[.!?])\s+|\n+", content.strip())
+            for sentence in resale_sentences:
+                sentence_low = sentence.casefold()
+                if not (
+                    re.search(r"\b(?:stronger|better|faster)\b", sentence_low)
+                    and re.search(
+                        r"\b(?:resale|turnover|market activity|historical market signal|"
+                        r"observed historical turnover)\b",
+                        sentence_low,
+                    )
+                ):
+                    continue
+                sentence_targets = resolve_market_vehicle_mentions(sentence)
+                if len(sentence_targets) == 1:
+                    return [sentence_targets[0]]
+
+            # Recommendation answers deliberately name the selected vehicle in
+            # the opening paragraph. Resolve that paragraph next so other compared
+            # vehicles later in the answer cannot steal the reference.
             opening = re.split(r"\n\s*\n|(?<=[.!?])\s+", content.strip(), maxsplit=1)[0]
             opening_targets = resolve_market_vehicle_mentions(opening)
             if len(opening_targets) == 1:
