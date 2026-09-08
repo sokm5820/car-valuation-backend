@@ -4930,7 +4930,16 @@ def api_ai_buying_assistant():
                 flush=True,
             )
 
-        public_results = (advisory_results or search_result.get("results") or [])[:100]
+        if decision_mode == "SHOP":
+            public_results = _select_shop_representatives(
+                advisory_results or search_result.get("results") or [],
+                max_candidates=3,
+                sort_mode=_listing_sort_mode(next_preferences),
+            )
+        else:
+            public_results = (
+                advisory_results or search_result.get("results") or []
+            )[:100]
         return jsonify({
             "success": True,
             "answer": answer,
