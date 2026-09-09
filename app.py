@@ -2032,6 +2032,281 @@ def _parse_human_number(token):
         return None
 
 
+
+# =========================================================
+# AI ASSISTANT V8 - SEMANTIC CONVERSATION CONTROLLER
+# =========================================================
+#
+# V8 separates "what did the user mean?" from "what does the market data say?".
+# The model is used only to understand the conversational turn. All prices,
+# counts, listings, liquidity, rankings and market evidence remain deterministic
+# and are calculated from OtoDeğer data below.
+#
+# This deliberately replaces the old pattern of recovering arbitrary state from
+# older prose. current_filters/current_preferences are the authoritative state;
+# recent conversation is used only to understand the latest turn.
+
+ASSISTANT_ORCHESTRATION_VERSION = "8.0"
+
+
+def _v8_previous_assistant_text(conversation_history):
+    for item in reversed(conversation_history or []):
+        if str(item.get("role") or "").casefold() != "assistant":
+            continue
+        value = str(item.get("text") or item.get("content") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _v8_state_snapshot(current_filters, current_preferences, conversation_history):
+    return {
+        "filters": sanitize_ai_filters(current_filters or {}),
+        "preferences": _canonicalize_buyer_preferences(current_preferences or []),
+        "previous_assistant_message": _v8_previous_assistant_text(conversation_history)[:1200],
+    }
+
+
+def _v8_semantic_turn_plan(
+    message,
+    language,
+    current_filters,
+    current_preferences,
+    conversation_history,
+    explicit_targets,
+):
+    """
+    Premium semantic controller for Personal buyer conversations.
+
+    It returns an incremental state operation. It does NOT answer the market
+    question and it never supplies market facts. That separation is important:
+    language understanding can be probabilistic; OtoDeğer evidence cannot be.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY_NOT_CONFIGURED")
+
+    state = _v8_state_snapshot(
+        current_filters,
+        current_preferences,
+        conversation_history,
+    )
+
+    instructions = """
+You are the semantic conversation controller for OtoDeğer, a premium North Cyprus
+vehicle-market assistant.
+
+Your ONLY job is to understand the user's latest conversational turn and return
+one compact JSON object describing how the application's structured state should
+change. Never answer the user. Never invent vehicle-market facts.
+
+Think like an excellent human sales/research assistant:
+- Understand terse answers in context. If the assistant just asked for maximum
+  budget and the user says "15.000", that is the budget answer, not nonsense.
+- Preserve active constraints when the user is refining the SAME task:
+  "I want something economical", "under 80,000 km", "automatic", "newer".
+- Do not resurrect an older task after the user has started a newer one.
+- A clearly new request starts a NEW_TASK. Examples:
+  * after discussing two models, "What cars fit my budget?" starts a new discovery.
+  * "Compare Honda Fit and Toyota Yaris" starts a new comparison.
+- A follow-up such as "which one would you choose?", "show me those", "cheaper",
+  "what about private sellers?", "under 80k km" normally CONTINUES the current task.
+- CORRECT means the user is correcting/removing/replacing something in the active task.
+- ANSWER means the user is directly answering the assistant's immediately preceding
+  clarification/question.
+- Never infer a Honda Fit from the ordinary English verb "fit".
+- Do not translate brand/model names.
+- resolved_explicit_vehicle_targets are deterministic application evidence. Use them
+  to determine task/mode; do not invent additional vehicle names.
+- Hard constraints go in filters. Subjective goals go in preferences.
+- Vehicle classes use preferences, not Category:
+  vehicle_type:car, vehicle_type:SUV, vehicle_type:crossover,
+  vehicle_type:pickup, vehicle_type:small_car, vehicle_type:motorcycle,
+  vehicle_type:scooter.
+- Buyer goals use:
+  priority:economy, priority:reliability, priority:performance, priority:luxury,
+  priority:comfort, priority:practicality, use_case:family, use_case:commute.
+- Listing ordering uses:
+  listing_sort:lowest_km, listing_sort:cheapest, listing_sort:newest.
+- If a new concrete vehicle_type is supplied, the application will replace the old type.
+- Prices are GBP. "15k", "15 bin", "15 thousand" = 15000.
+- "15.000" or "15,000" in an immediately requested budget context = 15000.
+- Mileage numbers must not be confused with budgets.
+- Exact model years attached to a named vehicle are handled by deterministic vehicle
+  resolution, so do not turn two different comparison years into one global year filter.
+- For a fresh explicit multi-vehicle comparison, use NEW_TASK and do not carry an old
+  budget/body-type search unless the user repeats that constraint in the SAME message.
+- If the user asks to see actual cars/listings/ads, mode is SHOP.
+- If they compare two or more vehicles, mode is COMPARE.
+- Otherwise mode is DISCOVER.
+- needs_clarification=true only when the latest message is genuinely ambiguous and
+  cannot safely be understood from state + previous assistant message.
+- Do not ask generic questions merely because some optional buying dimensions are absent;
+  the application has its own progressive narrowing flow.
+- seller_mode: individual means private/Bireysel, gallery means dealers, both clears it.
+- clear_filters contains only hard filter names that the user explicitly removes.
+- clear_preferences contains canonical preference tags or prefixes the user explicitly
+  removes. Use "vehicle_type:*" to clear an old vehicle class and "priority:*" only if
+  the user explicitly removes all priorities.
+- Return JSON only. No markdown.
+
+JSON shape:
+{
+  "operation": "CONTINUE" | "NEW_TASK" | "ANSWER" | "CORRECT",
+  "decision_mode": "DISCOVER" | "COMPARE" | "SHOP",
+  "filters": {
+    "budget": number|null,
+    "min_budget": number|null,
+    "brands": array|null,
+    "exclude_brands": array|null,
+    "models": array|null,
+    "exclude_models": array|null,
+    "categories": array|null,
+    "exclude_categories": array|null,
+    "locations": array|null,
+    "exclude_locations": array|null,
+    "companies": array|null,
+    "exclude_companies": array|null,
+    "transmissions": array|null,
+    "colors": array|null,
+    "min_year": integer|null,
+    "max_year": integer|null,
+    "min_km": number|null,
+    "max_km": number|null
+  },
+  "clear_filters": [],
+  "seller_mode": null | "individual" | "gallery" | "both",
+  "preferences": [],
+  "clear_preferences": [],
+  "needs_clarification": false,
+  "clarification_question": null,
+  "awaiting": null | "budget" | "mileage" | "year" | "vehicle_type" | "model" | "seller"
+}
+"""
+
+    payload = {
+        "language": language,
+        "latest_message": str(message or "")[:1200],
+        "state": state,
+        "recent_conversation": sanitize_conversation_history(
+            conversation_history, max_messages=8
+        ),
+        "resolved_explicit_vehicle_targets": explicit_targets or [],
+    }
+
+    response = _openai_post(
+        payload={
+            "model": OPENAI_MODEL,
+            "reasoning": {"effort": "low"},
+            "max_output_tokens": 850,
+            "instructions": instructions,
+            "input": json.dumps(payload, ensure_ascii=False),
+        },
+        timeout=(1.5, 7.0),
+    )
+    response.raise_for_status()
+    response_text = extract_response_text(response.json())
+    if not response_text:
+        raise ValueError("V8_TURN_CONTROLLER_EMPTY_RESPONSE")
+
+    plan = json.loads(response_text)
+
+    operation = str(plan.get("operation") or "CONTINUE").upper()
+    if operation not in {"CONTINUE", "NEW_TASK", "ANSWER", "CORRECT"}:
+        operation = "CONTINUE"
+
+    decision_mode = str(plan.get("decision_mode") or "DISCOVER").upper()
+    if decision_mode not in {"DISCOVER", "COMPARE", "SHOP"}:
+        decision_mode = "DISCOVER"
+
+    filters = sanitize_ai_filters(plan.get("filters") or {})
+    filters = {k: v for k, v in filters.items() if v is not None}
+
+    clear_filters = [
+        str(k) for k in (plan.get("clear_filters") or [])
+        if str(k) in AI_FILTER_KEYS
+    ]
+
+    seller_mode = plan.get("seller_mode")
+    if seller_mode not in {None, "individual", "gallery", "both"}:
+        seller_mode = None
+
+    preferences = _canonicalize_buyer_preferences(plan.get("preferences") or [])
+    clear_preferences = [
+        str(v).strip() for v in (plan.get("clear_preferences") or [])
+        if str(v).strip()
+    ]
+
+    awaiting = plan.get("awaiting")
+    if awaiting not in {None, "budget", "mileage", "year", "vehicle_type", "model", "seller"}:
+        awaiting = None
+
+    clarification = str(plan.get("clarification_question") or "").strip() or None
+
+    return {
+        "operation": operation,
+        "filters": filters,
+        "clear_filters": clear_filters,
+        "seller_mode": seller_mode,
+        "preferences": preferences,
+        "clear_preferences": clear_preferences,
+        "needs_clarification": bool(plan.get("needs_clarification")),
+        "clarification_question": clarification,
+        "decision_mode": decision_mode,
+        "awaiting": awaiting,
+        "fast_path": False,
+        "orchestration_version": ASSISTANT_ORCHESTRATION_VERSION,
+    }
+
+
+def _v8_apply_preference_changes(previous_preferences, interpretation):
+    """Apply semantic preference removals, then normal replacement-aware merging."""
+    previous = _canonicalize_buyer_preferences(previous_preferences or [])
+    clear_preferences = [
+        str(v).strip().casefold()
+        for v in (interpretation.get("clear_preferences") or [])
+        if str(v).strip()
+    ]
+
+    if clear_preferences:
+        kept = []
+        for pref in previous:
+            p = str(pref).casefold()
+            remove = False
+            for clear in clear_preferences:
+                if clear.endswith("*"):
+                    if p.startswith(clear[:-1]):
+                        remove = True
+                        break
+                elif p == clear:
+                    remove = True
+                    break
+            if not remove:
+                kept.append(pref)
+        previous = kept
+
+    return merge_preferences(previous, interpretation.get("preferences") or [])
+
+
+def _v8_should_recover_compare_targets(message, interpretation):
+    """
+    Recover old comparison targets only when the semantic controller says the
+    latest turn continues/answers/corrects the active comparison. DISCOVER turns
+    can therefore never accidentally resurrect an older Fit/Yaris comparison.
+    """
+    if str(interpretation.get("decision_mode") or "").upper() != "COMPARE":
+        return False
+    return str(interpretation.get("operation") or "").upper() in {
+        "CONTINUE", "ANSWER", "CORRECT"
+    }
+
+
+def _v8_should_recover_shop_target(message, interpretation):
+    if str(interpretation.get("decision_mode") or "").upper() != "SHOP":
+        return False
+    return str(interpretation.get("operation") or "").upper() in {
+        "CONTINUE", "ANSWER", "CORRECT"
+    }
+
 def fast_common_interpretation(message, resolved_targets=None):
     """
     Deterministic multilingual fast path for common buyer requests.
@@ -7063,35 +7338,21 @@ def _business_acquire_intent(message, conversation_history=None):
 
 
 def _business_parse_budget(message):
+    """Parse dealer budgets with the same locale-safe number logic as Personal."""
     raw = str(message or "")
-
     patterns = [
-        r"£\s*([0-9]+(?:[.,][0-9]+)?\s*[kK]?)",
-        r"\b([0-9]+(?:[.,][0-9]+)?\s*[kK]?)\s*£",
-        r"\b([0-9]+(?:[.,][0-9]+)?)\s*(?:k|K)\b",
+        r"£\s*([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)",
+        r"\b([0-9](?:[0-9.,]|\s(?=\d))*\s*[kK]?)\s*£",
+        r"\b([0-9]+(?:[.,][0-9]+)?\s*[kK])\b",
     ]
 
     for pattern in patterns:
-        m = re.search(pattern, raw)
-        if not m:
+        match = re.search(pattern, raw)
+        if not match:
             continue
-
-        token = m.group(1).strip().replace(" ", "")
-        is_k = token.casefold().endswith("k")
-        token = token[:-1] if is_k else token
-        token = token.replace(",", ".")
-
-        try:
-            value = float(token)
-        except Exception:
-            continue
-
-        if is_k:
-            value *= 1000.0
-
-        if 500 <= value <= 500000:
-            return value
-
+        value = _parse_human_number(match.group(1))
+        if value is not None and 500 <= value <= 500000:
+            return float(value)
     return None
 
 
@@ -7777,19 +8038,19 @@ def api_ai_buying_assistant():
                 "stage": "business_recommendation",
             })
 
+        # =====================================================
+        # PERSONAL ASSISTANT V8 — semantic turn orchestration
+        # =====================================================
+        #
+        # Resolve ONLY vehicles explicitly named in the latest message first.
+        # History recovery happens later and only when the semantic controller
+        # confirms that this turn continues the same COMPARE/SHOP task.
         resolve_started = time.perf_counter()
         resolved_targets = resolve_market_vehicle_mentions(message)
-        resolved_targets = _attach_explicit_years_to_vehicle_targets(message, resolved_targets)
+        resolved_targets = _attach_explicit_years_to_vehicle_targets(
+            message, resolved_targets
+        )
 
-        # Keep a snapshot before any history-based recovery. An explicit comparison
-        # named in the current message is a self-contained request and must not inherit
-        # stale budget/body-type/model constraints from an unrelated earlier search.
-        explicit_current_message_targets = [dict(t) for t in resolved_targets]
-
-        # Contextual English pronoun "one" must not be mistaken for the real
-        # vehicle model MINI One. Preserve genuine explicit MINI One requests,
-        # but let phrases such as "which one would you choose?" and
-        # "the one you recommend" resolve from conversation history instead.
         low_message = str(message or "").casefold()
         contextual_one = bool(
             conversation_history
@@ -7800,53 +8061,72 @@ def api_ai_buying_assistant():
             )
         )
         if contextual_one and resolved_targets:
-            non_mini_one_targets = [
+            resolved_targets = [
                 target for target in resolved_targets
                 if not (
                     str(target.get("brand") or "").casefold() == "mini"
                     and str(target.get("model") or "").casefold() == "one"
                 )
             ]
-            resolved_targets = non_mini_one_targets
 
-        if not resolved_targets:
-            resolved_targets = _recover_recent_compare_targets(
-                message,
-                conversation_history,
-            )
-        if not resolved_targets:
-            resolved_targets = _recover_recent_recommendation_target(
-                message,
-                conversation_history,
-            )
+        explicit_current_message_targets = [dict(t) for t in resolved_targets]
         resolve_seconds = time.perf_counter() - resolve_started
 
         interpret_started = time.perf_counter()
-        interpretation = fast_common_interpretation(
-            message=message,
-            resolved_targets=resolved_targets,
+        try:
+            interpretation = _v8_semantic_turn_plan(
+                message=message,
+                language=language,
+                current_filters=current_filters,
+                current_preferences=current_preferences,
+                conversation_history=conversation_history,
+                explicit_targets=explicit_current_message_targets,
+            )
+        except Exception as exc:
+            # Graceful degradation: the deterministic parser remains a fallback,
+            # not the primary conversation brain.
+            print(f"V8_CONTROLLER_DEGRADED_FALLBACK: {exc}", flush=True)
+            interpretation = fast_common_interpretation(
+                message=message,
+                resolved_targets=explicit_current_message_targets,
+            )
+            if interpretation is None:
+                try:
+                    interpretation = interpret_market_query(
+                        message=message,
+                        current_filters=current_filters,
+                        language=language,
+                        conversation_history=conversation_history,
+                    )
+                except Exception as legacy_exc:
+                    print(
+                        f"LEGACY_INTERPRETER_DEGRADED_FALLBACK: {legacy_exc}",
+                        flush=True,
+                    )
+                    question = {
+                        "TR": "Bunu doğru anlayabilmem için neyi değiştirmek istediğinizi biraz daha açık yazar mısınız?",
+                        "RU": "Уточните, пожалуйста, что именно вы хотите изменить, чтобы я понял вас правильно.",
+                        "EN": "Could you clarify what you'd like me to change so I can apply it correctly?",
+                    }.get(language, "Could you clarify what you'd like me to change?")
+                    interpretation = {
+                        "operation": "CONTINUE",
+                        "filters": {},
+                        "clear_filters": [],
+                        "seller_mode": None,
+                        "preferences": [],
+                        "clear_preferences": [],
+                        "needs_clarification": True,
+                        "clarification_question": question,
+                        "decision_mode": "COMPARE" if explicit_current_message_targets else "DISCOVER",
+                        "fast_path": False,
+                        "degraded": True,
+                        "orchestration_version": ASSISTANT_ORCHESTRATION_VERSION,
+                    }
+
+        interpretation.setdefault("operation", "CONTINUE")
+        interpretation.setdefault(
+            "orchestration_version", ASSISTANT_ORCHESTRATION_VERSION
         )
-        if interpretation is None:
-            try:
-                interpretation = interpret_market_query(
-                    message=message,
-                    current_filters=current_filters,
-                    language=language,
-                    conversation_history=conversation_history,
-                )
-            except Exception as exc:
-                print(f"INTERPRETER_DEGRADED_FALLBACK: {exc}", flush=True)
-                question = {
-                    "TR": "Bu değişikliği net uygulayabilmem için bütçe, model, yıl, kilometre veya satıcı tercihinizi biraz daha açık yazar mısınız?",
-                    "RU": "Чтобы точно применить изменение, уточните бюджет, модель, год, пробег или тип продавца.",
-                    "EN": "To apply that accurately, please rephrase it with the budget, model, year, mileage or seller preference you want to change.",
-                }.get(language, "To apply that accurately, please rephrase the restriction you want to change.")
-                interpretation = {
-                    "filters": {}, "clear_filters": [], "seller_mode": None, "preferences": [],
-                    "needs_clarification": True, "clarification_question": question,
-                    "decision_mode": "COMPARE" if resolved_targets else "DISCOVER",
-                    "fast_path": False, "degraded": True,
-                }
         interpret_seconds = time.perf_counter() - interpret_started
 
         decision_mode = str(
@@ -7854,66 +8134,75 @@ def api_ai_buying_assistant():
         ).upper()
         if decision_mode not in {"DISCOVER", "COMPARE", "SHOP"}:
             decision_mode = "DISCOVER"
+            interpretation["decision_mode"] = decision_mode
 
-        # Preserve listing-level intent while a buyer refines one already-selected
-        # vehicle. A follow-up such as "only 2020 or newer", "private sellers
-        # only", or "galleries are fine too; show me the best 3" changes the
-        # listing filters; it does not move the conversation back to DISCOVER.
+        if len(explicit_current_message_targets) >= 2:
+            decision_mode = "COMPARE"
+            interpretation["decision_mode"] = "COMPARE"
+            interpretation["operation"] = "NEW_TASK"
+
+        # History is now subordinate to semantic task state.
+        if not resolved_targets and _v8_should_recover_compare_targets(
+            message, interpretation
+        ):
+            resolved_targets = _recover_recent_compare_targets(
+                message,
+                conversation_history,
+            )
+
+        if not resolved_targets and _v8_should_recover_shop_target(
+            message, interpretation
+        ):
+            resolved_targets = _recover_recent_recommendation_target(
+                message,
+                conversation_history,
+            )
+
+        # A genuine new task starts from a clean Personal search state.
+        # Only constraints/preferences explicitly supplied in the new turn survive.
+        operation = str(interpretation.get("operation") or "CONTINUE").upper()
+        state_base_filters = {} if operation == "NEW_TASK" else current_filters
+        state_base_preferences = [] if operation == "NEW_TASK" else current_preferences
+
+        next_filters = apply_interpretation_to_filters(
+            state_base_filters,
+            interpretation,
+        )
+        next_preferences = _v8_apply_preference_changes(
+            state_base_preferences,
+            interpretation,
+        )
+
+        # A fresh explicit multi-vehicle comparison is always self-contained.
+        # Per-vehicle year/category is applied target-by-target, never as one
+        # impossible global cross-product.
+        explicit_named_multi_compare = (
+            decision_mode == "COMPARE"
+            and len(explicit_current_message_targets) >= 2
+        )
+        if explicit_named_multi_compare:
+            fresh_filters = sanitize_ai_filters(
+                interpretation.get("filters") or {}
+            )
+            for key in (
+                "brands", "exclude_brands",
+                "models", "exclude_models",
+                "categories", "exclude_categories",
+            ):
+                fresh_filters.pop(key, None)
+            next_filters = fresh_filters
+            next_preferences = _canonicalize_buyer_preferences(
+                interpretation.get("preferences", []) or []
+            )
+
         current_brands = list(current_filters.get("brands") or [])
         current_models = list(current_filters.get("models") or [])
-        refinement_shop_cue = re.search(
-            r"\b(?:only show|show me|private sellers?|private cars?|individual sellers?|"
-            r"galleries?|dealers?|best\s+\d+|best matches?|"
-            r"increase|raise|decrease|lower|change|set|budget|spend|ceiling|"
-            r"older cars?|older vehicles?|older is fine|older are fine|"
-            r"automatic|manual|transmission|"
-            r"or newer|onwards|less than|under|maximum|max(?:imum)? mileage|"
-            r"bireysel|galeri(?:ler)?|sadece|göster|goster|"
-            r"частн(?:ый|ые|ого)|дилер(?:ы|ов)?|покажи)\b",
-            message.casefold(),
-        )
-        # Only inherit SHOP from an implicit refinement when the recent
-        # conversation was actually listing-level. A single recommended model can
-        # also exist during DISCOVER/COMPARE; budget/transmission/year follow-ups
-        # there must not accidentally turn into listing search.
-        recent_shop_context = False
-        for history_item in reversed((conversation_history or [])[-8:]):
-            # Only prior USER intent can establish listing-level context.
-            # Assistant explanations may naturally mention "listings" while
-            # discussing market evidence, which must not silently switch a
-            # DISCOVER/COMPARE journey into SHOP.
-            history_role = str(history_item.get("role") or "").casefold()
-            if history_role != "user":
-                continue
-            history_content = str(
-                history_item.get("text")
-                or history_item.get("content")
-                or ""
-            ).casefold()
-            if re.search(
-                r"\b(?:listings?|actual listings?|"
-                r"ilan(?:lar|ları|lari|ları)?|"
-                r"объявлен(?:ие|ия|ий|иям|иях)?)\b",
-                history_content,
-            ):
-                recent_shop_context = True
-                break
 
-        if (
-            decision_mode == "DISCOVER"
-            and len(current_brands) == 1
-            and len(current_models) == 1
-            and refinement_shop_cue
-            and recent_shop_context
-        ):
-            decision_mode = "SHOP"
-            interpretation["decision_mode"] = "SHOP"
-
-        # Carry the canonical single vehicle forward for listing refinements even
-        # when the follow-up does not repeat its name. This also keeps exact model
-        # matching active, so Honda Fit cannot broaden to Honda Fit Aria.
+        # Carry the canonical single vehicle forward for listing refinements only
+        # when V8 says this is a continuation of the existing SHOP task.
         if (
             decision_mode == "SHOP"
+            and operation != "NEW_TASK"
             and not resolved_targets
             and len(current_brands) == 1
             and len(current_models) == 1
@@ -7956,11 +8245,6 @@ def api_ai_buying_assistant():
                 "stage": "clarification",
                 "resolved_vehicle_targets": [],
             })
-
-        next_filters = apply_interpretation_to_filters(
-            current_filters,
-            interpretation,
-        )
 
         # Deterministic explicit-constraint clearing.
         # Conversational phrases such as "mileage doesn't matter anymore" are
@@ -8024,43 +8308,6 @@ def api_ai_buying_assistant():
 
         if clear_min_year:
             next_filters.pop("min_year", None)
-
-        next_preferences = merge_preferences(
-            current_preferences,
-            interpretation.get("preferences", []),
-        )
-
-        # A newly stated, explicit multi-vehicle comparison is self-contained.
-        #
-        # Example:
-        #   "My budget is £15k" -> "I want an SUV" ->
-        #   "Compare Honda Fit and Toyota Yaris"
-        #
-        # The final request should compare those named vehicles, not silently retain
-        # the old SUV/budget search. Constraints written in the SAME comparison
-        # message (e.g. "under £15k") are preserved through interpretation["filters"].
-        explicit_named_multi_compare = (
-            decision_mode == "COMPARE"
-            and len(explicit_current_message_targets) >= 2
-        )
-        if explicit_named_multi_compare:
-            fresh_filters = sanitize_ai_filters(
-                interpretation.get("filters") or {}
-            )
-
-            # Brand/model/category are applied target-by-target below; leaving them
-            # as global filters would create invalid cross-products.
-            for key in (
-                "brands", "exclude_brands",
-                "models", "exclude_models",
-                "categories", "exclude_categories",
-            ):
-                fresh_filters.pop(key, None)
-
-            next_filters = fresh_filters
-            next_preferences = _canonicalize_buyer_preferences(
-                interpretation.get("preferences", []) or []
-            )
 
         # Deterministic scope-reset guard for explicit physical-class changes.
         # The interpreter remains responsible for soft use-cases, but phrases such
@@ -8159,7 +8406,7 @@ def api_ai_buying_assistant():
 
         # Canonicalize explicitly named single vehicles. This fixes natural compound
         # names such as "Nissan Note e-Power" without hard-coding any vehicle.
-        if len(resolved_targets) == 1 and decision_mode in {"COMPARE", "SHOP"}:
+        if len(resolved_targets) == 1 and decision_mode in {"DISCOVER", "COMPARE", "SHOP"}:
             target = resolved_targets[0]
             next_filters["brands"] = [target["brand"]]
             next_filters["models"] = [target["model"]]
@@ -8189,7 +8436,6 @@ def api_ai_buying_assistant():
         if (
             interpretation.get("needs_clarification")
             and interpretation.get("clarification_question")
-            and (interpretation.get("filters") or interpretation.get("clear_filters"))
         ):
             return jsonify({
                 "success": True,
@@ -8201,6 +8447,10 @@ def api_ai_buying_assistant():
                 "results": [],
                 "interpretation": interpretation,
                 "decision_mode": decision_mode,
+                "stage": "clarification",
+                "orchestration_version": ASSISTANT_ORCHESTRATION_VERSION,
+                "conversation_operation": interpretation.get("operation"),
+                "awaiting": interpretation.get("awaiting"),
             })
 
         # Pull the full filtered result set for candidate selection.
@@ -8316,6 +8566,9 @@ def api_ai_buying_assistant():
                 "interpretation": interpretation,
                 "decision_mode": "DISCOVER",
                 "stage": "narrowing",
+                "orchestration_version": ASSISTANT_ORCHESTRATION_VERSION,
+                "conversation_operation": interpretation.get("operation"),
+                "awaiting": interpretation.get("awaiting"),
             })
 
         answer_started = time.perf_counter()
@@ -8398,6 +8651,9 @@ def api_ai_buying_assistant():
             "actions": response_actions,
             "access_tier": access_tier,
             "business_capabilities": business_capabilities,
+            "orchestration_version": ASSISTANT_ORCHESTRATION_VERSION,
+            "conversation_operation": interpretation.get("operation"),
+            "awaiting": interpretation.get("awaiting"),
         })
 
     except AIUsageLimitExceeded as e:
