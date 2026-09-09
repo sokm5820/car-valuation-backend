@@ -300,9 +300,9 @@ def _valuation_response(language):
         ),
     }
     labels = {
-        "TR": "Aracımın değerini öğren",
-        "EN": "Value my car",
-        "RU": "Узнать стоимость автомобиля",
+        "TR": "Değerleme aracını aç",
+        "EN": "Open valuation tool",
+        "RU": "Открыть инструмент оценки",
     }
 
     return {
@@ -1688,6 +1688,36 @@ def resolve_market_vehicle_mentions(message):
 
     return resolved
 
+def _attach_explicit_years_to_vehicle_targets(message, targets):
+    """Attach a nearby explicit model year to each named comparison target.
+
+    Years belong to the vehicle they are written next to (for example,
+    "2022 Honda Fit and 2021 Toyota Yaris"). They must not become one global
+    min/max-year filter across all comparison targets.
+    """
+    text = str(message or "")
+    enriched = [dict(t) for t in (targets or [])]
+
+    for target in enriched:
+        brand = str(target.get("brand") or "").strip()
+        model = str(target.get("model") or "").strip()
+        if not brand or not model:
+            continue
+
+        vehicle = rf"{re.escape(brand)}\s+{re.escape(model)}"
+        patterns = [
+            rf"\b((?:19|20)\d{{2}})\s+(?:model\s+)?{vehicle}\b",
+            rf"\b{vehicle}\s+(?:model\s+)?((?:19|20)\d{{2}})\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                target["year"] = int(match.group(1))
+                break
+
+    return enriched
+
+
 def _search_market_for_vehicle_targets(base_filters, targets):
     """
     Search each explicit vehicle target independently, then merge the results.
@@ -1714,6 +1744,9 @@ def _search_market_for_vehicle_targets(base_filters, targets):
         target_filters["models"] = [target["model"]]
         if target.get("category"):
             target_filters["categories"] = [target["category"]]
+        if target.get("year") is not None:
+            target_filters["min_year"] = int(target["year"])
+            target_filters["max_year"] = int(target["year"])
 
         result = market_search(
             budget=target_filters.get("budget"),
@@ -3967,10 +4000,13 @@ def _fast_compare_answer(message, language, filters, model_options):
         return None
 
     targets = resolve_market_vehicle_mentions(message)
+    targets = _attach_explicit_years_to_vehicle_targets(message, targets)
     target_labels = {}
     for t in targets:
         key = (str(t.get("brand") or "").casefold(), str(t.get("model") or "").casefold())
         label = f"{t.get('brand','')} {t.get('model','')}".strip()
+        if t.get("year") is not None:
+            label = f"{int(t['year'])} {label}"
         if t.get("category"):
             label += f" {t['category']}"
         target_labels[key] = label
@@ -7435,6 +7471,7 @@ def api_ai_buying_assistant():
 
         resolve_started = time.perf_counter()
         resolved_targets = resolve_market_vehicle_mentions(message)
+        resolved_targets = _attach_explicit_years_to_vehicle_targets(message, resolved_targets)
 
         # Contextual English pronoun "one" must not be mistaken for the real
         # vehicle model MINI One. Preserve genuine explicit MINI One requests,
