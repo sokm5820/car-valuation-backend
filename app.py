@@ -11,6 +11,7 @@ import json
 import math
 import re
 from datetime import datetime, timezone
+from collections import defaultdict, deque
 
 # AI interpreter configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -21,6 +22,342 @@ from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 CORS(app)
+
+# Public API hardening. 128 KB is far above normal assistant requests while
+# preventing oversized request bodies from consuming unnecessary resources.
+app.config["MAX_CONTENT_LENGTH"] = int(
+    os.environ.get("MAX_REQUEST_BYTES", str(128 * 1024))
+)
+
+# =========================================================
+# PUBLIC API SECURITY / COST CONTROLS
+# =========================================================
+
+ASSISTANT_MAX_MESSAGE_CHARS = int(
+    os.environ.get("ASSISTANT_MAX_MESSAGE_CHARS", "1200")
+)
+ASSISTANT_RATE_10MIN = int(
+    os.environ.get("ASSISTANT_RATE_10MIN", "20")
+)
+ASSISTANT_RATE_DAY = int(
+    os.environ.get("ASSISTANT_RATE_DAY", "80")
+)
+SEARCH_RATE_10MIN = int(
+    os.environ.get("SEARCH_RATE_10MIN", "40")
+)
+SEARCH_RATE_DAY = int(
+    os.environ.get("SEARCH_RATE_DAY", "200")
+)
+
+# These caps count OpenAI HTTP calls, not user messages. Some complex Personal
+# requests can make more than one model call, so the caps are intentionally
+# separate from assistant-request limits.
+OPENAI_IP_CALLS_HOUR = int(
+    os.environ.get("OPENAI_IP_CALLS_HOUR", "40")
+)
+OPENAI_GLOBAL_CALLS_HOUR = int(
+    os.environ.get("OPENAI_GLOBAL_CALLS_HOUR", "250")
+)
+OPENAI_GLOBAL_CALLS_DAY = int(
+    os.environ.get("OPENAI_GLOBAL_CALLS_DAY", "1000")
+)
+
+PUBLIC_ASSISTANT_RESULT_CAP = int(
+    os.environ.get("PUBLIC_ASSISTANT_RESULT_CAP", "20")
+)
+PUBLIC_SEARCH_RESULT_CAP = int(
+    os.environ.get("PUBLIC_SEARCH_RESULT_CAP", "20")
+)
+
+_RATE_LOCK = threading.Lock()
+_RATE_BUCKETS = defaultdict(lambda: defaultdict(deque))
+
+
+class AIUsageLimitExceeded(RuntimeError):
+    pass
+
+
+def _client_ip():
+    """
+    Render/proxy deployments normally provide X-Forwarded-For.
+    Use the first address when present and fall back to Flask remote_addr.
+    """
+    forwarded = str(request.headers.get("X-Forwarded-For") or "").strip()
+    if forwarded:
+        candidate = forwarded.split(",")[0].strip()
+        if candidate:
+            return candidate[:128]
+    return str(request.remote_addr or "unknown")[:128]
+
+
+def _consume_rate(bucket, key, window_seconds, max_events):
+    """
+    Thread-safe in-memory limiter. This protects a single app process immediately.
+    A shared Redis-backed limiter can replace it later if the deployment uses
+    multiple independent workers/instances.
+    """
+    now = time.time()
+    cutoff = now - float(window_seconds)
+    key = str(key or "unknown")[:256]
+
+    with _RATE_LOCK:
+        dq = _RATE_BUCKETS[bucket][key]
+        while dq and dq[0] <= cutoff:
+            dq.popleft()
+
+        if len(dq) >= int(max_events):
+            retry_after = max(1, int(dq[0] + window_seconds - now))
+            return False, retry_after
+
+        dq.append(now)
+        return True, 0
+
+
+def _assistant_request_allowed():
+    ip = _client_ip()
+
+    ok, retry = _consume_rate(
+        "assistant_10m", ip, 600, ASSISTANT_RATE_10MIN
+    )
+    if not ok:
+        return False, retry
+
+    ok, retry = _consume_rate(
+        "assistant_day", ip, 86400, ASSISTANT_RATE_DAY
+    )
+    if not ok:
+        return False, retry
+
+    return True, 0
+
+
+def _search_request_allowed():
+    ip = _client_ip()
+
+    ok, retry = _consume_rate(
+        "search_10m", ip, 600, SEARCH_RATE_10MIN
+    )
+    if not ok:
+        return False, retry
+
+    ok, retry = _consume_rate(
+        "search_day", ip, 86400, SEARCH_RATE_DAY
+    )
+    if not ok:
+        return False, retry
+
+    return True, 0
+
+
+def _reserve_openai_call():
+    """
+    Hard server-side call ceilings. Client-supplied account tiers do not bypass
+    these limits, so changing JSON to BUSINESS cannot defeat cost protection.
+    """
+    ip = _client_ip()
+
+    ok, retry = _consume_rate(
+        "openai_ip_hour", ip, 3600, OPENAI_IP_CALLS_HOUR
+    )
+    if not ok:
+        raise AIUsageLimitExceeded(
+            f"OPENAI_IP_RATE_LIMIT:{retry}"
+        )
+
+    ok, retry = _consume_rate(
+        "openai_global_hour", "GLOBAL", 3600, OPENAI_GLOBAL_CALLS_HOUR
+    )
+    if not ok:
+        raise AIUsageLimitExceeded(
+            f"OPENAI_GLOBAL_HOURLY_LIMIT:{retry}"
+        )
+
+    ok, retry = _consume_rate(
+        "openai_global_day", "GLOBAL", 86400, OPENAI_GLOBAL_CALLS_DAY
+    )
+    if not ok:
+        raise AIUsageLimitExceeded(
+            f"OPENAI_GLOBAL_DAILY_LIMIT:{retry}"
+        )
+
+
+def _openai_post(payload, timeout):
+    """
+    Single guarded path for every OpenAI Responses API call in this app.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY_NOT_CONFIGURED")
+
+    _reserve_openai_call()
+
+    return requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=timeout,
+    )
+
+
+def _looks_like_dataset_extraction_request(message):
+    """
+    Block clear bulk/export/reconstruction attempts before market search or
+    OpenAI is called. Normal questions such as "show me more cars" are allowed.
+    """
+    low = str(message or "").strip().casefold()
+    if not low:
+        return False
+
+    bulk_terms = re.search(
+        r"\b(?:dump|export|download|extract|scrape|harvest|recreate|reconstruct|"
+        r"entire|complete|full|raw|all rows?|every row|every listing|all listings|"
+        r"database|dataset|data set|csv|json|sql|spreadsheet|table)\b",
+        low,
+        flags=re.IGNORECASE,
+    )
+    extraction_terms = re.search(
+        r"\b(?:give|show|send|return|list|provide|output|print|enumerate|iterate|"
+        r"copy|reveal|expose|recover|build|replicate|download|export)\b",
+        low,
+        flags=re.IGNORECASE,
+    )
+    systematic_terms = re.search(
+        r"\b(?:every brand|every model|every year|all brands|all models|"
+        r"all years|brand by brand|model by model|year by year|pagination|"
+        r"next 100|next 1000|thousands of)\b",
+        low,
+        flags=re.IGNORECASE,
+    )
+
+    return bool(
+        (bulk_terms and extraction_terms)
+        or systematic_terms
+    )
+
+
+def _data_protection_answer(language):
+    answers = {
+        "TR": (
+            "Toplu veri dışa aktarma veya veri tabanını yeniden oluşturabilecek "
+            "istekleri desteklemiyorum. Belirli bir araç, bütçe, model, karşılaştırma "
+            "veya piyasa kararı sorarsanız mevcut veriyi kullanarak yardımcı olabilirim."
+        ),
+        "EN": (
+            "I can't provide bulk exports or information that could reconstruct the "
+            "underlying dataset. Ask about a specific vehicle, budget, model, comparison "
+            "or market decision and I can use the data to help with that."
+        ),
+        "RU": (
+            "Я не предоставляю массовые выгрузки или данные, позволяющие восстановить "
+            "исходную базу. Спросите о конкретном автомобиле, бюджете, модели, сравнении "
+            "или рыночном решении — и я помогу на основе доступных данных."
+        ),
+    }
+    return answers.get(language, answers["TR"])
+
+
+def _valuation_intent(message):
+    """
+    Route genuine own-car valuation questions to OtoDeğer's valuation flow.
+    Do not intercept buyer questions such as "is this good value?".
+    """
+    low = str(message or "").strip().casefold()
+    if not low:
+        return False
+
+    patterns = [
+        r"\b(?:aracım|arabam|aracim|arabamın|arabamin)\b.{0,35}\b(?:değer|deger|eder|kaç para|kac para|fiyat)\b",
+        r"\b(?:aracımın|aracimin|arabamın|arabamin)\s+(?:değeri|degeri)\b",
+        r"\b(?:araç|arac|araba)\s+değerleme\b",
+        r"\b(?:how much is|what is)\s+my\s+(?:car|vehicle)\s+worth\b",
+        r"\bvalue\s+my\s+(?:car|vehicle)\b",
+        r"\bcar\s+valuation\b",
+        r"\bvehicle\s+valuation\b",
+        r"\bсколько\s+стоит\s+моя\s+машина\b",
+        r"\bоцен(?:ить|ка)\s+(?:мою\s+)?машин",
+    ]
+    return any(re.search(p, low, flags=re.IGNORECASE) for p in patterns)
+
+
+def _valuation_response(language):
+    content = {
+        "TR": (
+            "Aracınızın güncel değerini bunun için özel olarak geliştirdiğimiz "
+            "OtoDeğer değerleme aracıyla hesaplamak daha doğru olur. Yıl, marka, "
+            "model ve versiyonu seçerek birkaç saniyede gerçek piyasa verilerine "
+            "dayalı değer aralığını görebilirsiniz."
+        ),
+        "EN": (
+            "For your car's current value, the best route is our dedicated OtoDeğer "
+            "valuation tool. Select the year, make, model and version and it will show "
+            "a market-data-based value range in a few seconds."
+        ),
+        "RU": (
+            "Для оценки текущей стоимости автомобиля лучше использовать специальный "
+            "инструмент OtoDeğer. Выберите год, марку, модель и версию — и получите "
+            "диапазон стоимости на основе рыночных данных за несколько секунд."
+        ),
+    }
+    labels = {
+        "TR": "Aracımın değerini öğren",
+        "EN": "Value my car",
+        "RU": "Узнать стоимость автомобиля",
+    }
+
+    return {
+        "answer": content.get(language, content["TR"]),
+        "actions": [{
+            "type": "VALUATION",
+            "label": labels.get(language, labels["TR"]),
+            "url": "https://otodeger.online",
+        }],
+    }
+
+
+def _fallback_support_payload(language):
+    suggestions = {
+        "TR": [
+            "Bütçeme göre hangi araçları önerirsin?",
+            "İki modeli karşılaştırabilir misin?",
+            "Aracımın değerini öğrenmek istiyorum",
+        ],
+        "EN": [
+            "What cars fit my budget?",
+            "Can you compare two models?",
+            "I want to value my car",
+        ],
+        "RU": [
+            "Какие автомобили подходят моему бюджету?",
+            "Сравни две модели",
+            "Хочу узнать стоимость моей машины",
+        ],
+    }
+    instagram_labels = {
+        "TR": "Aradığınız özellik yok mu? Instagram'dan bize yazın",
+        "EN": "Can't find what you need? Message us on Instagram",
+        "RU": "Не нашли нужную функцию? Напишите нам в Instagram",
+    }
+    return {
+        "suggestions": suggestions.get(language, suggestions["TR"]),
+        "actions": [{
+            "type": "INSTAGRAM",
+            "label": instagram_labels.get(language, instagram_labels["TR"]),
+            # Frontend can replace this with the exact profile URL if desired.
+            "url": "https://www.instagram.com/analist.kibris/",
+        }],
+    }
+
+
+@app.after_request
+def _security_response_headers(response):
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
 
 # -----------------------
 # GOOGLE SHEETS CONNECTION
@@ -136,6 +473,31 @@ MODEL_PROFILE_LOOKUP = {}
 ASSISTANT_PROFILE_VERSION = "1.0"
 
 
+# =========================================================
+# AI ASSISTANT - BUSINESS INTELLIGENCE v1.5
+# =========================================================
+# These files are generated offline by build_business_intelligence_v1.py
+# and committed beside the other production intelligence CSVs.
+BUSINESS_STOCK_CSV_URL = (
+    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
+    "business_stock_intelligence.csv"
+)
+BUSINESS_COMPANY_CSV_URL = (
+    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
+    "business_company_intelligence.csv"
+)
+BUSINESS_MARKET_CSV_URL = (
+    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
+    "business_market_intelligence.csv"
+)
+
+business_stock_df = pd.DataFrame()
+business_company_df = pd.DataFrame()
+business_market_df = pd.DataFrame()
+BUSINESS_INTELLIGENCE_READY = False
+BUSINESS_INTELLIGENCE_VERSION = "1.5"
+
+
 def _prepare_buyer_intelligence_frame(frame):
     frame = frame.copy()
 
@@ -239,6 +601,157 @@ def load_buyer_intelligence():
             buyer_model_df = pd.DataFrame()
             buyer_category_df = pd.DataFrame()
             BUYER_INTELLIGENCE_READY = False
+
+
+
+def _prepare_business_frame(frame):
+    frame = frame.copy()
+
+    text_cols = [
+        "Link", "Company", "VehicleType", "Brand", "Model", "CategoryDetail",
+        "Location", "Transmission", "Color", "Image",
+        "PublicListingAgeDefinition", "BenchmarkSource",
+        "ComparableEvidenceConfidence", "PricePositionBand",
+        "StockAgeBand", "AttentionLevel", "AttentionReasons",
+        "BusinessGranularity",
+        "HistoricalBenchmarkSourceLiquidity",
+        "HistoricalBenchmarkSourcePricePressure",
+        "LiquidityEvidenceConfidence",
+        "PricePressureEvidenceConfidence",
+        "EvidenceQuality",
+        "TurnoverSignal", "CurrentSupplySignal", "PricePressureSignal",
+        "AcquisitionSignal", "AcquisitionReasons",
+        "ObservedExitDefinition",
+    ]
+    for col in text_cols:
+        if col in frame.columns:
+            frame[col] = frame[col].fillna("").astype(str).str.strip()
+
+    numeric_cols = [
+        "Year", "KM", "CurrentAskingPrice", "StockAgeDays",
+        "FirstObservedPrice", "HistoricalLatestObservedPrice",
+        "PriceChangeAmount", "PriceChangePct",
+        "HistoricalMedianObservedDaysToExit",
+        "HistoricalP25ObservedDaysToExit",
+        "HistoricalP75ObservedDaysToExit",
+        "ObservedExit30Rate", "ObservedExit60Rate", "ObservedExit90Rate",
+        "HistoricalPriceReductionRate",
+        "HistoricalMedianReductionPctAmongReduced",
+        "ComparableListings", "ComparableMedianPrice",
+        "ComparableP25Price", "ComparableP75Price",
+        "ComparableMinPrice", "ComparableMaxPrice",
+        "ComparableMedianKM", "KMVsComparableMedian",
+        "PriceVsMedianPct", "PricePercentile",
+        "AgeVsMarketMedianDays", "AgeVsMarketMedianPct",
+        "CurrentStockCount", "CurrentStockAskingValue",
+        "MedianCurrentAskingPrice", "MedianPublicListingAgeDays",
+        "P75PublicListingAgeDays",
+        "FreshStockCount", "NormalStockCount", "AboveTypicalAgeCount",
+        "AgedStockCount", "VeryAgedStockCount",
+        "LowPricePositionCount", "MidMarketPriceCount",
+        "HighPricePositionCount", "InsufficientPriceComparisonCount",
+        "WatchStockCount", "AttentionStockCount", "HighAttentionStockCount",
+        "DistinctBrands", "DistinctModels", "HistoricalDistinctListings",
+        "HistoricalObservedMarketExits", "HistoricalPriceReductionEligibleListings",
+        "HistoricalPriceReductionListings",
+        "CurrentListings", "CurrentStartingPrice", "CurrentMedianPrice",
+        "CurrentHighestPrice", "GalleryListings", "PrivateListings",
+        "DistinctCompanies", "LiquidityHistoricalDistinctListings",
+        "PricePressureHistoricalDistinctListings", "Exit60EligibleListings",
+        "PricePressureEligibleListings", "MedianObservedDaysToExit",
+        "ObservedExitWithin60DaysRate", "PriceReductionRate",
+        "TurnoverPercentile", "RawSupplyScarcityPercentile",
+        "CurrentMarketOpportunityPercentile",
+        "PricePressureAttractivenessPercentile",
+        "EvidencePriorityModifier", "OpportunityIndexInternal",
+        "ConfidenceAdjustedOpportunityIndex", "OpportunityPercentile",
+    ]
+    for col in numeric_cols:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+    if "PublicListingAgeIsLowerBound" in frame.columns:
+        frame["PublicListingAgeIsLowerBound"] = (
+            frame["PublicListingAgeIsLowerBound"]
+            .astype(str)
+            .str.strip()
+            .str.casefold()
+            .isin({"true", "1", "yes"})
+        )
+
+    return frame
+
+
+def load_business_intelligence():
+    global business_stock_df, business_company_df, business_market_df
+    global BUSINESS_INTELLIGENCE_READY
+
+    try:
+        stock_r = requests.get(BUSINESS_STOCK_CSV_URL, timeout=25)
+        stock_r.raise_for_status()
+        company_r = requests.get(BUSINESS_COMPANY_CSV_URL, timeout=25)
+        company_r.raise_for_status()
+        market_r = requests.get(BUSINESS_MARKET_CSV_URL, timeout=25)
+        market_r.raise_for_status()
+
+        new_stock = pd.read_csv(io.StringIO(stock_r.text), low_memory=False)
+        new_company = pd.read_csv(io.StringIO(company_r.text), low_memory=False)
+        new_market = pd.read_csv(io.StringIO(market_r.text), low_memory=False)
+
+        required_stock = {
+            "Link", "Company", "Brand", "Model", "Year",
+            "CurrentAskingPrice", "StockAgeDays",
+            "PricePositionBand", "AttentionLevel",
+        }
+        required_company = {
+            "Company", "CurrentStockCount", "HighAttentionStockCount",
+            "VeryAgedStockCount", "HighPricePositionCount",
+        }
+        required_market = {
+            "BusinessGranularity", "VehicleType", "Brand", "Model", "Year",
+            "CurrentListings", "CurrentStartingPrice", "CurrentMedianPrice",
+            "ObservedExitWithin60DaysRate", "PriceReductionRate",
+            "EvidenceQuality", "OpportunityPercentile",
+            "AcquisitionSignal", "AcquisitionReasons",
+        }
+
+        missing_stock = required_stock - set(new_stock.columns)
+        missing_company = required_company - set(new_company.columns)
+        missing_market = required_market - set(new_market.columns)
+
+        if missing_stock or missing_company or missing_market:
+            raise ValueError(
+                "Business Intelligence schema mismatch. "
+                f"stock missing={sorted(missing_stock)}, "
+                f"company missing={sorted(missing_company)}, "
+                f"market missing={sorted(missing_market)}"
+            )
+
+        business_stock_df = _prepare_business_frame(new_stock)
+        business_company_df = _prepare_business_frame(new_company)
+        business_market_df = _prepare_business_frame(new_market)
+        BUSINESS_INTELLIGENCE_READY = True
+
+        print(
+            "Business Intelligence loaded successfully: "
+            f"{len(business_stock_df)} stock rows, "
+            f"{len(business_company_df)} companies, "
+            f"{len(business_market_df)} market rows"
+        )
+
+    except Exception as e:
+        print("BUSINESS INTELLIGENCE LOAD FAILED:", e)
+
+        # Preserve the last successful snapshot if there is one.
+        if (
+            business_stock_df is None or business_stock_df.empty
+            or business_company_df is None or business_company_df.empty
+            or business_market_df is None or business_market_df.empty
+        ):
+            business_stock_df = pd.DataFrame()
+            business_company_df = pd.DataFrame()
+            business_market_df = pd.DataFrame()
+            BUSINESS_INTELLIGENCE_READY = False
 
 
 def load_model_profiles():
@@ -596,6 +1109,7 @@ def load_market_data():
 load_market_data()
 load_buyer_intelligence()
 load_model_profiles()
+load_business_intelligence()
 
 
 # =========================================================
@@ -613,6 +1127,8 @@ def refresh_market_data_loop():
         load_buyer_intelligence()
         print("Refreshing Model Buyer Profiles from GitHub...")
         load_model_profiles()
+        print("Refreshing Business Intelligence from GitHub...")
+        load_business_intelligence()
 
 
 threading.Thread(
@@ -1796,13 +2312,8 @@ Important rules:
         "additionalProperties": False,
     }
 
-    response = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
+    response = _openai_post(
+        payload={
             "model": OPENAI_MODEL,
             "reasoning": {"effort": "none"},
             "max_output_tokens": 700,
@@ -2704,10 +3215,8 @@ Never infer listing condition, reliability or value retention. Select up to 20.
         "model_candidates": [{"brand": m["brand"], "model": m["model"]} for m in qualification_market],
     }
     try:
-        response = requests.post(
-            "https://api.openai.com/v1/responses",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={
+        response = _openai_post(
+            payload={
                 "model": OPENAI_MODEL, "reasoning": {"effort": "none"},
                 "max_output_tokens": 450, "instructions": instructions,
                 "input": json.dumps(payload, ensure_ascii=False),
@@ -4119,13 +4628,8 @@ FORMAT — IMPORTANT:
         ),
     }
 
-    response = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
+    response = _openai_post(
+        payload={
             "model": OPENAI_MODEL,
             "reasoning": {"effort": "none"},
             "max_output_tokens": 900,
@@ -4375,6 +4879,2190 @@ def _looks_like_unknown_explicit_vehicle_shop_request(message, resolved_targets,
     return (titleish >= 2 and len(alpha_words) >= 2) or (titleish >= 1 and has_number)
 
 
+
+# =========================================================
+# BUSINESS ASSISTANT v6 - UNIFIED ACCOUNT / COMPANY CONTEXT
+# =========================================================
+
+def _normalize_access_tier(value):
+    """
+    Normalise future account entitlement without enforcing a paywall yet.
+
+    Current behaviour remains backward-compatible:
+    - missing tier -> PERSONAL
+    - BUSINESS enables Business entitlement metadata
+    - FREE/PERSONAL remain available for the existing buyer assistant
+
+    Enforcement will be added only after the account/payment layer exists.
+    """
+    value = str(value or "").strip().upper()
+    aliases = {
+        "FREE": "FREE",
+        "PERSONAL": "PERSONAL",
+        "BUYER": "PERSONAL",
+        "BUSINESS": "BUSINESS",
+        "DEALER": "BUSINESS",
+        "GALLERY": "BUSINESS",
+    }
+    return aliases.get(value, "PERSONAL")
+
+
+def _conversation_text(conversation_history, max_messages=8):
+    """
+    Safely flatten recent conversation history for lightweight context recovery.
+    """
+    if not isinstance(conversation_history, list):
+        return ""
+
+    parts = []
+    for item in conversation_history[-max_messages:]:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if content is None:
+            content = item.get("message")
+        if content is None:
+            content = item.get("text")
+        if content:
+            parts.append(str(content))
+
+    return "\n".join(parts)
+
+
+def _resolve_business_company_context(
+    message,
+    conversation_history=None,
+    requested_company=None,
+):
+    """
+    Resolve dealership/company context in the following order:
+
+    1. exact account-linked `business_company`
+    2. explicit company mention in the current message
+    3. explicit company mention in recent conversation history
+
+    This lets a dealer say:
+        "Asal Oto Galeri stokları nasıl?"
+        "Hangilerinin fiyatı yüksek?"
+    without repeating the company name on every turn.
+
+    The resolution remains exact against Business Company values; fuzzy account
+    identity is deliberately avoided.
+    """
+    if requested_company:
+        resolved = _resolve_business_company(
+            message="",
+            requested_company=requested_company,
+        )
+        if resolved:
+            return resolved
+
+    resolved = _resolve_business_company(message)
+    if resolved:
+        return resolved
+
+    history_text = _conversation_text(conversation_history)
+    if history_text:
+        resolved = _resolve_business_company(history_text)
+        if resolved:
+            return resolved
+
+    return None
+
+
+def _business_capabilities_payload(access_tier, company):
+    """
+    Small machine-readable capability block for the frontend/account layer.
+    No access is blocked yet; this is integration metadata only.
+    """
+    return {
+        "access_tier": access_tier,
+        "business_entitled": access_tier == "BUSINESS",
+        "business_company": company,
+        "business_company_linked": bool(company),
+        "business_intelligence_version": BUSINESS_INTELLIGENCE_VERSION,
+        "business_modes": [
+            "BUSINESS_ACQUIRE",
+            "BUSINESS_STOCK",
+            "BUSINESS_PRICE",
+            "BUSINESS_MANAGE",
+            "BUSINESS_MARKET",
+        ],
+    }
+
+
+# =========================================================
+# BUSINESS ASSISTANT v5 - MARKET UNDERSTANDING
+# =========================================================
+
+def _business_market_intent(message):
+    """
+    Detect explicit commercial-market questions without intercepting ordinary
+    Personal vehicle-shopping questions.
+    """
+    raw = str(message or "").strip()
+    if not raw:
+        return False
+
+    low = raw.casefold()
+
+    commercial_cues = [
+        r"\bgaleri\b", r"\bgalerici\b", r"\bstok\b", r"\benvanter\b",
+        r"\bdealer(?:ship)?\b", r"\binventory\b", r"\bmarket\s+for\s+dealers\b",
+        r"\bmy\s+dealership\b", r"\bour\s+dealership\b",
+        r"\bавтосалон\b", r"\bдилер\b", r"\bсклад\b",
+    ]
+
+    market_cues = [
+        r"\bpiyasa\b", r"\bmarket\b", r"\bsegment\b", r"\bkategori\b",
+        r"\byavaş\b", r"\byavas\b", r"\bhızlı\b", r"\bhizli\b",
+        r"\bhareket\b", r"\bdaral\b", r"\bgeniş\b", r"\bgenis\b",
+        r"\bfiyat\s+indir\b", r"\bfiyat\s+düş\b", r"\bfiyat\s+dus\b",
+        r"\bprice\s+cut\b", r"\bprice\s+reduction\b",
+        r"\bturnover\b", r"\bliquidity\b", r"\bsupply\b",
+        r"\bwhat(?:'s|\s+is)\s+happening\b",
+        r"\bwhat\s+is\s+moving\b", r"\bwhat\s+is\s+slow\b",
+        r"\bрынок\b", r"\bсегмент\b", r"\bликвид\b",
+        r"\bснижени.*цен\b", r"\bчто\s+происходит\b",
+    ]
+
+    has_commercial = any(re.search(p, low, flags=re.IGNORECASE) for p in commercial_cues)
+    has_market = any(re.search(p, low, flags=re.IGNORECASE) for p in market_cues)
+
+    # Also allow clearly dealer-oriented broad market questions even if "dealer"
+    # is implied via wording such as "what should galleries watch?"
+    dealer_market_phrase = bool(re.search(
+        r"\b(?:galeriler|dealers?)\b.{0,40}\b(?:piyasa|market|segment|kategori|stok|supply|turnover)",
+        low,
+        flags=re.IGNORECASE,
+    ))
+
+    return bool((has_commercial and has_market) or dealer_market_phrase)
+
+
+def _business_market_target_mask(message, frame):
+    """
+    Narrow Business market analysis to explicit Brand/Model/Category/Year mentions
+    where possible. Uses broad textual matching so the function remains robust to
+    category wording differences.
+    """
+    work = frame.copy()
+    low = str(message or "").casefold()
+
+    # Year
+    years = [int(x) for x in re.findall(r"\b((?:19|20)\d{2})\b", str(message or ""))]
+    if years and "Year" in work.columns:
+        numeric_year = pd.to_numeric(work["Year"], errors="coerce")
+        mask = numeric_year.isin(years)
+        if mask.any():
+            work = work[mask].copy()
+
+    # Vehicle mention resolver for brand/model/category.
+    targets = resolve_market_vehicle_mentions(message)
+    if targets:
+        mask = pd.Series(False, index=work.index)
+        for target in targets:
+            this = pd.Series(True, index=work.index)
+            if target.get("brand"):
+                this &= (
+                    work["Brand"].fillna("").astype(str).str.casefold()
+                    == str(target.get("brand") or "").casefold()
+                )
+            if target.get("model"):
+                this &= (
+                    work["Model"].fillna("").astype(str).str.casefold()
+                    == str(target.get("model") or "").casefold()
+                )
+            if target.get("category") and "CategoryDetail" in work.columns:
+                this &= (
+                    work["CategoryDetail"].fillna("").astype(str).str.casefold()
+                    == str(target.get("category") or "").casefold()
+                )
+            mask |= this
+        if mask.any():
+            work = work[mask].copy()
+
+    # Common broad category words that may not resolve through model mentions.
+    category_terms = {
+        "suv": ["suv", "arazi/suv/pick-up", "arazi"],
+        "pickup": ["pick-up", "pickup"],
+        "pick-up": ["pick-up", "pickup"],
+        "otomobil": ["otomobil"],
+        "car": ["otomobil"],
+        "cars": ["otomobil"],
+    }
+
+    for term, values in category_terms.items():
+        if re.search(rf"\b{re.escape(term)}\b", low, flags=re.IGNORECASE):
+            if "VehicleType" in work.columns:
+                m = work["VehicleType"].fillna("").astype(str).str.casefold().apply(
+                    lambda x: any(v.casefold() in x for v in values)
+                )
+                if m.any():
+                    work = work[m].copy()
+            break
+
+    return work
+
+
+def _business_market_rank_rows(frame, mode="balanced", limit=8):
+    if frame is None or frame.empty:
+        return frame
+
+    work = frame.copy()
+
+    for col in [
+        "CurrentListings",
+        "ObservedExitWithin60DaysRate",
+        "PriceReductionRate",
+        "OpportunityPercentile",
+        "TurnoverPercentile",
+        "CurrentMarketOpportunityPercentile",
+        "PricePressureAttractivenessPercentile",
+        "CurrentMedianPrice",
+        "HistoricalDistinctListings",
+    ]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    evidence_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INSUFFICIENT": 9}
+    signal_rank = {
+        "VERY_STRONG": 0,
+        "STRONG": 1,
+        "MODERATE": 2,
+        "WEAK": 3,
+        "CAUTION": 4,
+        "INSUFFICIENT_EVIDENCE": 9,
+    }
+
+    work["_evidence_rank"] = work["EvidenceQuality"].map(evidence_rank).fillna(9)
+    work["_signal_rank"] = work["AcquisitionSignal"].map(signal_rank).fillna(9)
+
+    if mode == "slow":
+        work = work.sort_values(
+            ["ObservedExitWithin60DaysRate", "PriceReductionRate", "_evidence_rank", "CurrentListings"],
+            ascending=[True, False, True, False],
+            na_position="last",
+        )
+    elif mode == "price_pressure":
+        work = work.sort_values(
+            ["PriceReductionRate", "_evidence_rank", "CurrentListings"],
+            ascending=[False, True, False],
+            na_position="last",
+        )
+    elif mode == "supply":
+        work = work.sort_values(
+            ["CurrentListings", "_evidence_rank", "ObservedExitWithin60DaysRate"],
+            ascending=[False, True, False],
+            na_position="last",
+        )
+    else:
+        work = work.sort_values(
+            ["_signal_rank", "_evidence_rank", "OpportunityPercentile", "CurrentListings"],
+            ascending=[True, True, False, False],
+            na_position="last",
+        )
+
+    # Avoid returning many variants from the same family.
+    seen = set()
+    selected = []
+    for row in work.to_dict("records"):
+        key = (
+            str(row.get("Brand") or "").casefold(),
+            str(row.get("Model") or "").casefold(),
+        )
+        if key in seen and key != ("", ""):
+            continue
+        seen.add(key)
+        selected.append(row)
+        if len(selected) >= limit:
+            break
+
+    return pd.DataFrame(selected)
+
+
+def _business_market_public(row):
+    return {
+        "granularity": str(row.get("BusinessGranularity") or "").strip(),
+        "vehicle_type": str(row.get("VehicleType") or "").strip(),
+        "brand": str(row.get("Brand") or "").strip(),
+        "model": str(row.get("Model") or "").strip(),
+        "category": str(row.get("CategoryDetail") or "").strip(),
+        "year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
+        "current_listings": int(row["CurrentListings"]) if pd.notna(row.get("CurrentListings")) else None,
+        "current_starting_price": float(row["CurrentStartingPrice"]) if pd.notna(row.get("CurrentStartingPrice")) else None,
+        "current_median_price": float(row["CurrentMedianPrice"]) if pd.notna(row.get("CurrentMedianPrice")) else None,
+        "current_highest_price": float(row["CurrentHighestPrice"]) if pd.notna(row.get("CurrentHighestPrice")) else None,
+        "gallery_listings": int(row["GalleryListings"]) if pd.notna(row.get("GalleryListings")) else None,
+        "private_listings": int(row["PrivateListings"]) if pd.notna(row.get("PrivateListings")) else None,
+        "distinct_companies": int(row["DistinctCompanies"]) if pd.notna(row.get("DistinctCompanies")) else None,
+        "historical_distinct_listings": int(row["HistoricalDistinctListings"]) if pd.notna(row.get("HistoricalDistinctListings")) else None,
+        "median_observed_days_to_exit": float(row["MedianObservedDaysToExit"]) if pd.notna(row.get("MedianObservedDaysToExit")) else None,
+        "observed_exit60_rate": float(row["ObservedExitWithin60DaysRate"]) if pd.notna(row.get("ObservedExitWithin60DaysRate")) else None,
+        "price_reduction_rate": float(row["PriceReductionRate"]) if pd.notna(row.get("PriceReductionRate")) else None,
+        "evidence_quality": str(row.get("EvidenceQuality") or "").strip(),
+        "acquisition_signal": str(row.get("AcquisitionSignal") or "").strip(),
+        "opportunity_percentile": float(row["OpportunityPercentile"]) if pd.notna(row.get("OpportunityPercentile")) else None,
+        "acquisition_reasons": str(row.get("AcquisitionReasons") or "").strip(),
+    }
+
+
+def _business_market_answer(message, language):
+    if not BUSINESS_INTELLIGENCE_READY or business_market_df is None or business_market_df.empty:
+        text = {
+            "TR": "Business piyasa verisi şu anda hazır değil. Lütfen biraz sonra tekrar deneyin.",
+            "EN": "The Business market data is not ready right now. Please try again shortly.",
+            "RU": "Business-данные по рынку сейчас недоступны. Попробуйте чуть позже.",
+        }
+        return text.get(language, text["TR"]), {
+            "success": False,
+            "error": "BUSINESS_INTELLIGENCE_NOT_READY",
+            "rows": [],
+        }
+
+    work = _business_market_target_mask(message, business_market_df)
+
+    # Default dealer-market universe: normal dealership vehicles only.
+    if "VehicleType" in work.columns:
+        normal_mask = work["VehicleType"].fillna("").astype(str).str.casefold().apply(
+            lambda x: any(k in x for k in ["otomobil", "suv", "pick-up", "pickup", "arazi"])
+        )
+        if normal_mask.any():
+            work = work[normal_mask].copy()
+
+    low = str(message or "").casefold()
+    if re.search(r"\b(yavaş|yavas|slow|slowest|zayıf|zayif|weak|stagn|долго|медлен)\b", low):
+        mode = "slow"
+    elif re.search(r"\b(price\s+cut|price\s+reduction|fiyat\s+indir|fiyat\s+düş|fiyat\s+dus|снижени.*цен)\b", low):
+        mode = "price_pressure"
+    elif re.search(r"\b(supply|arz|stok\s+çok|stok\s+cok|çok\s+ilan|cok\s+ilan|предложени)\b", low):
+        mode = "supply"
+    else:
+        mode = "balanced"
+
+    ranked = _business_market_rank_rows(work, mode=mode, limit=8)
+
+    if ranked is None or ranked.empty:
+        text = {
+            "TR": "Bu piyasa sorusu için yeterli Business verisi bulamadım.",
+            "EN": "I couldn't find enough Business-market data for that question.",
+            "RU": "Для этого рыночного вопроса недостаточно Business-данных.",
+        }
+        return text.get(language, text["TR"]), {
+            "success": True,
+            "rows": [],
+            "mode": mode,
+        }
+
+    rows = [_business_market_public(r) for r in ranked.to_dict("records")]
+
+    lines = []
+    for idx, r in enumerate(rows, 1):
+        name = " ".join(
+            x for x in [
+                str(r.get("year") or "").strip(),
+                r.get("brand") or "",
+                r.get("model") or "",
+                r.get("category") or "",
+            ] if x
+        ).strip() or r.get("vehicle_type") or "Market segment"
+
+        listings = r.get("current_listings")
+        exit60 = r.get("observed_exit60_rate")
+        cuts = r.get("price_reduction_rate")
+        med_days = r.get("median_observed_days_to_exit")
+        median_price = _business_money(r.get("current_median_price"))
+        evidence = r.get("evidence_quality") or "—"
+        signal = r.get("acquisition_signal") or "—"
+
+        exit_text = f"{exit60*100:.0f}%" if exit60 is not None else "—"
+        cuts_text = f"{cuts*100:.0f}%" if cuts is not None else "—"
+
+        if language == "EN":
+            parts = [
+                f"{listings} current listings" if listings is not None else None,
+                f"median ask {median_price}" if median_price else None,
+                f"{exit_text} observed 60-day exit",
+                f"{cuts_text} historical price-reduction rate",
+                f"median observed exit {med_days:.0f}d" if med_days is not None else None,
+                f"{evidence.lower()} evidence",
+                f"signal {signal.replace('_', ' ').lower()}",
+            ]
+        elif language == "RU":
+            parts = [
+                f"{listings} текущих объявлений" if listings is not None else None,
+                f"медианная цена {median_price}" if median_price else None,
+                f"{exit_text} наблюдаемый выход за 60 дней",
+                f"{cuts_text} историческая доля снижения цены",
+                f"медианный выход {med_days:.0f} дн." if med_days is not None else None,
+                f"достоверность {evidence}",
+                f"сигнал {signal}",
+            ]
+        else:
+            parts = [
+                f"{listings} güncel ilan" if listings is not None else None,
+                f"medyan ilan {median_price}" if median_price else None,
+                f"%{exit60*100:.0f} gözlenen 60 günlük çıkış" if exit60 is not None else None,
+                f"%{cuts*100:.0f} tarihsel fiyat indirimi" if cuts is not None else None,
+                f"medyan gözlenen çıkış {med_days:.0f} gün" if med_days is not None else None,
+                f"{evidence.lower()} kanıt",
+                f"sinyal {signal.replace('_', ' ').lower()}",
+            ]
+
+        lines.append(f"{idx}. {name}\n   " + " · ".join(x for x in parts if x))
+
+    if language == "EN":
+        if mode == "slow":
+            intro = "These are the weaker/slower-moving areas in the current dealer-market evidence:"
+        elif mode == "price_pressure":
+            intro = "These areas show the strongest historical asking-price reduction pressure:"
+        elif mode == "supply":
+            intro = "These areas currently have the heaviest advertised supply:"
+        else:
+            intro = "These are the strongest current dealer-market opportunities in the available evidence:"
+        note = (
+            "This is a cross-sectional market snapshot combined with historical listing behaviour. "
+            "It does not prove that the overall market is accelerating or slowing over time unless a time-series trend is explicitly available. "
+            "Observed market exit means a listing disappeared from observation, not a confirmed sale."
+        )
+    elif language == "RU":
+        if mode == "slow":
+            intro = "По текущим данным это более слабые/медленные зоны дилерского рынка:"
+        elif mode == "price_pressure":
+            intro = "Здесь исторически наблюдается самое сильное давление снижения цен объявлений:"
+        elif mode == "supply":
+            intro = "Здесь сейчас самая высокая видимая плотность предложений:"
+        else:
+            intro = "По доступным данным это самые сильные текущие рыночные возможности для дилера:"
+        note = (
+            "Это текущий срез рынка, объединённый с историческим поведением объявлений. "
+            "Он сам по себе не доказывает, что весь рынок ускоряется или замедляется во времени, если нет отдельного временного ряда. "
+            "Наблюдаемый выход с рынка означает исчезновение объявления из наблюдения, а не подтверждённую продажу."
+        )
+    else:
+        if mode == "slow":
+            intro = "Mevcut dealer piyasa verisinde daha zayıf/yavaş görünen alanlar şunlar:"
+        elif mode == "price_pressure":
+            intro = "Tarihsel ilan fiyatı indirimi baskısının en yüksek olduğu alanlar şunlar:"
+        elif mode == "supply":
+            intro = "Şu anda ilan arzının en yoğun olduğu alanlar şunlar:"
+        else:
+            intro = "Mevcut veriye göre dealer açısından en güçlü piyasa fırsatları şunlar:"
+        note = (
+            "Bu analiz güncel piyasa kesitini tarihsel ilan davranışıyla birleştirir. "
+            "Ayrı bir zaman serisi olmadan piyasanın genel olarak hızlandığını veya yavaşladığını kesin biçimde göstermez. "
+            "Gözlenen piyasa çıkışı da doğrulanmış satış anlamına gelmez."
+        )
+
+    return intro + "\n\n" + "\n\n".join(lines) + "\n\n" + note, {
+        "success": True,
+        "rows": rows,
+        "mode": mode,
+    }
+
+
+# =========================================================
+# BUSINESS ASSISTANT v4 - AGING STOCK / INVENTORY ACTIONS
+# =========================================================
+
+def _business_manage_intent(message):
+    """
+    Detect dealer questions about aging stock and what action to take.
+    Kept conservative so ordinary Personal ownership/buying questions are untouched.
+    """
+    raw = str(message or "").strip()
+    if not raw:
+        return False
+
+    low = raw.casefold()
+
+    commercial_cues = [
+        r"\bstok(?:um|umdaki|larım|larim|ta|taki)?\b",
+        r"\bgaleri(?:m|mde|mdeki|min|ye)?\b",
+        r"\benvanter(?:im|imde|de)?\b",
+        r"\bdealer(?:ship)?\b",
+        r"\binventory\b",
+        r"\bmy\s+stock\b",
+        r"\bour\s+stock\b",
+        r"\bmy\s+dealership\b",
+        r"\bавтосалон\b",
+        r"\bсклад\b",
+    ]
+
+    aging_cues = [
+        r"\bgündür\b", r"\bgund[üu]r\b",
+        r"\bgün\b", r"\bgun\b",
+        r"\bhaftadır\b", r"\bhaftadir\b",
+        r"\baydır\b", r"\baydir\b",
+        r"\bbekliyor\b", r"\bbekleyen\b",
+        r"\buzun\s+süredir\b", r"\buzun\s+suredir\b",
+        r"\beskiyen\s+stok\b", r"\byaşlanan\s+stok\b", r"\byaslanan\s+stok\b",
+        r"\bilanda\s+uzun\b",
+        r"\bdays?\b", r"\bweeks?\b", r"\bmonths?\b",
+        r"\baging\b", r"\baged\b", r"\bstale\b",
+        r"\bsitting\b", r"\btoo\s+long\b",
+        r"\blongest\b", r"\boldest\s+stock\b",
+        r"\bдн(?:я|ей)?\b", r"\bнедел", r"\bмесяц",
+        r"\bдолго\b", r"\bзалежал",
+    ]
+
+    action_cues = [
+        r"\bne\s+yap\b", r"\bne\s+yapmalıyım\b", r"\bne\s+yapmaliyim\b",
+        r"\bne\s+öner\b", r"\bne\s+oner\b",
+        r"\bindir\b", r"\bdüşür\b", r"\bdusur\b",
+        r"\bfiyatı\s+düşür\b", r"\bfiyati\s+dusur\b",
+        r"\bbeklet\b", r"\btut\b",
+        r"\bwhat\s+should\s+i\s+do\b",
+        r"\bshould\s+i\b", r"\bwhat\s+do\s+i\s+do\b",
+        r"\breduce\b", r"\bcut\s+(?:the\s+)?price\b",
+        r"\bhold\b", r"\bkeep\s+(?:the\s+)?price\b",
+        r"\baction\b", r"\bmanage\b",
+        r"\bчто\s+делать\b", r"\bснизить\b", r"\bдержать\b",
+    ]
+
+    has_commercial = any(re.search(p, low, flags=re.IGNORECASE) for p in commercial_cues)
+    has_aging = any(re.search(p, low, flags=re.IGNORECASE) for p in aging_cues)
+    has_action = any(re.search(p, low, flags=re.IGNORECASE) for p in action_cues)
+
+    # Dealer + aging is sufficient for "which of my cars have been sitting too long?"
+    # Dealer + explicit action is sufficient for "should I reduce this stock car?"
+    return bool(has_commercial and (has_aging or has_action))
+
+
+def _business_manage_action(row):
+    """
+    Transparent deterministic action logic based on:
+    observed listing age vs historical median/P75,
+    current advertised price position, evidence quality,
+    and whether the advert has already shown a price reduction.
+
+    No sale probability or guaranteed time-to-sell claims.
+    """
+    age = pd.to_numeric(pd.Series([row.get("StockAgeDays")]), errors="coerce").iloc[0]
+    med = pd.to_numeric(pd.Series([row.get("HistoricalMedianObservedDaysToExit")]), errors="coerce").iloc[0]
+    p75 = pd.to_numeric(pd.Series([row.get("HistoricalP75ObservedDaysToExit")]), errors="coerce").iloc[0]
+
+    price_position = str(row.get("PricePositionBand") or "").strip().upper()
+    liquidity_conf = str(row.get("LiquidityEvidenceConfidence") or "").strip().upper()
+    comp_conf = str(row.get("ComparableEvidenceConfidence") or "").strip().upper()
+    reduced = bool(row.get("HasReducedPrice", False))
+
+    reliable_liquidity = liquidity_conf in {"HIGH", "MEDIUM"}
+    reliable_price = comp_conf in {"HIGH", "MEDIUM"}
+
+    beyond_p75 = bool(
+        pd.notna(age) and pd.notna(p75) and reliable_liquidity and age > p75
+    )
+    beyond_median = bool(
+        pd.notna(age) and pd.notna(med) and reliable_liquidity and age > med
+    )
+    high_price = price_position in {"HIGH", "HIGH_MID"}
+    low_price = price_position in {"LOW", "LOW_MID"}
+    mid_price = price_position == "MID_MARKET"
+
+    reasons = []
+
+    if not reliable_liquidity and not reliable_price:
+        action = "REVIEW_MANUALLY"
+        reasons.append("historical age and comparable-price evidence are limited")
+    elif beyond_p75 and high_price and reliable_price:
+        action = "REPRICE_REVIEW"
+        reasons.append("listing age is beyond the historical upper-quartile exit benchmark")
+        reasons.append("current asking price is above the middle of comparable advertised prices")
+        if reduced:
+            reasons.append("the advert has already shown at least one asking-price reduction")
+    elif beyond_p75 and (mid_price or low_price):
+        action = "NON_PRICE_REVIEW"
+        reasons.append("listing age is beyond the historical upper-quartile exit benchmark")
+        reasons.append("price position is not obviously high versus current comparables")
+        if reduced:
+            reasons.append("the advert has already shown at least one asking-price reduction")
+    elif beyond_median and high_price and reliable_price:
+        action = "WATCH_REPRICE"
+        reasons.append("listing age is above the historical median observed exit benchmark")
+        reasons.append("current asking price is toward the upper end of comparable advertised prices")
+    elif beyond_median:
+        action = "WATCH"
+        reasons.append("listing age is above the historical median observed exit benchmark")
+        if low_price:
+            reasons.append("price is already below the middle of comparable advertised prices")
+    else:
+        action = "HOLD_MONITOR"
+        if pd.notna(age) and pd.notna(med) and reliable_liquidity:
+            reasons.append("listing age is still within the historical median observed exit benchmark")
+        else:
+            reasons.append("there is not enough age pressure in the available evidence to justify an automatic price action")
+        if high_price and reliable_price:
+            reasons.append("price is relatively high, but age evidence does not yet point to urgent action")
+
+    return action, reasons
+
+
+def _business_manage_row_public(row):
+    action, action_reasons = _business_manage_action(row)
+
+    return {
+        "link": str(row.get("Link") or "").strip(),
+        "company": str(row.get("Company") or "").strip(),
+        "brand": str(row.get("Brand") or "").strip(),
+        "model": str(row.get("Model") or "").strip(),
+        "category": str(row.get("CategoryDetail") or "").strip(),
+        "year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
+        "km": float(row["KM"]) if pd.notna(row.get("KM")) else None,
+        "asking_price": float(row["CurrentAskingPrice"]) if pd.notna(row.get("CurrentAskingPrice")) else None,
+        "listing_age_days": int(row["StockAgeDays"]) if pd.notna(row.get("StockAgeDays")) else None,
+        "listing_age_is_lower_bound": bool(row.get("PublicListingAgeIsLowerBound", False)),
+        "historical_median_days_to_exit": float(row["HistoricalMedianObservedDaysToExit"]) if pd.notna(row.get("HistoricalMedianObservedDaysToExit")) else None,
+        "historical_p75_days_to_exit": float(row["HistoricalP75ObservedDaysToExit"]) if pd.notna(row.get("HistoricalP75ObservedDaysToExit")) else None,
+        "liquidity_confidence": str(row.get("LiquidityEvidenceConfidence") or "").strip(),
+        "historical_exit60_rate": float(row["ObservedExit60Rate"]) if pd.notna(row.get("ObservedExit60Rate")) else None,
+        "historical_price_reduction_rate": float(row["HistoricalPriceReductionRate"]) if pd.notna(row.get("HistoricalPriceReductionRate")) else None,
+        "price_position": str(row.get("PricePositionBand") or "").strip(),
+        "comparable_confidence": str(row.get("ComparableEvidenceConfidence") or "").strip(),
+        "comparable_count": int(row["ComparableListings"]) if pd.notna(row.get("ComparableListings")) else None,
+        "comparable_median_price": float(row["ComparableMedianPrice"]) if pd.notna(row.get("ComparableMedianPrice")) else None,
+        "comparable_p25_price": float(row["ComparableP25Price"]) if pd.notna(row.get("ComparableP25Price")) else None,
+        "comparable_p75_price": float(row["ComparableP75Price"]) if pd.notna(row.get("ComparableP75Price")) else None,
+        "price_vs_median_pct": float(row["PriceVsMedianPct"]) if pd.notna(row.get("PriceVsMedianPct")) else None,
+        "has_reduced_price": bool(row.get("HasReducedPrice", False)),
+        "price_change_pct": float(row["PriceChangePct"]) if pd.notna(row.get("PriceChangePct")) else None,
+        "attention_level": str(row.get("AttentionLevel") or "").strip(),
+        "recommended_action": action,
+        "action_reasons": action_reasons,
+    }
+
+
+def _business_manage_action_label(action, language):
+    labels = {
+        "TR": {
+            "REPRICE_REVIEW": "fiyatı yeniden değerlendir",
+            "NON_PRICE_REVIEW": "fiyat dışı nedenleri incele",
+            "WATCH_REPRICE": "yakından izle; fiyatı gözden geçir",
+            "WATCH": "izle",
+            "HOLD_MONITOR": "şimdilik koru ve izle",
+            "REVIEW_MANUALLY": "manuel inceleme gerekli",
+        },
+        "EN": {
+            "REPRICE_REVIEW": "review the price",
+            "NON_PRICE_REVIEW": "review non-price factors",
+            "WATCH_REPRICE": "watch closely; review pricing",
+            "WATCH": "monitor",
+            "HOLD_MONITOR": "hold for now and monitor",
+            "REVIEW_MANUALLY": "manual review needed",
+        },
+        "RU": {
+            "REPRICE_REVIEW": "пересмотреть цену",
+            "NON_PRICE_REVIEW": "проверить неценовые факторы",
+            "WATCH_REPRICE": "внимательно следить и проверить цену",
+            "WATCH": "наблюдать",
+            "HOLD_MONITOR": "пока оставить и наблюдать",
+            "REVIEW_MANUALLY": "нужна ручная проверка",
+        },
+    }
+    return labels.get(language, labels["TR"]).get(action, action)
+
+
+def _business_manage_answer(message, language, requested_company=None):
+    if not BUSINESS_INTELLIGENCE_READY or business_stock_df is None or business_stock_df.empty:
+        text = {
+            "TR": "Business stok yönetimi verisi şu anda hazır değil. Lütfen biraz sonra tekrar deneyin.",
+            "EN": "The Business stock-management data is not ready right now. Please try again shortly.",
+            "RU": "Данные Business для управления складом сейчас недоступны. Попробуйте чуть позже.",
+        }
+        return text.get(language, text["TR"]), {
+            "success": False,
+            "error": "BUSINESS_INTELLIGENCE_NOT_READY",
+            "company": None,
+            "vehicles": [],
+        }
+
+    company, work = _business_stock_target_rows(
+        message,
+        requested_company=requested_company,
+    )
+
+    explicit_targets = resolve_market_vehicle_mentions(message)
+
+    if not company and not explicit_targets:
+        text = {
+            "TR": "Stok yönetimi analizini hangi galeri için yapacağımı bilmem gerekiyor. Şimdilik mesajınıza galeri adını ekleyin; hesap bağlantısı geldiğinde bu otomatik olacak.",
+            "EN": "I need to know which dealership's stock to manage. For now, include the dealership name in your message; account linking will make this automatic later.",
+            "RU": "Мне нужно знать, склад какого автосалона анализировать. Пока укажите название в сообщении; позже это будет определяться по аккаунту автоматически.",
+        }
+        return text.get(language, text["TR"]), {
+            "success": False,
+            "error": "BUSINESS_COMPANY_REQUIRED",
+            "company": None,
+            "vehicles": [],
+        }
+
+    if work.empty:
+        text = {
+            "TR": f"{company or 'Bu galeri'} stoklarında mesajınızdaki aracı bulamadım.",
+            "EN": f"I couldn't find the referenced vehicle in {(company or 'this dealership')}'s current stock.",
+            "RU": f"Я не нашёл указанный автомобиль в текущем складе {company or 'этого автосалона'}.",
+        }
+        return text.get(language, text["TR"]), {
+            "success": False,
+            "error": "BUSINESS_STOCK_VEHICLE_NOT_FOUND",
+            "company": company,
+            "vehicles": [],
+        }
+
+    # For portfolio questions, prioritise the most aged/high-attention stock.
+    # For an explicitly named vehicle, retain all matching rows but keep the most
+    # decision-relevant variants at the top.
+    age = pd.to_numeric(work["StockAgeDays"], errors="coerce")
+    p75 = pd.to_numeric(work["HistoricalP75ObservedDaysToExit"], errors="coerce")
+    median = pd.to_numeric(work["HistoricalMedianObservedDaysToExit"], errors="coerce")
+    price_vs = pd.to_numeric(work["PriceVsMedianPct"], errors="coerce")
+
+    work["_beyond_p75"] = ((age > p75) & p75.notna()).astype(int)
+    work["_beyond_median"] = ((age > median) & median.notna()).astype(int)
+    work["_age"] = age
+    work["_price_vs"] = price_vs
+
+    attention_rank = {"HIGH": 0, "ATTENTION": 1, "WATCH": 2, "NONE": 3}
+    work["_attention_rank"] = work["AttentionLevel"].map(attention_rank).fillna(9)
+
+    work = work.sort_values(
+        ["_beyond_p75", "_beyond_median", "_attention_rank", "_age", "_price_vs"],
+        ascending=[False, False, True, False, False],
+        na_position="last",
+    )
+
+    limit = 5 if explicit_targets else 8
+    vehicles = [
+        _business_manage_row_public(r)
+        for r in work.head(limit).to_dict("records")
+    ]
+
+    lines = []
+    for idx, v in enumerate(vehicles, 1):
+        name = " ".join(
+            x for x in [
+                str(v.get("year") or "").strip(),
+                v.get("brand") or "",
+                v.get("model") or "",
+                v.get("category") or "",
+            ] if x
+        ).strip()
+
+        ask = _business_money(v.get("asking_price"))
+        med_price = _business_money(v.get("comparable_median_price"))
+        p75_price = _business_money(v.get("comparable_p75_price"))
+        age_days = v.get("listing_age_days")
+        med_days = v.get("historical_median_days_to_exit")
+        p75_days = v.get("historical_p75_days_to_exit")
+        action = _business_manage_action_label(v.get("recommended_action"), language)
+
+        if language == "EN":
+            age_text = (
+                f"observed for at least {age_days} days"
+                if v.get("listing_age_is_lower_bound")
+                else f"observed advertised for {age_days} days"
+            ) if age_days is not None else "listing age unavailable"
+            benchmarks = []
+            if med_days is not None:
+                benchmarks.append(f"historical median exit benchmark {med_days:.0f}d")
+            if p75_days is not None:
+                benchmarks.append(f"P75 {p75_days:.0f}d")
+            price_bits = [
+                f"ask {ask}" if ask else None,
+                f"price position {_business_price_position_label(v.get('price_position'), 'EN')}",
+                f"comparable median {med_price}" if med_price else None,
+                f"P75 price {p75_price}" if p75_price else None,
+            ]
+            lines.append(
+                f"{idx}. {name} — {action}\n   "
+                + " · ".join([age_text] + benchmarks + [x for x in price_bits if x])
+            )
+
+        elif language == "RU":
+            age_text = (
+                f"наблюдается как минимум {age_days} дн."
+                if v.get("listing_age_is_lower_bound")
+                else f"наблюдается в объявлениях {age_days} дн."
+            ) if age_days is not None else "возраст объявления неизвестен"
+            benchmarks = []
+            if med_days is not None:
+                benchmarks.append(f"историческая медиана выхода {med_days:.0f} дн.")
+            if p75_days is not None:
+                benchmarks.append(f"P75 {p75_days:.0f} дн.")
+            price_bits = [
+                f"цена {ask}" if ask else None,
+                f"позиция {_business_price_position_label(v.get('price_position'), 'RU')}",
+                f"медиана сопоставимых {med_price}" if med_price else None,
+                f"P75 цены {p75_price}" if p75_price else None,
+            ]
+            lines.append(
+                f"{idx}. {name} — {action}\n   "
+                + " · ".join([age_text] + benchmarks + [x for x in price_bits if x])
+            )
+
+        else:
+            age_text = (
+                f"en az {age_days} gündür gözlemleniyor"
+                if v.get("listing_age_is_lower_bound")
+                else f"{age_days} gündür ilanda gözlemleniyor"
+            ) if age_days is not None else "ilan yaşı bilinmiyor"
+            benchmarks = []
+            if med_days is not None:
+                benchmarks.append(f"tarihsel medyan çıkış {med_days:.0f} gün")
+            if p75_days is not None:
+                benchmarks.append(f"P75 {p75_days:.0f} gün")
+            price_bits = [
+                f"ilan {ask}" if ask else None,
+                f"fiyat konumu {_business_price_position_label(v.get('price_position'), 'TR')}",
+                f"benzer ilan medyanı {med_price}" if med_price else None,
+                f"fiyat P75 {p75_price}" if p75_price else None,
+            ]
+            lines.append(
+                f"{idx}. {name} — {action}\n   "
+                + " · ".join([age_text] + benchmarks + [x for x in price_bits if x])
+            )
+
+    if language == "EN":
+        if explicit_targets:
+            intro = "For the referenced stock, this is the action the current evidence supports:"
+        else:
+            intro = f"For {company}, these are the vehicles I would review first based on observed listing age and current price position:"
+        note = (
+            "This is inventory-management evidence, not a sale prediction. "
+            "Listing age starts when OtoDeğer first observed the advert, not when the dealer acquired the vehicle. "
+            "Historical market exit means the listing disappeared from observation; it is not a confirmed sale. "
+            "A price reduction should only be considered after checking condition, specification, preparation costs and your margin."
+        )
+    elif language == "RU":
+        if explicit_targets:
+            intro = "По указанному автомобилю текущие данные поддерживают следующее действие:"
+        else:
+            intro = f"Для {company} в первую очередь я бы проверил эти автомобили по наблюдаемому возрасту объявления и текущей ценовой позиции:"
+        note = (
+            "Это данные для управления складом, а не прогноз продажи. "
+            "Возраст считается с момента, когда OtoDeğer впервые увидел объявление, а не с даты покупки автомобиля дилером. "
+            "Исторический выход с рынка означает исчезновение объявления из наблюдения, а не подтверждённую продажу. "
+            "Перед снижением цены нужно учитывать состояние, комплектацию, затраты на подготовку и вашу маржу."
+        )
+    else:
+        if explicit_targets:
+            intro = "Mesajınızdaki stok aracı için mevcut verinin desteklediği aksiyon şu:"
+        else:
+            intro = f"{company} için gözlenen ilan yaşı ve mevcut fiyat konumuna göre önce şu araçları gözden geçirirdim:"
+        note = (
+            "Bu bir satış tahmini değil, stok yönetimi göstergesidir. "
+            "İlan yaşı galerinin aracı aldığı tarihten değil, OtoDeğer'in ilanı ilk gördüğü tarihten başlar. "
+            "Tarihsel piyasa çıkışı da doğrulanmış satış anlamına gelmez. "
+            "Fiyat indirimi düşünmeden önce kondisyon, donanım, hazırlık maliyeti ve marjınızı da kontrol etmek gerekir."
+        )
+
+    return intro + "\n\n" + "\n\n".join(lines) + "\n\n" + note, {
+        "success": True,
+        "company": company,
+        "vehicles": vehicles,
+    }
+
+
+# =========================================================
+# BUSINESS ASSISTANT v3 - PRICE / COMPETITIVE POSITIONING
+# =========================================================
+
+def _business_price_intent(message):
+    """
+    Detect explicit dealer/inventory pricing questions without intercepting
+    ordinary Personal buyer price questions.
+    """
+    raw = str(message or "").strip()
+    if not raw:
+        return False
+
+    low = raw.casefold()
+
+    commercial_cues = [
+        r"\bstok(?:um|umdaki|larım|larim|ta|taki)?\b",
+        r"\bgaleri(?:m|mde|mdeki|min|ye)?\b",
+        r"\benvanter(?:im|imde|de)?\b",
+        r"\bdealer(?:ship)?\b",
+        r"\binventory\b",
+        r"\bmy\s+stock\b",
+        r"\bour\s+stock\b",
+        r"\bmy\s+car\b",
+        r"\bour\s+car\b",
+        r"\bдилер\b",
+        r"\bавтосалон\b",
+        r"\bсклад\b",
+    ]
+
+    price_cues = [
+        r"\bfiyat\b", r"\bfiyatı\b", r"\bfiyati\b", r"\bfiyatlar\b",
+        r"\bpahalı\b", r"\bpahali\b", r"\bucuz\b",
+        r"\byüksek\b", r"\byuksek\b",
+        r"\bprice\b", r"\bpricing\b", r"\bpriced\b",
+        r"\boverpriced\b", r"\bunderpriced\b",
+        r"\bexpensive\b", r"\bcheap\b",
+        r"\bcompetitive\b", r"\bcompetitively\b",
+        r"\bhow\s+high\b", r"\bhow\s+much\s+should\s+i\s+(?:ask|price)\b",
+        r"\basking\s+price\b",
+        r"\bцена\b", r"\bцену\b", r"\bдорог\b", r"\bдешев\b",
+        r"\bконкурент\b",
+    ]
+
+    has_commercial = any(re.search(p, low, flags=re.IGNORECASE) for p in commercial_cues)
+    has_price = any(re.search(p, low, flags=re.IGNORECASE) for p in price_cues)
+
+    return bool(has_commercial and has_price)
+
+
+def _business_stock_target_rows(message, requested_company=None):
+    """
+    Resolve Business-stock rows referenced by the user.
+
+    Company scope is applied when known. Vehicle mentions use the existing
+    deterministic live-market mention resolver so Personal and Business
+    understand Brand/Model/Category names consistently.
+    """
+    company = _resolve_business_company(message, requested_company=requested_company)
+
+    if business_stock_df is None or business_stock_df.empty:
+        return company, pd.DataFrame()
+
+    work = business_stock_df.copy()
+
+    if company:
+        work = work[
+            work["Company"].fillna("").astype(str).str.casefold()
+            == str(company).casefold()
+        ].copy()
+
+    targets = resolve_market_vehicle_mentions(message)
+
+    # Explicit year, when present, is useful for disambiguating stock rows.
+    years = [
+        int(x)
+        for x in re.findall(r"\b((?:19|20)\d{2})\b", str(message or ""))
+    ]
+
+    if targets:
+        mask = pd.Series(False, index=work.index)
+        for target in targets:
+            this_mask = (
+                work["Brand"].fillna("").astype(str).str.casefold()
+                == str(target.get("brand") or "").casefold()
+            ) & (
+                work["Model"].fillna("").astype(str).str.casefold()
+                == str(target.get("model") or "").casefold()
+            )
+
+            if target.get("category"):
+                this_mask &= (
+                    work["CategoryDetail"].fillna("").astype(str).str.casefold()
+                    == str(target.get("category") or "").casefold()
+                )
+
+            mask |= this_mask
+
+        work = work[mask].copy()
+
+    if years and not work.empty:
+        numeric_year = pd.to_numeric(work["Year"], errors="coerce")
+        year_mask = numeric_year.isin(years)
+        if year_mask.any():
+            work = work[year_mask].copy()
+
+    return company, work
+
+
+def _business_price_position_label(value, language):
+    value = str(value or "").strip().upper()
+
+    labels = {
+        "TR": {
+            "HIGH": "yüksek",
+            "HIGH_MID": "yüksek-orta",
+            "MID_MARKET": "piyasa ortası",
+            "LOW_MID": "düşük-orta",
+            "LOW": "düşük",
+            "INSUFFICIENT_EVIDENCE": "yetersiz veri",
+        },
+        "EN": {
+            "HIGH": "high",
+            "HIGH_MID": "upper-middle",
+            "MID_MARKET": "mid-market",
+            "LOW_MID": "lower-middle",
+            "LOW": "low",
+            "INSUFFICIENT_EVIDENCE": "insufficient evidence",
+        },
+        "RU": {
+            "HIGH": "высокая",
+            "HIGH_MID": "выше средней",
+            "MID_MARKET": "середина рынка",
+            "LOW_MID": "ниже средней",
+            "LOW": "низкая",
+            "INSUFFICIENT_EVIDENCE": "недостаточно данных",
+        },
+    }
+    return labels.get(language, labels["TR"]).get(value, value or "—")
+
+
+def _business_price_row_public(row):
+    return {
+        "link": str(row.get("Link") or "").strip(),
+        "company": str(row.get("Company") or "").strip(),
+        "brand": str(row.get("Brand") or "").strip(),
+        "model": str(row.get("Model") or "").strip(),
+        "category": str(row.get("CategoryDetail") or "").strip(),
+        "year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
+        "km": float(row["KM"]) if pd.notna(row.get("KM")) else None,
+        "asking_price": float(row["CurrentAskingPrice"]) if pd.notna(row.get("CurrentAskingPrice")) else None,
+        "comparable_count": int(row["ComparableListings"]) if pd.notna(row.get("ComparableListings")) else None,
+        "comparable_confidence": str(row.get("ComparableEvidenceConfidence") or "").strip(),
+        "comparable_median_price": float(row["ComparableMedianPrice"]) if pd.notna(row.get("ComparableMedianPrice")) else None,
+        "comparable_p25_price": float(row["ComparableP25Price"]) if pd.notna(row.get("ComparableP25Price")) else None,
+        "comparable_p75_price": float(row["ComparableP75Price"]) if pd.notna(row.get("ComparableP75Price")) else None,
+        "comparable_min_price": float(row["ComparableMinPrice"]) if pd.notna(row.get("ComparableMinPrice")) else None,
+        "comparable_max_price": float(row["ComparableMaxPrice"]) if pd.notna(row.get("ComparableMaxPrice")) else None,
+        "price_vs_median_pct": float(row["PriceVsMedianPct"]) if pd.notna(row.get("PriceVsMedianPct")) else None,
+        "price_percentile": float(row["PricePercentile"]) if pd.notna(row.get("PricePercentile")) else None,
+        "price_position": str(row.get("PricePositionBand") or "").strip(),
+        "benchmark_source": str(row.get("BenchmarkSource") or "").strip(),
+        "listing_age_days": int(row["StockAgeDays"]) if pd.notna(row.get("StockAgeDays")) else None,
+        "listing_age_is_lower_bound": bool(row.get("PublicListingAgeIsLowerBound", False)),
+    }
+
+
+def _business_price_answer(message, language, requested_company=None):
+    if not BUSINESS_INTELLIGENCE_READY or business_stock_df is None or business_stock_df.empty:
+        text = {
+            "TR": "Business fiyat verisi şu anda hazır değil. Lütfen biraz sonra tekrar deneyin.",
+            "EN": "The Business pricing data is not ready right now. Please try again shortly.",
+            "RU": "Данные Business по ценам сейчас недоступны. Попробуйте чуть позже.",
+        }
+        return text.get(language, text["TR"]), {
+            "success": False,
+            "error": "BUSINESS_INTELLIGENCE_NOT_READY",
+            "company": None,
+            "vehicles": [],
+        }
+
+    company, work = _business_stock_target_rows(
+        message,
+        requested_company=requested_company,
+    )
+
+    low = str(message or "").casefold()
+
+    wants_portfolio_review = bool(re.search(
+        r"\b(?:hangi|which|show|göster|goster|list|tüm|tum|all)\b.{0,40}"
+        r"\b(?:pahalı|pahali|yüksek|yuksek|overpriced|high[- ]priced|price|fiyat|дорог|цена)",
+        low,
+        flags=re.IGNORECASE,
+    ))
+
+    # If no explicit vehicle was resolved, a dealer-wide pricing question
+    # requires a known company. Otherwise we cannot know whose stock to inspect.
+    if work.empty and not company:
+        text = {
+            "TR": "Fiyat analizini hangi galeri için yapacağımı bilmem gerekiyor. Şimdilik mesajınıza galeri adını ekleyin; hesap bağlantısı geldiğinde bu otomatik olacak.",
+            "EN": "I need to know which dealership's stock to price-check. For now, include the dealership name in your message; account linking will make this automatic later.",
+            "RU": "Мне нужно знать, для какого автосалона проверять цены. Пока укажите название в сообщении; позже это будет определяться по аккаунту автоматически.",
+        }
+        return text.get(language, text["TR"]), {
+            "success": False,
+            "error": "BUSINESS_COMPANY_REQUIRED",
+            "company": None,
+            "vehicles": [],
+        }
+
+    if company and work.empty:
+        # Company exists but no target rows matched.
+        text = {
+            "TR": f"{company} stoklarında mesajınızdaki aracı bulamadım.",
+            "EN": f"I couldn't find the vehicle you referenced in {company}'s current stock.",
+            "RU": f"Я не нашёл указанный автомобиль в текущем складе {company}.",
+        }
+        return text.get(language, text["TR"]), {
+            "success": False,
+            "error": "BUSINESS_STOCK_VEHICLE_NOT_FOUND",
+            "company": company,
+            "vehicles": [],
+        }
+
+    # Portfolio-level price review: show highest price-position stock first.
+    if wants_portfolio_review or not resolve_market_vehicle_mentions(message):
+        position_rank = {
+            "HIGH": 0,
+            "HIGH_MID": 1,
+            "MID_MARKET": 2,
+            "LOW_MID": 3,
+            "LOW": 4,
+            "INSUFFICIENT_EVIDENCE": 9,
+        }
+        work["_position_rank"] = work["PricePositionBand"].map(position_rank).fillna(9)
+        work["_price_vs_median"] = pd.to_numeric(work["PriceVsMedianPct"], errors="coerce")
+        work["_asking"] = pd.to_numeric(work["CurrentAskingPrice"], errors="coerce")
+
+        review = work.sort_values(
+            ["_position_rank", "_price_vs_median", "_asking"],
+            ascending=[True, False, False],
+            na_position="last",
+        ).head(8)
+
+        vehicles = [_business_price_row_public(r) for r in review.to_dict("records")]
+
+        if not vehicles:
+            text = {
+                "TR": f"{company} için karşılaştırılabilir fiyat kanıtı olan stok bulamadım.",
+                "EN": f"I couldn't find stock with usable comparable-price evidence for {company}.",
+                "RU": f"Для {company} я не нашёл склад с достаточными сопоставимыми ценовыми данными.",
+            }
+            return text.get(language, text["TR"]), {
+                "success": True,
+                "company": company,
+                "vehicles": [],
+            }
+
+        lines = []
+        for idx, v in enumerate(vehicles, 1):
+            name = " ".join(
+                x for x in [
+                    str(v.get("year") or "").strip(),
+                    v.get("brand") or "",
+                    v.get("model") or "",
+                    v.get("category") or "",
+                ] if x
+            ).strip()
+
+            asking = _business_money(v.get("asking_price"))
+            median = _business_money(v.get("comparable_median_price"))
+            p75 = _business_money(v.get("comparable_p75_price"))
+            diff = v.get("price_vs_median_pct")
+            diff_pct = round(diff * 100) if diff is not None else None
+            position = _business_price_position_label(v.get("price_position"), language)
+            confidence = v.get("comparable_confidence") or "—"
+
+            if language == "EN":
+                parts = [
+                    f"asking {asking}" if asking else None,
+                    f"{position} price position",
+                    f"comparable median {median}" if median else None,
+                    f"upper quartile {p75}" if p75 else None,
+                    f"{diff_pct:+d}% vs median" if diff_pct is not None else None,
+                    f"{confidence.lower()} evidence",
+                ]
+            elif language == "RU":
+                parts = [
+                    f"цена {asking}" if asking else None,
+                    f"позиция: {position}",
+                    f"медиана сопоставимых {median}" if median else None,
+                    f"верхний квартиль {p75}" if p75 else None,
+                    f"{diff_pct:+d}% к медиане" if diff_pct is not None else None,
+                    f"достоверность: {confidence}",
+                ]
+            else:
+                confidence_tr = {
+                    "HIGH": "yüksek",
+                    "MEDIUM": "orta",
+                    "LOW": "düşük",
+                }.get(confidence, confidence.casefold())
+                parts = [
+                    f"ilan {asking}" if asking else None,
+                    f"fiyat konumu: {position}",
+                    f"benzer ilan medyanı {median}" if median else None,
+                    f"üst çeyrek {p75}" if p75 else None,
+                    f"medyana göre %{diff_pct:+d}" if diff_pct is not None else None,
+                    f"{confidence_tr} kanıt",
+                ]
+
+            lines.append(
+                f"{idx}. {name}\n   " + " · ".join(x for x in parts if x)
+            )
+
+        if language == "EN":
+            intro = (
+                f"The first {company} vehicles I would price-check are the ones sitting highest relative to comparable current asking prices:"
+            )
+            note = (
+                "These comparisons use advertised prices, not confirmed transaction prices. "
+                "A high price position does not automatically mean the vehicle should be reduced; specification, condition and acquisition economics can justify a premium."
+            )
+        elif language == "RU":
+            intro = (
+                f"В первую очередь у {company} я бы проверил автомобили, которые стоят выше всего относительно сопоставимых текущих цен объявлений:"
+            )
+            note = (
+                "Сравнение основано на ценах объявлений, а не на подтверждённых ценах сделок. "
+                "Высокая ценовая позиция не означает автоматически, что цену нужно снижать: комплектация, состояние и закупочная экономика могут оправдывать премию."
+            )
+        else:
+            intro = (
+                f"{company} stoklarında önce, benzer güncel ilanlara göre en yüksek fiyat konumunda duran araçları kontrol ederdim:"
+            )
+            note = (
+                "Bu karşılaştırma gerçekleşmiş satış fiyatlarına değil, ilan fiyatlarına dayanır. "
+                "Yüksek fiyat konumu tek başına indirim gerektiği anlamına gelmez; donanım, kondisyon ve alış maliyeti primi haklı çıkarabilir."
+            )
+
+        return intro + "\n\n" + "\n\n".join(lines) + "\n\n" + note, {
+            "success": True,
+            "company": company,
+            "vehicles": vehicles,
+        }
+
+    # Specific-vehicle pricing analysis.
+    position_rank = {
+        "HIGH": 0,
+        "HIGH_MID": 1,
+        "MID_MARKET": 2,
+        "LOW_MID": 3,
+        "LOW": 4,
+        "INSUFFICIENT_EVIDENCE": 9,
+    }
+    work["_position_rank"] = work["PricePositionBand"].map(position_rank).fillna(9)
+    work["_comparables"] = pd.to_numeric(work["ComparableListings"], errors="coerce")
+    work = work.sort_values(
+        ["_position_rank", "_comparables"],
+        ascending=[True, False],
+        na_position="last",
+    ).head(5)
+
+    vehicles = [_business_price_row_public(r) for r in work.to_dict("records")]
+
+    if not vehicles:
+        text = {
+            "TR": "Bu araç için yeterli stok/fiyat verisi bulamadım.",
+            "EN": "I couldn't find enough stock/pricing data for that vehicle.",
+            "RU": "По этому автомобилю недостаточно данных о складе и ценах.",
+        }
+        return text.get(language, text["TR"]), {
+            "success": True,
+            "company": company,
+            "vehicles": [],
+        }
+
+    lines = []
+    for idx, v in enumerate(vehicles, 1):
+        name = " ".join(
+            x for x in [
+                str(v.get("year") or "").strip(),
+                v.get("brand") or "",
+                v.get("model") or "",
+                v.get("category") or "",
+            ] if x
+        ).strip()
+
+        asking = _business_money(v.get("asking_price"))
+        median = _business_money(v.get("comparable_median_price"))
+        p25 = _business_money(v.get("comparable_p25_price"))
+        p75 = _business_money(v.get("comparable_p75_price"))
+        diff = v.get("price_vs_median_pct")
+        diff_pct = round(diff * 100) if diff is not None else None
+        position = _business_price_position_label(v.get("price_position"), language)
+        confidence = v.get("comparable_confidence") or "—"
+        comp_n = v.get("comparable_count")
+
+        if language == "EN":
+            competitive = (
+                f"A defensible advertised-market range is roughly {p25}–{p75}"
+                if p25 and p75 else
+                f"The comparable median is about {median}" if median else
+                "Comparable-price evidence is limited"
+            )
+            parts = [
+                f"current ask {asking}" if asking else None,
+                f"{position} position",
+                f"{diff_pct:+d}% vs comparable median" if diff_pct is not None else None,
+                competitive,
+                f"{comp_n} comparables" if comp_n is not None else None,
+                f"{confidence.lower()} evidence",
+            ]
+        elif language == "RU":
+            competitive = (
+                f"Ориентир конкурентного диапазона объявлений: примерно {p25}–{p75}"
+                if p25 and p75 else
+                f"Медиана сопоставимых объявлений: около {median}" if median else
+                "Сопоставимых ценовых данных мало"
+            )
+            parts = [
+                f"текущая цена {asking}" if asking else None,
+                f"позиция: {position}",
+                f"{diff_pct:+d}% к медиане" if diff_pct is not None else None,
+                competitive,
+                f"сопоставимых объявлений: {comp_n}" if comp_n is not None else None,
+                f"достоверность: {confidence}",
+            ]
+        else:
+            competitive = (
+                f"İlan piyasasında savunulabilir rekabetçi aralık yaklaşık {p25}–{p75}"
+                if p25 and p75 else
+                f"Benzer ilan medyanı yaklaşık {median}" if median else
+                "Karşılaştırılabilir fiyat kanıtı sınırlı"
+            )
+            confidence_tr = {
+                "HIGH": "yüksek",
+                "MEDIUM": "orta",
+                "LOW": "düşük",
+            }.get(confidence, confidence.casefold())
+            parts = [
+                f"mevcut ilan {asking}" if asking else None,
+                f"fiyat konumu: {position}",
+                f"benzer ilan medyanına göre %{diff_pct:+d}" if diff_pct is not None else None,
+                competitive,
+                f"{comp_n} benzer ilan" if comp_n is not None else None,
+                f"{confidence_tr} kanıt",
+            ]
+
+        lines.append(f"{idx}. {name}\n   " + " · ".join(x for x in parts if x))
+
+    if language == "EN":
+        intro = (
+            f"For {company}, this is how the referenced stock sits against comparable current asking prices:"
+            if company else
+            "This is how the referenced listing sits against comparable current asking prices:"
+        )
+        note = (
+            "Treat the P25–P75 range as competitive advertised-market positioning, not a guaranteed sale-price range. "
+            "The evidence does not include the vehicle's condition, exact optional equipment, preparation cost or your acquisition cost."
+        )
+    elif language == "RU":
+        intro = (
+            f"Для {company} указанный автомобиль выглядит так относительно сопоставимых текущих цен объявлений:"
+            if company else
+            "Указанный автомобиль выглядит так относительно сопоставимых текущих цен объявлений:"
+        )
+        note = (
+            "Диапазон P25–P75 — это ориентир конкурентного позиционирования по объявлениям, а не гарантированный диапазон цены продажи. "
+            "Здесь не учтены состояние, точная комплектация, затраты на подготовку и ваша закупочная цена."
+        )
+    else:
+        intro = (
+            f"{company} için mesajınızdaki aracın benzer güncel ilanlara göre fiyat konumu şöyle:"
+            if company else
+            "Mesajınızdaki aracın benzer güncel ilanlara göre fiyat konumu şöyle:"
+        )
+        note = (
+            "P25–P75 aralığını gerçekleşecek satış fiyatı değil, rekabetçi ilan fiyatı konumu olarak düşünün. "
+            "Kondisyon, tam donanım, hazırlık maliyeti ve sizin alış maliyetiniz bu veride yok."
+        )
+
+    return intro + "\n\n" + "\n\n".join(lines) + "\n\n" + note, {
+        "success": True,
+        "company": company,
+        "vehicles": vehicles,
+    }
+
+
+# =========================================================
+# BUSINESS ASSISTANT v2 - MY STOCK / INVENTORY HEALTH
+# =========================================================
+
+def _normalize_company_name(value):
+    value = str(value or "").casefold()
+    value = re.sub(r"[^a-z0-9çğıöşüа-яё]+", " ", value, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _resolve_business_company(message, requested_company=None):
+    """
+    Resolve the gallery/company either from an explicit request field
+    (future account association) or from a clear company mention in the message.
+    """
+    if not BUSINESS_INTELLIGENCE_READY or business_company_df is None or business_company_df.empty:
+        return None
+
+    companies = [
+        str(x).strip()
+        for x in business_company_df["Company"].dropna().astype(str).tolist()
+        if str(x).strip()
+    ]
+
+    if requested_company:
+        requested_n = _normalize_company_name(requested_company)
+        exact = [c for c in companies if _normalize_company_name(c) == requested_n]
+        if len(exact) == 1:
+            return exact[0]
+
+    message_n = _normalize_company_name(message)
+    if not message_n:
+        return None
+
+    # Prefer exact full company-name mentions and then sufficiently specific
+    # containment matches. Very short/placeholder company values are ignored.
+    matches = []
+    padded = f" {message_n} "
+    for company in companies:
+        cn = _normalize_company_name(company)
+        if len(cn) < 4 or cn in {".", "bireysel"}:
+            continue
+        if f" {cn} " in padded:
+            matches.append((len(cn), company))
+
+    if matches:
+        matches.sort(reverse=True)
+        return matches[0][1]
+
+    return None
+
+
+def _business_stock_intent(message):
+    raw = str(message or "").strip()
+    if not raw:
+        return False
+
+    low = raw.casefold()
+
+    stock_cues = [
+        r"\bstoklarım\b", r"\bstoklarim\b",
+        r"\bstokum\b", r"\bstokuma\b", r"\bstokumdaki\b",
+        r"\benvanterim\b", r"\benvanter\b",
+        r"\bgalerimdeki\b", r"\bgalerimin\b",
+        r"\bmy\s+stock\b", r"\bmy\s+inventory\b",
+        r"\bour\s+stock\b", r"\bour\s+inventory\b",
+        r"\bmy\s+dealership\b", r"\bour\s+dealership\b",
+        r"\bмой\s+склад\b", r"\bмои\s+машины\b",
+        r"\bмой\s+автосалон\b",
+    ]
+    health_cues = [
+        r"\bnasıl\b", r"\bnasil\b", r"\bdurum\b",
+        r"\bkontrol\b", r"\bbak\b", r"\bincele\b",
+        r"\bsorun\b", r"\bdikkat\b",
+        r"\bhealth\b", r"\bdoing\b", r"\bperform",
+        r"\bproblem\b", r"\battention\b", r"\breview\b",
+        r"\bкак\b", r"\bсостояни", r"\bпроверь\b",
+    ]
+
+    has_stock = any(re.search(p, low, flags=re.IGNORECASE) for p in stock_cues)
+    has_health = any(re.search(p, low, flags=re.IGNORECASE) for p in health_cues)
+
+    # "Which of my stock..." and similar questions are also clearly stock-health.
+    specific_stock_question = bool(re.search(
+        r"\b(?:hangi|which|what)\b.{0,30}\b(?:stok|stock|inventory|araç|arac|vehicle|car)",
+        low,
+        flags=re.IGNORECASE,
+    ))
+
+    return bool(has_stock and (has_health or specific_stock_question))
+
+
+def _business_company_snapshot(company):
+    if not company:
+        return None
+
+    rows = business_company_df[
+        business_company_df["Company"].fillna("").astype(str).str.casefold()
+        == str(company).casefold()
+    ]
+    if rows.empty:
+        return None
+
+    row = rows.iloc[0].to_dict()
+
+    stock = business_stock_df[
+        business_stock_df["Company"].fillna("").astype(str).str.casefold()
+        == str(company).casefold()
+    ].copy()
+
+    if stock.empty:
+        priority = []
+    else:
+        attention_rank = {"HIGH": 0, "ATTENTION": 1, "WATCH": 2, "NONE": 3}
+        price_rank = {"HIGH": 0, "HIGH_MID": 1, "MID_MARKET": 2, "LOW_MID": 3, "LOW": 4}
+
+        stock["_attention_rank"] = stock["AttentionLevel"].map(attention_rank).fillna(9)
+        stock["_price_rank"] = stock["PricePositionBand"].map(price_rank).fillna(9)
+        stock["_age"] = pd.to_numeric(stock["StockAgeDays"], errors="coerce")
+
+        priority_df = stock.sort_values(
+            ["_attention_rank", "_age", "_price_rank"],
+            ascending=[True, False, True],
+            na_position="last",
+        ).head(6)
+
+        priority = []
+        for item in priority_df.to_dict("records"):
+            priority.append({
+                "link": str(item.get("Link") or "").strip(),
+                "brand": str(item.get("Brand") or "").strip(),
+                "model": str(item.get("Model") or "").strip(),
+                "category": str(item.get("CategoryDetail") or "").strip(),
+                "year": int(item["Year"]) if pd.notna(item.get("Year")) else None,
+                "km": float(item["KM"]) if pd.notna(item.get("KM")) else None,
+                "asking_price": float(item["CurrentAskingPrice"]) if pd.notna(item.get("CurrentAskingPrice")) else None,
+                "listing_age_days": int(item["StockAgeDays"]) if pd.notna(item.get("StockAgeDays")) else None,
+                "listing_age_is_lower_bound": bool(item.get("PublicListingAgeIsLowerBound", False)),
+                "price_position": str(item.get("PricePositionBand") or "").strip(),
+                "attention_level": str(item.get("AttentionLevel") or "").strip(),
+                "attention_reasons": [
+                    x for x in str(item.get("AttentionReasons") or "").split("|") if x
+                ],
+                "comparable_count": int(item["ComparableListings"]) if pd.notna(item.get("ComparableListings")) else None,
+                "comparable_confidence": str(item.get("ComparableEvidenceConfidence") or "").strip(),
+                "comparable_median_price": float(item["ComparableMedianPrice"]) if pd.notna(item.get("ComparableMedianPrice")) else None,
+                "historical_median_days_to_exit": float(item["HistoricalMedianObservedDaysToExit"]) if pd.notna(item.get("HistoricalMedianObservedDaysToExit")) else None,
+            })
+
+    return {
+        "company": company,
+        "summary": {
+            "current_stock_count": int(row["CurrentStockCount"]) if pd.notna(row.get("CurrentStockCount")) else 0,
+            "stock_asking_value": float(row["CurrentStockAskingValue"]) if pd.notna(row.get("CurrentStockAskingValue")) else None,
+            "median_asking_price": float(row["MedianCurrentAskingPrice"]) if pd.notna(row.get("MedianCurrentAskingPrice")) else None,
+            "median_listing_age_days": float(row["MedianPublicListingAgeDays"]) if pd.notna(row.get("MedianPublicListingAgeDays")) else None,
+            "fresh_count": int(row["FreshStockCount"]) if pd.notna(row.get("FreshStockCount")) else 0,
+            "normal_count": int(row["NormalStockCount"]) if pd.notna(row.get("NormalStockCount")) else 0,
+            "above_typical_count": int(row["AboveTypicalAgeCount"]) if pd.notna(row.get("AboveTypicalAgeCount")) else 0,
+            "aged_count": int(row["AgedStockCount"]) if pd.notna(row.get("AgedStockCount")) else 0,
+            "very_aged_count": int(row["VeryAgedStockCount"]) if pd.notna(row.get("VeryAgedStockCount")) else 0,
+            "high_price_position_count": int(row["HighPricePositionCount"]) if pd.notna(row.get("HighPricePositionCount")) else 0,
+            "watch_count": int(row["WatchStockCount"]) if pd.notna(row.get("WatchStockCount")) else 0,
+            "attention_count": int(row["AttentionStockCount"]) if pd.notna(row.get("AttentionStockCount")) else 0,
+            "high_attention_count": int(row["HighAttentionStockCount"]) if pd.notna(row.get("HighAttentionStockCount")) else 0,
+            "historical_distinct_listings": int(row["HistoricalDistinctListings"]) if pd.notna(row.get("HistoricalDistinctListings")) else None,
+            "historical_observed_exits": int(row["HistoricalObservedMarketExits"]) if pd.notna(row.get("HistoricalObservedMarketExits")) else None,
+            "historical_median_observed_days_to_exit": float(row["HistoricalMedianObservedDaysToExit"]) if pd.notna(row.get("HistoricalMedianObservedDaysToExit")) else None,
+            "historical_price_reduction_rate": float(row["HistoricalPriceReductionRate"]) if pd.notna(row.get("HistoricalPriceReductionRate")) else None,
+        },
+        "priority_vehicles": priority,
+    }
+
+
+def _business_stock_answer(message, language, requested_company=None):
+    company = _resolve_business_company(message, requested_company=requested_company)
+
+    if not company:
+        text = {
+            "TR": "Stok analizini yapabilmem için hangi galeriye ait olduğunuzu bilmem gerekiyor. Şimdilik mesajınızda galeri adını yazabilirsiniz; hesap sistemi geldiğinde bu otomatik olacak.",
+            "EN": "I need to know which dealership is yours before I can analyse your stock. For now, include the dealership name in your message; once account linking is added, this will be automatic.",
+            "RU": "Чтобы проанализировать ваш склад, мне нужно знать название автосалона. Пока укажите его в сообщении; после подключения аккаунтов это будет определяться автоматически.",
+        }
+        return text.get(language, text["TR"]), {
+            "success": False,
+            "error": "BUSINESS_COMPANY_REQUIRED",
+            "company": None,
+            "priority_vehicles": [],
+        }
+
+    snapshot = _business_company_snapshot(company)
+    if not snapshot:
+        text = {
+            "TR": f"{company} için Business stok verisi bulamadım.",
+            "EN": f"I couldn't find Business stock data for {company}.",
+            "RU": f"Я не нашёл Business-данные по складу для {company}.",
+        }
+        return text.get(language, text["TR"]), {
+            "success": False,
+            "error": "BUSINESS_COMPANY_NOT_FOUND",
+            "company": company,
+            "priority_vehicles": [],
+        }
+
+    s = snapshot["summary"]
+    vehicles = snapshot["priority_vehicles"]
+
+    total = max(int(s.get("current_stock_count") or 0), 1)
+    aged_total = (
+        int(s.get("above_typical_count") or 0)
+        + int(s.get("aged_count") or 0)
+        + int(s.get("very_aged_count") or 0)
+    )
+    aged_pct = round(aged_total / total * 100)
+    high_attention_pct = round(int(s.get("high_attention_count") or 0) / total * 100)
+
+    lines = []
+    for idx, vehicle in enumerate(vehicles, 1):
+        name = " ".join(
+            x for x in [
+                str(vehicle.get("year") or "").strip(),
+                vehicle.get("brand") or "",
+                vehicle.get("model") or "",
+                vehicle.get("category") or "",
+            ] if x
+        ).strip()
+
+        asking = _business_money(vehicle.get("asking_price"))
+        age = vehicle.get("listing_age_days")
+        price_pos = vehicle.get("price_position") or "—"
+        level = vehicle.get("attention_level") or "—"
+        comp_median = _business_money(vehicle.get("comparable_median_price"))
+
+        if language == "EN":
+            age_text = (
+                f"observed for at least {age} days"
+                if vehicle.get("listing_age_is_lower_bound")
+                else f"observed advertised for {age} days"
+            ) if age is not None else "listing age unavailable"
+            details = [
+                asking,
+                age_text,
+                f"price position: {price_pos.replace('_', ' ').lower()}",
+            ]
+            if comp_median:
+                details.append(f"comparable median {comp_median}")
+            lines.append(f"{idx}. {name} — {level}\n   " + " · ".join(x for x in details if x))
+
+        elif language == "RU":
+            age_text = (
+                f"наблюдается как минимум {age} дн."
+                if vehicle.get("listing_age_is_lower_bound")
+                else f"наблюдается в объявлениях {age} дн."
+            ) if age is not None else "возраст объявления неизвестен"
+            details = [
+                asking,
+                age_text,
+                f"ценовая позиция: {price_pos}",
+            ]
+            if comp_median:
+                details.append(f"медиана сопоставимых объявлений {comp_median}")
+            lines.append(f"{idx}. {name} — {level}\n   " + " · ".join(x for x in details if x))
+
+        else:
+            age_text = (
+                f"en az {age} gündür gözlemleniyor"
+                if vehicle.get("listing_age_is_lower_bound")
+                else f"{age} gündür ilanda gözlemleniyor"
+            ) if age is not None else "ilan yaşı bilinmiyor"
+            price_pos_tr = {
+                "HIGH": "yüksek",
+                "HIGH_MID": "yüksek-orta",
+                "MID_MARKET": "piyasa ortası",
+                "LOW_MID": "düşük-orta",
+                "LOW": "düşük",
+                "INSUFFICIENT_EVIDENCE": "yetersiz veri",
+            }.get(price_pos, price_pos)
+            level_tr = {
+                "HIGH": "yüksek dikkat",
+                "ATTENTION": "dikkat",
+                "WATCH": "izle",
+                "NONE": "normal",
+            }.get(level, level)
+            details = [
+                asking,
+                age_text,
+                f"fiyat konumu: {price_pos_tr}",
+            ]
+            if comp_median:
+                details.append(f"benzer ilan medyanı {comp_median}")
+            lines.append(f"{idx}. {name} — {level_tr}\n   " + " · ".join(x for x in details if x))
+
+    stock_value = _business_money(s.get("stock_asking_value"))
+    median_price = _business_money(s.get("median_asking_price"))
+
+    if language == "EN":
+        intro = (
+            f"{company} currently has {s['current_stock_count']} advertised vehicles"
+            + (f" with a combined asking value of about {stock_value}" if stock_value else "")
+            + ". "
+            f"{aged_pct}% of stock is above its typical observed market-age range, "
+            f"and {s['high_attention_count']} vehicles ({high_attention_pct}%) are in the highest-attention group."
+        )
+        overview = (
+            f"Median advertised age is {s['median_listing_age_days']:.0f} days"
+            + (f" and median asking price is {median_price}" if median_price else "")
+            + ". The first vehicles I would review are:"
+        )
+        note = (
+            "Listing age means days since OtoDeğer first observed the vehicle advertised; it is not the dealership's acquisition age. "
+            "Observed market exit is historical listing behaviour, not a confirmed sale."
+        )
+
+    elif language == "RU":
+        intro = (
+            f"У {company} сейчас {s['current_stock_count']} активных объявлений"
+            + (f" с общей заявленной стоимостью около {stock_value}" if stock_value else "")
+            + ". "
+            f"{aged_pct}% склада находится выше типичного наблюдаемого рыночного возраста, "
+            f"а {s['high_attention_count']} автомобилей ({high_attention_pct}%) относятся к группе повышенного внимания."
+        )
+        overview = (
+            f"Медианный наблюдаемый возраст объявления — {s['median_listing_age_days']:.0f} дн."
+            + (f", медианная цена — {median_price}" if median_price else "")
+            + ". В первую очередь я бы проверил:"
+        )
+        note = (
+            "Возраст объявления — это дни с момента, когда OtoDeğer впервые увидел автомобиль в рекламе, а не возраст нахождения автомобиля у дилера. "
+            "Исторический выход с рынка не означает подтверждённую продажу."
+        )
+
+    else:
+        intro = (
+            f"{company} için şu anda {s['current_stock_count']} aktif ilan görüyorum"
+            + (f"; toplam ilan değeri yaklaşık {stock_value}" if stock_value else "")
+            + ". "
+            f"Stokun %{aged_pct}'i kendi piyasa davranışına göre tipik yaş aralığının üzerinde, "
+            f"{s['high_attention_count']} araç (%{high_attention_pct}) ise en yüksek dikkat grubunda."
+        )
+        overview = (
+            f"Medyan gözlenen ilan yaşı {s['median_listing_age_days']:.0f} gün"
+            + (f", medyan ilan fiyatı {median_price}" if median_price else "")
+            + ". İlk olarak şu araçları gözden geçirirdim:"
+        )
+        note = (
+            "Buradaki ilan yaşı, OtoDeğer'in aracı ilk kez ilanda gördüğü tarihten itibaren geçen süredir; galerinin aracı satın aldığı tarih değildir. "
+            "Tarihsel piyasa çıkışı da doğrulanmış satış anlamına gelmez."
+        )
+
+    answer = intro + "\n\n" + overview
+    if lines:
+        answer += "\n\n" + "\n\n".join(lines)
+    answer += "\n\n" + note
+
+    return answer, {
+        "success": True,
+        "company": company,
+        "summary": s,
+        "priority_vehicles": vehicles,
+    }
+
+
+# =========================================================
+# BUSINESS ASSISTANT v1 - ACQUISITION / STOCKING OPPORTUNITIES
+# =========================================================
+
+def _business_acquire_intent(message, conversation_history=None):
+    """
+    Conservative first Business router.
+
+    BUSINESS_ACQUIRE activates only when the message clearly combines:
+      - dealer/gallery/stock/inventory commercial context, and
+      - an acquisition/stocking decision.
+
+    This intentionally does NOT intercept ordinary buyer questions such as
+    "What should I buy for £15k?".
+    """
+    raw = str(message or "").strip()
+    if not raw:
+        return False
+
+    low = raw.casefold()
+
+    commercial_cues = [
+        r"\bgaleri(?:m|me|mi|ler|lerim)?\b",
+        r"\bstok(?:um|a|ta|lamak|layayım|layalim|layalım)?\b",
+        r"\benvanter(?:im|e|de)?\b",
+        r"\bdealer(?:ship)?\b",
+        r"\binventory\b",
+        r"\bstock\b",
+        r"\bforecourt\b",
+        r"\bresale\s+stock\b",
+        r"\bдилер\b",
+        r"\bавтосалон\b",
+        r"\bсклад\b",
+    ]
+    acquire_cues = [
+        r"\bne\s+al(?:ayım|alim|malıyım|maliyim)\b",
+        r"\bhangi\s+araç(?:ları|lari)?\s+(?:al|stokla)",
+        r"\bstok(?:a|uma)?\s+(?:ne|hangi)",
+        r"\bstokla(?:mak|yacağım|yacagim|malıyım|maliyim)",
+        r"\bwhat\s+should\s+i\s+(?:buy|stock)\b",
+        r"\bwhat\s+(?:cars?|vehicles?)\s+should\s+i\s+(?:buy|stock)\b",
+        r"\bwhat\s+should\s+we\s+(?:buy|stock)\b",
+        r"\bwhich\s+(?:cars?|vehicles?|models?)\s+should\s+(?:i|we)\s+(?:buy|stock)\b",
+        r"\bstocking\s+opportunit",
+        r"\bbuy\s+for\s+(?:my|our)\s+(?:stock|inventory|dealership)\b",
+        r"\bчто\s+(?:купить|закупить)\b",
+        r"\bкакие\s+машины\s+(?:купить|закупить)\b",
+    ]
+
+    has_commercial = any(re.search(p, low, flags=re.IGNORECASE) for p in commercial_cues)
+    has_acquire = any(re.search(p, low, flags=re.IGNORECASE) for p in acquire_cues)
+
+    return bool(has_commercial and has_acquire)
+
+
+def _business_parse_budget(message):
+    raw = str(message or "")
+
+    patterns = [
+        r"£\s*([0-9]+(?:[.,][0-9]+)?\s*[kK]?)",
+        r"\b([0-9]+(?:[.,][0-9]+)?\s*[kK]?)\s*£",
+        r"\b([0-9]+(?:[.,][0-9]+)?)\s*(?:k|K)\b",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, raw)
+        if not m:
+            continue
+
+        token = m.group(1).strip().replace(" ", "")
+        is_k = token.casefold().endswith("k")
+        token = token[:-1] if is_k else token
+        token = token.replace(",", ".")
+
+        try:
+            value = float(token)
+        except Exception:
+            continue
+
+        if is_k:
+            value *= 1000.0
+
+        if 500 <= value <= 500000:
+            return value
+
+    return None
+
+
+def _business_vehicle_type_filter(message):
+    low = str(message or "").casefold()
+
+    if re.search(r"\b(?:suv|crossover|4x4)\b", low):
+        return "SUV"
+    if re.search(r"\b(?:pickup|pick-up|pick up)\b", low):
+        return "PICKUP"
+    if re.search(r"\b(?:otomobil|car|cars|araba|arabalar|автомобил|машин)\b", low):
+        return "CAR"
+
+    return None
+
+
+def _business_market_type_mask(frame, requested_type=None):
+    vt = frame["VehicleType"].fillna("").astype(str).str.casefold()
+
+    # Business V1 focuses on normal dealership vehicle stock. Other vehicle
+    # classes remain in the source data but are not proactively recommended.
+    normal_market = (
+        vt.str.contains("otomobil", regex=False)
+        | vt.str.contains("suv", regex=False)
+        | vt.str.contains("pick", regex=False)
+        | vt.str.contains("arazi", regex=False)
+    )
+
+    if requested_type == "SUV":
+        return normal_market & (
+            vt.str.contains("suv", regex=False)
+            | vt.str.contains("arazi", regex=False)
+        )
+    if requested_type == "PICKUP":
+        return normal_market & vt.str.contains("pick", regex=False)
+    if requested_type == "CAR":
+        return normal_market & vt.str.contains("otomobil", regex=False)
+
+    return normal_market
+
+
+def _business_acquisition_candidates(message, limit=8):
+    if not BUSINESS_INTELLIGENCE_READY or business_market_df is None or business_market_df.empty:
+        return {
+            "success": False,
+            "error": "BUSINESS_INTELLIGENCE_NOT_READY",
+            "budget": _business_parse_budget(message),
+            "results": [],
+        }
+
+    work = business_market_df.copy()
+    requested_type = _business_vehicle_type_filter(message)
+    budget = _business_parse_budget(message)
+
+    work = work[_business_market_type_mask(work, requested_type)].copy()
+
+    # Prefer the more specific category/variant-year rows. Model-year rows remain
+    # available as fallback when the precise layer cannot produce enough options.
+    specific = work[work["BusinessGranularity"].str.upper() == "CATEGORY_YEAR"].copy()
+    fallback = work[work["BusinessGranularity"].str.upper() == "MODEL_YEAR"].copy()
+
+    def eligible(frame):
+        x = frame.copy()
+
+        if budget is not None:
+            # We do not know wholesale acquisition cost. CurrentStartingPrice is
+            # therefore only a live advertised-market affordability proxy.
+            x = x[
+                pd.to_numeric(x["CurrentStartingPrice"], errors="coerce").le(budget)
+            ].copy()
+
+        x = x[
+            x["AcquisitionSignal"].isin(
+                ["VERY_STRONG", "STRONG", "MODERATE", "WEAK", "CAUTION"]
+            )
+        ].copy()
+
+        signal_rank = {
+            "VERY_STRONG": 0,
+            "STRONG": 1,
+            "MODERATE": 2,
+            "WEAK": 3,
+            "CAUTION": 4,
+        }
+        evidence_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+
+        x["_signal_rank"] = x["AcquisitionSignal"].map(signal_rank).fillna(9)
+        x["_evidence_rank"] = x["EvidenceQuality"].map(evidence_rank).fillna(9)
+        x["_confidence_index"] = pd.to_numeric(
+            x.get("ConfidenceAdjustedOpportunityIndex"),
+            errors="coerce",
+        )
+        x["_opp_pct"] = pd.to_numeric(
+            x.get("OpportunityPercentile"),
+            errors="coerce",
+        )
+
+        return x.sort_values(
+            ["_signal_rank", "_evidence_rank", "_confidence_index", "_opp_pct"],
+            ascending=[True, True, False, False],
+            na_position="last",
+        )
+
+    ordered = pd.concat(
+        [eligible(specific), eligible(fallback)],
+        ignore_index=True,
+    )
+
+    if ordered.empty:
+        return {
+            "success": True,
+            "budget": budget,
+            "requested_type": requested_type,
+            "results": [],
+        }
+
+    # Avoid returning a page dominated by many variants of one model family.
+    selected = []
+    model_counts = {}
+    seen_variant_keys = set()
+
+    for row in ordered.to_dict("records"):
+        brand = str(row.get("Brand") or "").strip()
+        model = str(row.get("Model") or "").strip()
+        category = str(row.get("CategoryDetail") or "").strip()
+        year = row.get("Year")
+
+        family_key = (brand.casefold(), model.casefold())
+        variant_key = (
+            brand.casefold(),
+            model.casefold(),
+            category.casefold(),
+            int(year) if pd.notna(year) else None,
+        )
+
+        if variant_key in seen_variant_keys:
+            continue
+        if model_counts.get(family_key, 0) >= 1:
+            continue
+
+        selected.append(row)
+        seen_variant_keys.add(variant_key)
+        model_counts[family_key] = model_counts.get(family_key, 0) + 1
+
+        if len(selected) >= int(limit):
+            break
+
+    public = []
+    for row in selected:
+        public.append({
+            "vehicle_type": str(row.get("VehicleType") or "").strip(),
+            "brand": str(row.get("Brand") or "").strip(),
+            "model": str(row.get("Model") or "").strip(),
+            "category": str(row.get("CategoryDetail") or "").strip(),
+            "year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
+            "current_listings": (
+                int(row["CurrentListings"])
+                if pd.notna(row.get("CurrentListings")) else None
+            ),
+            "starting_price": (
+                float(row["CurrentStartingPrice"])
+                if pd.notna(row.get("CurrentStartingPrice")) else None
+            ),
+            "median_price": (
+                float(row["CurrentMedianPrice"])
+                if pd.notna(row.get("CurrentMedianPrice")) else None
+            ),
+            "historical_median_observed_days_to_exit": (
+                float(row["MedianObservedDaysToExit"])
+                if pd.notna(row.get("MedianObservedDaysToExit")) else None
+            ),
+            "observed_exit_within_60_days_rate": (
+                float(row["ObservedExitWithin60DaysRate"])
+                if pd.notna(row.get("ObservedExitWithin60DaysRate")) else None
+            ),
+            "historical_price_reduction_rate": (
+                float(row["PriceReductionRate"])
+                if pd.notna(row.get("PriceReductionRate")) else None
+            ),
+            "evidence_quality": str(row.get("EvidenceQuality") or "").strip(),
+            "liquidity_benchmark_source": str(
+                row.get("HistoricalBenchmarkSourceLiquidity") or ""
+            ).strip(),
+            "price_pressure_benchmark_source": str(
+                row.get("HistoricalBenchmarkSourcePricePressure") or ""
+            ).strip(),
+            "opportunity_percentile": (
+                float(row["OpportunityPercentile"])
+                if pd.notna(row.get("OpportunityPercentile")) else None
+            ),
+            "acquisition_signal": str(row.get("AcquisitionSignal") or "").strip(),
+            "acquisition_reasons": [
+                x for x in str(row.get("AcquisitionReasons") or "").split("|") if x
+            ],
+        })
+
+    return {
+        "success": True,
+        "budget": budget,
+        "requested_type": requested_type,
+        "results": public,
+    }
+
+
+def _business_pct(value):
+    if value is None or pd.isna(value):
+        return None
+    return round(float(value) * 100.0)
+
+
+def _business_money(value):
+    if value is None or pd.isna(value):
+        return None
+    return f"£{float(value):,.0f}"
+
+
+def _business_acquisition_answer(message, language):
+    result = _business_acquisition_candidates(message, limit=8)
+
+    if not result.get("success"):
+        fallback = {
+            "TR": "Business piyasa verisi şu anda hazır değil. Lütfen biraz sonra tekrar deneyin.",
+            "EN": "The Business market data is not ready right now. Please try again shortly.",
+            "RU": "Данные Business по рынку сейчас недоступны. Попробуйте ещё раз чуть позже.",
+        }
+        return fallback.get(language, fallback["TR"]), result
+
+    candidates = result.get("results") or []
+    budget = result.get("budget")
+
+    if not candidates:
+        fallback = {
+            "TR": "Bu bütçe ve araç tipi için yeterli kanıta sahip bir stok fırsatı bulamadım.",
+            "EN": "I couldn't find a stocking opportunity with sufficient evidence for that budget and vehicle type.",
+            "RU": "Я не нашёл достаточно подтверждённых вариантов для закупки в рамках этого бюджета и типа автомобиля.",
+        }
+        return fallback.get(language, fallback["TR"]), result
+
+    lines = []
+
+    for idx, item in enumerate(candidates, 1):
+        name_bits = [
+            str(item.get("year") or "").strip(),
+            item.get("brand") or "",
+            item.get("model") or "",
+        ]
+        if item.get("category"):
+            name_bits.append(item["category"])
+        vehicle_name = " ".join(x for x in name_bits if x).strip()
+
+        starting = _business_money(item.get("starting_price"))
+        median = _business_money(item.get("median_price"))
+        exit60 = _business_pct(item.get("observed_exit_within_60_days_rate"))
+        reduction = _business_pct(item.get("historical_price_reduction_rate"))
+
+        evidence = item.get("evidence_quality") or "—"
+        signal = item.get("acquisition_signal") or "—"
+
+        if language == "EN":
+            evidence_bits = []
+            if exit60 is not None:
+                evidence_bits.append(f"{exit60}% observed 60-day exit rate")
+            if reduction is not None:
+                evidence_bits.append(f"{reduction}% historical asking-price reduction rate")
+            if item.get("current_listings") is not None:
+                evidence_bits.append(f"{item['current_listings']} current listings")
+            market_part = (
+                f"Current asking range starts around {starting}"
+                + (f", median {median}" if median else "")
+                + "."
+                if starting else ""
+            )
+            lines.append(
+                f"{idx}. {vehicle_name} — {signal.replace('_', ' ').title()} "
+                f"({evidence} evidence)\n"
+                f"   {market_part} "
+                + (", ".join(evidence_bits) + "." if evidence_bits else "")
+            )
+        elif language == "RU":
+            evidence_bits = []
+            if exit60 is not None:
+                evidence_bits.append(f"наблюдаемый выход с рынка за 60 дней: {exit60}%")
+            if reduction is not None:
+                evidence_bits.append(f"историческая доля снижения цены: {reduction}%")
+            if item.get("current_listings") is not None:
+                evidence_bits.append(f"активных объявлений: {item['current_listings']}")
+            market_part = (
+                f"Текущие цены начинаются примерно от {starting}"
+                + (f", медиана {median}" if median else "")
+                + "."
+                if starting else ""
+            )
+            lines.append(
+                f"{idx}. {vehicle_name} — {signal.replace('_', ' ')} "
+                f"(достоверность: {evidence})\n"
+                f"   {market_part} "
+                + (", ".join(evidence_bits) + "." if evidence_bits else "")
+            )
+        else:
+            evidence_bits = []
+            if exit60 is not None:
+                evidence_bits.append(f"60 günde gözlenen piyasa çıkış oranı %{exit60}")
+            if reduction is not None:
+                evidence_bits.append(f"tarihsel fiyat indirimi oranı %{reduction}")
+            if item.get("current_listings") is not None:
+                evidence_bits.append(f"güncel {item['current_listings']} ilan")
+            market_part = (
+                f"Güncel ilanlar yaklaşık {starting}'dan başlıyor"
+                + (f", medyan {median}" if median else "")
+                + "."
+                if starting else ""
+            )
+            signal_tr = {
+                "VERY_STRONG": "Çok güçlü",
+                "STRONG": "Güçlü",
+                "MODERATE": "Orta",
+                "WEAK": "Zayıf",
+                "CAUTION": "Dikkat",
+            }.get(signal, signal)
+            evidence_tr = {
+                "HIGH": "yüksek",
+                "MEDIUM": "orta",
+                "LOW": "düşük",
+            }.get(evidence, evidence.casefold())
+            lines.append(
+                f"{idx}. {vehicle_name} — {signal_tr} "
+                f"({evidence_tr} kanıt)\n"
+                f"   {market_part} "
+                + (", ".join(evidence_bits) + "." if evidence_bits else "")
+            )
+
+    if language == "EN":
+        intro = (
+            f"Using current advertised-market levels"
+            + (f" within roughly a {_business_money(budget)} ceiling" if budget else "")
+            + ", these are the strongest evidence-backed stocking opportunities I can identify:"
+        )
+        note = (
+            "This is a market-opportunity ranking, not a wholesale purchase-price or profit prediction. "
+            "I do not yet know your actual acquisition cost, so current asking prices are being used only as a market-level affordability reference."
+        )
+    elif language == "RU":
+        intro = (
+            "По текущим рыночным объявлениям"
+            + (f" и ориентиру примерно до {_business_money(budget)}" if budget else "")
+            + " наиболее сильные подтверждённые варианты для закупки выглядят так:"
+        )
+        note = (
+            "Это рейтинг рыночной привлекательности, а не прогноз закупочной цены или прибыли. "
+            "Фактическая закупочная стоимость мне пока неизвестна, поэтому текущие цены объявлений используются только как ориентир."
+        )
+    else:
+        intro = (
+            "Güncel ilan piyasasını"
+            + (f" ve yaklaşık {_business_money(budget)} bütçe tavanını" if budget else "")
+            + " dikkate aldığımda, verinin en güçlü desteklediği stok seçenekleri şunlar:"
+        )
+        note = (
+            "Bu bir piyasa fırsatı sıralamasıdır; alış maliyeti veya kâr tahmini değildir. "
+            "Gerçek alış maliyetinizi henüz bilmediğim için güncel ilan fiyatlarını yalnızca piyasa/bütçe referansı olarak kullanıyorum."
+        )
+
+    return intro + "\n\n" + "\n\n".join(lines) + "\n\n" + note, result
+
+
 @app.route("/api/assistant", methods=["POST"])
 def api_ai_buying_assistant():
     request_started = time.perf_counter()
@@ -4401,6 +7089,273 @@ def api_ai_buying_assistant():
                 "success": False,
                 "error": "MESSAGE_REQUIRED"
             }), 400
+
+        if len(message) > ASSISTANT_MAX_MESSAGE_CHARS:
+            return jsonify({
+                "success": False,
+                "error": "MESSAGE_TOO_LONG",
+                "max_chars": ASSISTANT_MAX_MESSAGE_CHARS,
+            }), 413
+
+        allowed, retry_after = _assistant_request_allowed()
+        if not allowed:
+            response = jsonify({
+                "success": False,
+                "error": "RATE_LIMITED",
+                "retry_after_seconds": retry_after,
+            })
+            response.status_code = 429
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+
+        # Unified account / Business context.
+        # The frontend may already send these fields now; later authentication
+        # and payments can populate them automatically.
+        access_tier = _normalize_access_tier(
+            data.get("access_tier") or data.get("tier")
+        )
+        requested_business_company = str(
+            data.get("business_company") or ""
+        ).strip() or None
+
+        resolved_business_company = _resolve_business_company_context(
+            message=message,
+            conversation_history=conversation_history,
+            requested_company=requested_business_company,
+        )
+
+        business_capabilities = _business_capabilities_payload(
+            access_tier=access_tier,
+            company=resolved_business_company,
+        )
+
+        # Protect proprietary data from bulk reconstruction attempts before
+        # any search or model call is made.
+        if _looks_like_dataset_extraction_request(message):
+            fallback = _fallback_support_payload(language)
+            return jsonify({
+                "success": True,
+                "answer": _data_protection_answer(language),
+                "filters": current_filters,
+                "preferences": current_preferences,
+                "count": 0,
+                "returned": 0,
+                "results": [],
+                "model_options": [],
+                "suggestions": fallback["suggestions"],
+                "actions": fallback["actions"],
+                "decision_mode": "PROTECTED_DATA",
+                "stage": "protected_data",
+                "access_tier": access_tier,
+                "business_capabilities": business_capabilities,
+            })
+
+        # Own-car valuation is a first-class OtoDeğer flow, not a generative
+        # approximation inside chat.
+        if _valuation_intent(message):
+            valuation = _valuation_response(language)
+            return jsonify({
+                "success": True,
+                "answer": valuation["answer"],
+                "filters": current_filters,
+                "preferences": current_preferences,
+                "count": 0,
+                "returned": 0,
+                "results": [],
+                "model_options": [],
+                "actions": valuation["actions"],
+                "decision_mode": "VALUATION",
+                "stage": "valuation_handoff",
+                "access_tier": access_tier,
+                "business_capabilities": business_capabilities,
+            })
+
+        # Business V5: dealer-market understanding.
+        # Broad commercial market questions are handled here before stock-specific
+        # actions, while ordinary Personal shopping questions remain untouched.
+        if _business_market_intent(message):
+            business_started = time.perf_counter()
+            business_answer, business_result = _business_market_answer(
+                message=message,
+                language=language,
+            )
+            business_seconds = time.perf_counter() - business_started
+            total_seconds = time.perf_counter() - request_started
+
+            print(
+                f"ASSISTANT_TIMING mode=BUSINESS_MARKET "
+                f"business={business_seconds:.2f}s total={total_seconds:.2f}s",
+                flush=True,
+            )
+
+            return jsonify({
+                "success": True,
+                "answer": business_answer,
+                "filters": current_filters,
+                "preferences": current_preferences,
+                "count": len(business_result.get("rows") or []),
+                "returned": 0,
+                "results": [],
+                "model_options": [],
+                "business_options": business_result.get("rows") or [],
+                "business_market_mode": business_result.get("mode"),
+                "business_company": resolved_business_company,
+                "business_intelligence_version": BUSINESS_INTELLIGENCE_VERSION,
+                "business_capabilities": business_capabilities,
+                "access_tier": access_tier,
+                "decision_mode": "BUSINESS_MARKET",
+                "stage": "business_market_understanding",
+            })
+
+        # Business V4: aging-stock / inventory-action questions.
+        # This runs before pricing because a question such as
+        # "This has been sitting 73 days — should I reduce it?" is primarily
+        # an inventory-management decision that uses pricing as one input.
+        if _business_manage_intent(message):
+            business_started = time.perf_counter()
+            business_answer, business_result = _business_manage_answer(
+                message=message,
+                language=language,
+                requested_company=resolved_business_company,
+            )
+            business_seconds = time.perf_counter() - business_started
+            total_seconds = time.perf_counter() - request_started
+
+            print(
+                f"ASSISTANT_TIMING mode=BUSINESS_MANAGE "
+                f"business={business_seconds:.2f}s total={total_seconds:.2f}s",
+                flush=True,
+            )
+
+            return jsonify({
+                "success": True,
+                "answer": business_answer,
+                "filters": current_filters,
+                "preferences": current_preferences,
+                "count": len(business_result.get("vehicles") or []),
+                "returned": 0,
+                "results": [],
+                "model_options": [],
+                "business_options": business_result.get("vehicles") or [],
+                "business_company": business_result.get("company"),
+                "business_intelligence_version": BUSINESS_INTELLIGENCE_VERSION,
+                "business_capabilities": business_capabilities,
+                "access_tier": access_tier,
+                "decision_mode": "BUSINESS_MANAGE",
+                "stage": "business_inventory_action",
+            })
+
+        # Business V3: competitive pricing / price-position questions.
+        # This runs before generic stock-health routing so a request such as
+        # "Which cars in my stock are overpriced?" is treated as pricing.
+        if _business_price_intent(message):
+            business_started = time.perf_counter()
+            business_answer, business_result = _business_price_answer(
+                message=message,
+                language=language,
+                requested_company=resolved_business_company,
+            )
+            business_seconds = time.perf_counter() - business_started
+            total_seconds = time.perf_counter() - request_started
+
+            print(
+                f"ASSISTANT_TIMING mode=BUSINESS_PRICE "
+                f"business={business_seconds:.2f}s total={total_seconds:.2f}s",
+                flush=True,
+            )
+
+            return jsonify({
+                "success": True,
+                "answer": business_answer,
+                "filters": current_filters,
+                "preferences": current_preferences,
+                "count": len(business_result.get("vehicles") or []),
+                "returned": 0,
+                "results": [],
+                "model_options": [],
+                "business_options": business_result.get("vehicles") or [],
+                "business_company": business_result.get("company"),
+                "business_intelligence_version": BUSINESS_INTELLIGENCE_VERSION,
+                "business_capabilities": business_capabilities,
+                "access_tier": access_tier,
+                "decision_mode": "BUSINESS_PRICE",
+                "stage": "business_pricing",
+            })
+
+        # Business V2: own-stock / inventory-health questions.
+        if _business_stock_intent(message):
+            business_started = time.perf_counter()
+            business_answer, business_result = _business_stock_answer(
+                message=message,
+                language=language,
+                requested_company=resolved_business_company,
+            )
+            business_seconds = time.perf_counter() - business_started
+            total_seconds = time.perf_counter() - request_started
+
+            print(
+                f"ASSISTANT_TIMING mode=BUSINESS_STOCK "
+                f"business={business_seconds:.2f}s total={total_seconds:.2f}s",
+                flush=True,
+            )
+
+            return jsonify({
+                "success": True,
+                "answer": business_answer,
+                "filters": current_filters,
+                "preferences": current_preferences,
+                "count": len(business_result.get("priority_vehicles") or []),
+                "returned": 0,
+                "results": [],
+                "model_options": [],
+                "business_options": business_result.get("priority_vehicles") or [],
+                "business_company": business_result.get("company"),
+                "business_summary": business_result.get("summary"),
+                "business_intelligence_version": BUSINESS_INTELLIGENCE_VERSION,
+                "business_capabilities": business_capabilities,
+                "access_tier": access_tier,
+                "decision_mode": "BUSINESS_STOCK",
+                "stage": "business_stock_health",
+            })
+
+        # Business V1 acquisition/stocking questions.
+        # This branch is deliberately conservative and only activates when the
+        # user explicitly frames the request as a gallery/dealer/stock decision.
+        # Ordinary Personal DISCOVER / COMPARE / SHOP requests continue through
+        # the existing buyer pipeline unchanged below.
+        if _business_acquire_intent(message, conversation_history):
+            business_started = time.perf_counter()
+            business_answer, business_result = _business_acquisition_answer(
+                message=message,
+                language=language,
+            )
+            business_seconds = time.perf_counter() - business_started
+            total_seconds = time.perf_counter() - request_started
+
+            print(
+                f"ASSISTANT_TIMING mode=BUSINESS_ACQUIRE "
+                f"business={business_seconds:.2f}s total={total_seconds:.2f}s",
+                flush=True,
+            )
+
+            return jsonify({
+                "success": True,
+                "answer": business_answer,
+                "filters": current_filters,
+                "preferences": current_preferences,
+                "count": len(business_result.get("results") or []),
+                "returned": 0,
+                "results": [],
+                "model_options": [],
+                "business_options": business_result.get("results") or [],
+                "business_budget": business_result.get("budget"),
+                "business_vehicle_type": business_result.get("requested_type"),
+                "business_intelligence_version": BUSINESS_INTELLIGENCE_VERSION,
+                "business_capabilities": business_capabilities,
+                "access_tier": access_tier,
+                "decision_mode": "BUSINESS_ACQUIRE",
+                "stage": "business_recommendation",
+            })
 
         resolve_started = time.perf_counter()
         resolved_targets = resolve_market_vehicle_mentions(message)
@@ -4890,7 +7845,7 @@ def api_ai_buying_assistant():
             )
 
         if guide_question:
-            public_results = (search_result.get("results") or [])[:100]
+            public_results = (search_result.get("results") or [])[:PUBLIC_ASSISTANT_RESULT_CAP]
             return jsonify({
                 "success": True,
                 "answer": guide_question,
@@ -4940,6 +7895,12 @@ def api_ai_buying_assistant():
             public_results = (
                 advisory_results or search_result.get("results") or []
             )[:100]
+        fallback_support = (
+            _fallback_support_payload(language)
+            if int(search_result.get("count", 0) or 0) == 0
+            else {"suggestions": [], "actions": []}
+        )
+
         return jsonify({
             "success": True,
             "answer": answer,
@@ -4954,7 +7915,18 @@ def api_ai_buying_assistant():
             "resolved_vehicle_targets": resolved_targets,
             "decision_mode": decision_mode,
             "stage": "recommendation",
+            "suggestions": fallback_support["suggestions"],
+            "actions": fallback_support["actions"],
+            "access_tier": access_tier,
+            "business_capabilities": business_capabilities,
         })
+
+    except AIUsageLimitExceeded as e:
+        print("AI USAGE LIMIT:", str(e), flush=True)
+        return jsonify({
+            "success": False,
+            "error": "AI_USAGE_LIMIT_REACHED",
+        }), 429
 
     except requests.HTTPError as e:
         status_code = (
@@ -4978,9 +7950,7 @@ def api_ai_buying_assistant():
 
         return jsonify({
             "success": False,
-            "error": "AI_ASSISTANT_FAILED",
-            "openai_status": status_code,
-            "openai_message": response_text
+            "error": "AI_ASSISTANT_TEMPORARILY_UNAVAILABLE"
         }), 502
 
     except RuntimeError as e:
@@ -5009,7 +7979,27 @@ def api_ai_buying_assistant():
 def api_market_search():
 
     try:
+        allowed, retry_after = _search_request_allowed()
+        if not allowed:
+            response = jsonify({
+                "success": False,
+                "error": "RATE_LIMITED",
+                "retry_after_seconds": retry_after,
+                "count": 0,
+                "returned": 0,
+                "results": [],
+            })
+            response.status_code = 429
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+
         data = request.json or {}
+
+        try:
+            requested_limit = int(data.get("limit", 20))
+        except (TypeError, ValueError):
+            requested_limit = 20
+        safe_limit = max(1, min(requested_limit, PUBLIC_SEARCH_RESULT_CAP))
 
         result = market_search(
             budget=data.get("budget"),
@@ -5039,7 +8029,7 @@ def api_market_search():
             min_km=data.get("min_km"),
             max_km=data.get("max_km"),
 
-            limit=data.get("limit", 20)
+            limit=safe_limit
         )
 
         return jsonify(result)
