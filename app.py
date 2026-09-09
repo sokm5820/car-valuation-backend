@@ -353,6 +353,61 @@ def _looks_like_gibberish_message(message):
     return vowel_ratio < 0.16
 
 
+
+def _expand_contextual_short_answer(message, conversation_history):
+    """
+    Expand an otherwise ambiguous short numeric reply when the immediately
+    preceding assistant turn explicitly asked for a maximum budget.
+
+    Example:
+        assistant: "Sure — what's your maximum budget?"
+        user:      "15.000"
+    becomes internally:
+        "My maximum budget is £15,000"
+
+    This is intentionally narrow so ordinary numbers are not reinterpreted.
+    """
+    raw = str(message or "").strip()
+    if not raw or not conversation_history:
+        return raw
+
+    # Currency-bearing answers already have enough context for the normal parser.
+    if re.search(r"£|\b(?:gbp|pounds?|sterlin)\b", raw, re.I):
+        return raw
+
+    # Only accept a short numeric answer here.
+    if not re.fullmatch(r"\s*\d[\d.,\s]*\s*[kK]?\s*", raw):
+        return raw
+
+    previous_assistant = ""
+    for item in reversed(conversation_history or []):
+        if str(item.get("role") or "").casefold() == "assistant":
+            previous_assistant = str(item.get("text") or item.get("content") or "").strip()
+            break
+
+    if not previous_assistant:
+        return raw
+
+    asked_budget = bool(re.search(
+        r"(?:maximum|max(?:imum)?|maksimum|максимальн\w*)\s+(?:budget|bütçe|butce|бюджет)|"
+        r"(?:budget|bütçe|butce|бюджет).{0,20}(?:maximum|max|maksimum|максимальн\w*)",
+        previous_assistant,
+        re.I,
+    ))
+    if not asked_budget:
+        return raw
+
+    amount = _parse_human_number(raw)
+    if amount is None:
+        return raw
+
+    # A short reply such as "15" after a budget question is naturally £15k in
+    # this market; explicit larger values remain literal.
+    if re.fullmatch(r"\s*\d{1,3}\s*", raw) and amount < 1000:
+        amount *= 1000
+
+    return f"My maximum budget is £{int(round(amount)):,}"
+
 def _unsupported_input_answer(language):
     answers = {
         "TR": (
@@ -3253,7 +3308,18 @@ def _group_market_models(results, max_groups=350):
 
         # Conservative price-only opportunity signal. Prefer same-year + same
         # category peers when at least 3 exist; otherwise use same-year peers.
+        #
+        # The opportunity must also be relevant to the buyer's current search.
+        # When newer matching years exist, do not surface an old cheap car merely
+        # because it is far below the median for its own year.
         best_deal = None
+        relevance_floor_year = None
+        if years:
+            max_matching_year = max(years)
+            # Keep the signal close to the newest cars that actually satisfy the
+            # buyer's current hard filters (budget/km/etc.).
+            relevance_floor_year = max_matching_year - 2
+
         for candidate in raw_items:
             try:
                 candidate_price = float(candidate.get("price"))
@@ -3261,6 +3327,8 @@ def _group_market_models(results, max_groups=350):
             except (TypeError, ValueError):
                 continue
             if candidate_price <= 0:
+                continue
+            if relevance_floor_year is not None and candidate_year < relevance_floor_year:
                 continue
 
             candidate_category = str(candidate.get("category") or "").strip().casefold()
@@ -4135,6 +4203,49 @@ def _fast_compare_answer(message, language, filters, model_options):
             return None
         return f"{n:,}" if language != "TR" else f"{n:,}".replace(",", ".")
 
+    def liquidity_status(option):
+        bi = option.get("buyer_intelligence") or {}
+        days = bi.get("median_observed_days_to_exit")
+        confidence = str(bi.get("liquidity_confidence") or "").strip().upper()
+
+        if days is None or confidence in {"LOW", "INSUFFICIENT", ""}:
+            return "INSUFFICIENT", None
+
+        try:
+            days = float(days)
+        except (TypeError, ValueError):
+            return "INSUFFICIENT", None
+
+        if days <= 25:
+            return "FAST", days
+        if days <= 40:
+            return "MEDIUM", days
+        return "SLOW", days
+
+    def liquidity_label(option):
+        status, _ = liquidity_status(option)
+        labels = {
+            "EN": {
+                "FAST": "Fast",
+                "MEDIUM": "Medium",
+                "SLOW": "Slow",
+                "INSUFFICIENT": "Not enough data",
+            },
+            "TR": {
+                "FAST": "Hızlı",
+                "MEDIUM": "Orta",
+                "SLOW": "Yavaş",
+                "INSUFFICIENT": "Yeterli veri yok",
+            },
+            "RU": {
+                "FAST": "Высокая",
+                "MEDIUM": "Средняя",
+                "SLOW": "Низкая",
+                "INSUFFICIENT": "Недостаточно данных",
+            },
+        }
+        return labels.get(language, labels["EN"]).get(status, status)
+
     # Determine factual leaders.
     newest_winner = max(chosen, key=lambda o: (int(o.get("newest_year") or 0), int(o.get("count") or 0)))
     choice_winner = max(chosen, key=lambda o: int(o.get("count") or 0))
@@ -4303,8 +4414,6 @@ def _fast_compare_answer(message, language, filters, model_options):
                     + (f" — yaklaşık {pct_text} daha düşük" if pct_text else "")
                     + "."
                 )
-                if deal_link:
-                    deal_text += f" {deal_link}"
                 deal_text += " Bu yalnızca ilan fiyatına dayalı bir sinyaldir; kilometre, donanım ve kondisyon farkı açıklayabilir."
             elif language == "RU":
                 deal_text = (
@@ -4313,8 +4422,6 @@ def _fast_compare_answer(message, language, filters, model_options):
                     + (f" — примерно на {pct_text} ниже" if pct_text else "")
                     + "."
                 )
-                if deal_link:
-                    deal_text += f" {deal_link}"
                 deal_text += " Это сигнал только по цене объявления; пробег, комплектация и состояние могут объяснять разницу."
             else:
                 deal_text = (
@@ -4323,8 +4430,6 @@ def _fast_compare_answer(message, language, filters, model_options):
                     + (f" — about {pct_text} lower" if pct_text else "")
                     + "."
                 )
-                if deal_link:
-                    deal_text += f" {deal_link}"
                 deal_text += " That's a price-only signal, so mileage, trim and condition still need checking."
 
         if language == "TR":
@@ -4335,9 +4440,7 @@ def _fast_compare_answer(message, language, filters, model_options):
                 facts += f" · başlangıç fiyatı {overall_price}"
                 if overall_price_year:
                     facts += f" ({overall_price_year})"
-            resale=""
-            if days is not None:
-                resale=f" Yeniden satış sinyali: tarihsel ilanlarda medyan gözlenen piyasa süresi yaklaşık {float(days):.0f} gün."
+            resale=f" Likidite: {liquidity_label(o)}."
             sections.append(f"{name}\n{facts}.{deal_text}{resale}")
         elif language == "RU":
             facts=f"{count} активных вариантов"
@@ -4347,9 +4450,7 @@ def _fast_compare_answer(message, language, filters, model_options):
                 facts += f" · цены от {overall_price}"
                 if overall_price_year:
                     facts += f" ({overall_price_year})"
-            resale=""
-            if days is not None:
-                resale=f" Сигнал ликвидности: историческая медиана наблюдаемого присутствия на рынке около {float(days):.0f} дней."
+            resale=f" Ликвидность: {liquidity_label(o)}."
             sections.append(f"{name}\n{facts}.{deal_text}{resale}")
         else:
             facts=f"{count} currently available"
@@ -4359,29 +4460,66 @@ def _fast_compare_answer(message, language, filters, model_options):
                 facts += f" · prices start from {overall_price}"
                 if overall_price_year:
                     facts += f" for a {overall_price_year}"
-            resale=""
-            if days is not None:
-                resale=f" Resale signal: historical listings had a median observed market presence of about {float(days):.0f} days."
+            resale=f" Liquidity: {liquidity_label(o)}."
             sections.append(f"{name}\n{facts}.{deal_text}{resale}")
 
+    comparable_liquidity = []
+    for o in chosen:
+        status, days_value = liquidity_status(o)
+        if days_value is not None:
+            comparable_liquidity.append((o, days_value))
+
+    relative_turnover = None
+    if len(comparable_liquidity) >= 2:
+        fastest_o, fastest_days = min(comparable_liquidity, key=lambda x: x[1])
+        slowest_o, slowest_days = max(comparable_liquidity, key=lambda x: x[1])
+        if slowest_days > 0 and fastest_days < slowest_days:
+            relative_turnover = (
+                fastest_o,
+                max(1, round((slowest_days - fastest_days) / slowest_days * 100)),
+            )
+
     if language == "TR":
-        close_parts=[]
-        close_parts.append(f"Daha fazla seçenek ve daha yeni araç bulma açısından {label(choice_winner)} öne çıkıyor.")
-        if liquidity_winner is not None:
-            close_parts.append(f"Yeniden satılabilirlik için sahip olduğumuz piyasa sinyallerinde {label(liquidity_winner)} daha hızlı gözlenen devir gösteriyor.")
-        close_parts.append("Değerini ne kadar koruyacağını bu verilerle güvenilir biçimde garanti edemeyiz. Piyasa devri, ilanların gözlemden çıkışını ölçer; doğrulanmış satış anlamına gelmez. Maksimum kilometrenizi söylerseniz karşılaştırmayı doğrudan o sınırın içindeki araçlara indirebilirim.")
+        close_parts=[f"Seçenek sayısı ve daha yeni araçlara erişim açısından {label(choice_winner)} daha güçlü."]
+        if relative_turnover:
+            faster_o, faster_pct = relative_turnover
+            close_parts.append(
+                f"Likidite tarafında {label(faster_o)} gözlenen piyasa verilerinde yaklaşık %{faster_pct} daha hızlı hareket ediyor."
+            )
+        elif liquidity_winner is not None:
+            close_parts.append(f"Likidite sinyali {label(liquidity_winner)} için daha güçlü.")
+        close_parts.append(
+            "Bu likidite sinyali ilanların gözlemden çıkış hızına dayanır; doğrulanmış satış anlamına gelmez. "
+            "Maksimum kilometrenizi söylerseniz karşılaştırmayı doğrudan o sınırdaki araçlara indirebilirim."
+        )
         closing=" ".join(close_parts)
     elif language == "RU":
-        close_parts=[f"По выбору и более новым машинам сильнее выглядит {label(choice_winner)}."]
-        if liquidity_winner is not None:
-            close_parts.append(f"По наблюдаемому рыночному обороту сигнал сильнее у {label(liquidity_winner)}.")
-        close_parts.append("Надёжно гарантировать сохранение стоимости по этим данным нельзя. Рыночный оборот отражает исчезновение объявления из наблюдаемого рынка, а не подтверждённую продажу. Укажите максимальный пробег — и я сравню только варианты в этом диапазоне.")
+        close_parts=[f"По выбору и доступу к более новым машинам сильнее {label(choice_winner)}."]
+        if relative_turnover:
+            faster_o, faster_pct = relative_turnover
+            close_parts.append(
+                f"По ликвидности {label(faster_o)} в наблюдаемых рыночных данных движется примерно на {faster_pct}% быстрее."
+            )
+        elif liquidity_winner is not None:
+            close_parts.append(f"Сигнал ликвидности сильнее у {label(liquidity_winner)}.")
+        close_parts.append(
+            "Сигнал ликвидности основан на скорости исчезновения объявлений из наблюдаемого рынка, а не на подтверждённых продажах. "
+            "Укажите максимальный пробег — и я сравню только подходящие варианты."
+        )
         closing=" ".join(close_parts)
     else:
         close_parts=[f"For choice and access to newer cars, {label(choice_winner)} is stronger."]
-        if liquidity_winner is not None:
-            close_parts.append(f"For resale ease, the historical market signal is stronger for {label(liquidity_winner)}, based on faster observed turnover.")
-        close_parts.append("The data cannot reliably guarantee which one will hold its value better. Market turnover reflects listing disappearance from the observed market, not confirmed sales. Give me your maximum mileage and I can compare only the cars that actually meet it.")
+        if relative_turnover:
+            faster_o, faster_pct = relative_turnover
+            close_parts.append(
+                f"For liquidity, {label(faster_o)} moves about {faster_pct}% quicker in the observed market data."
+            )
+        elif liquidity_winner is not None:
+            close_parts.append(f"The liquidity signal is stronger for {label(liquidity_winner)}.")
+        close_parts.append(
+            "Liquidity is based on how quickly listings leave the observed market, not confirmed sales. "
+            "Give me your maximum mileage and I can compare only the cars that actually meet it."
+        )
         closing=" ".join(close_parts)
 
     return intro + "\n\n" + "\n\n".join(sections) + "\n\n" + closing
@@ -4945,20 +5083,29 @@ def _recover_recent_compare_targets(message, conversation_history):
     if scope_switch:
         return []
 
+    # Do not search arbitrarily far back for an old comparison. The immediately
+    # preceding substantive USER request defines the active conversational task.
+    # This prevents:
+    #   compare Fit/Yaris -> new budget search -> economical -> "under 80,000 km"
+    # from resurrecting the old Fit/Yaris comparison.
     for item in reversed(conversation_history or []):
         if str(item.get("role") or "").casefold() != "user":
             continue
-        content = str(item.get("text") or item.get("content") or "")
+
+        content = str(item.get("text") or item.get("content") or "").strip()
+        if not content:
+            continue
+
         content_low = content.casefold()
         if not re.search(
             r"\b(?:compare|comparison|versus|vs\.?|karşılaştır|karsilastir|kıyasla|kiyasla|"
             r"сравни(?:ть|те)?|сравнение|против)\b",
             content_low,
         ):
-            continue
+            return []
+
         targets = resolve_market_vehicle_mentions(content)
-        if len(targets) >= 2:
-            return targets
+        return targets if len(targets) >= 2 else []
 
     return []
 
@@ -7376,6 +7523,11 @@ def api_ai_buying_assistant():
             company=resolved_business_company,
         )
 
+        # Resolve narrow conversational short answers before fallback detection.
+        # In particular, a bare "15.000" immediately after we asked for a maximum
+        # budget should be understood as the answer to that question.
+        message = _expand_contextual_short_answer(message, conversation_history)
+
         # Obvious unusable / keyboard-smash input should never be treated as a
         # broad shopping request and sent into guided narrowing.
         if _looks_like_gibberish_message(message):
@@ -8208,6 +8360,26 @@ def api_ai_buying_assistant():
             else {"suggestions": [], "actions": []}
         )
 
+        response_actions = list(fallback_support["actions"])
+        if decision_mode == "COMPARE":
+            for option in (model_options or [])[:4]:
+                deal = option.get("potential_value_listing") or {}
+                deal_url = str(deal.get("link") or "").strip()
+                if not deal_url:
+                    continue
+                vehicle_name = f"{option.get('brand','')} {option.get('model','')}".strip()
+                if language == "TR":
+                    action_label = f"{vehicle_name} ilanını aç"
+                elif language == "RU":
+                    action_label = f"Открыть объявление {vehicle_name}"
+                else:
+                    action_label = f"Open {vehicle_name} listing"
+                response_actions.append({
+                    "type": "LISTING",
+                    "label": action_label,
+                    "url": deal_url,
+                })
+
         return jsonify({
             "success": True,
             "answer": answer,
@@ -8223,7 +8395,7 @@ def api_ai_buying_assistant():
             "decision_mode": decision_mode,
             "stage": "recommendation",
             "suggestions": fallback_support["suggestions"],
-            "actions": fallback_support["actions"],
+            "actions": response_actions,
             "access_tier": access_tier,
             "business_capabilities": business_capabilities,
         })
