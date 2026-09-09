@@ -356,57 +356,84 @@ def _looks_like_gibberish_message(message):
 
 def _expand_contextual_short_answer(message, conversation_history):
     """
-    Expand an otherwise ambiguous short numeric reply when the immediately
-    preceding assistant turn explicitly asked for a maximum budget.
+    Resolve a bare numeric reply only when recent conversation makes its meaning
+    unambiguous. This is a deterministic safety net around the semantic controller.
 
-    Example:
-        assistant: "Sure — what's your maximum budget?"
-        user:      "15.000"
-    becomes internally:
-        "My maximum budget is £15,000"
+    Examples:
+        EN: "What's your maximum budget?" -> "15.000" => £15,000
+        TR: "Maksimum bütçeniz nedir?"     -> "15.000" => £15,000
+        RU: "Какой максимальный бюджет?"   -> "15.000" => £15,000
 
-    This is intentionally narrow so ordinary numbers are not reinterpreted.
+    It also recognizes the immediately preceding user's budget-oriented request
+    (e.g. "Bütçeme göre hangi araçları önerirsin?") if the assistant's wording
+    was a broader narrowing prompt.
     """
     raw = str(message or "").strip()
     if not raw or not conversation_history:
         return raw
 
-    # Currency-bearing answers already have enough context for the normal parser.
-    if re.search(r"£|\b(?:gbp|pounds?|sterlin)\b", raw, re.I):
+    # Currency-bearing replies already have enough semantic information.
+    if re.search(
+        r"£|\b(?:gbp|pounds?|sterlin|sterling|фунт(?:ов|а)?|фунт)\b",
+        raw,
+        re.I,
+    ):
         return raw
 
-    # Only accept a short numeric answer here.
+    # Only reinterpret genuinely short numeric answers.
     if not re.fullmatch(r"\s*\d[\d.,\s]*\s*[kK]?\s*", raw):
         return raw
 
     previous_assistant = ""
+    previous_user = ""
     for item in reversed(conversation_history or []):
-        if str(item.get("role") or "").casefold() == "assistant":
-            previous_assistant = str(item.get("text") or item.get("content") or "").strip()
+        role = str(item.get("role") or "").casefold()
+        value = str(item.get("text") or item.get("content") or "").strip()
+        if not value:
+            continue
+        if role == "assistant" and not previous_assistant:
+            previous_assistant = value
+        elif role == "user" and not previous_user:
+            previous_user = value
+        if previous_assistant and previous_user:
             break
 
-    if not previous_assistant:
-        return raw
-
-    asked_budget = bool(re.search(
-        r"(?:maximum|max(?:imum)?|maksimum|максимальн\w*)\s+(?:budget|bütçe|butce|бюджет)|"
-        r"(?:budget|bütçe|butce|бюджет).{0,20}(?:maximum|max|maksimum|максимальн\w*)",
+    # English, Turkish (including inflected forms), and Russian.
+    assistant_asked_budget = bool(re.search(
+        r"(?:maximum|max(?:imum)?)\s+budget|"
+        r"(?:maksimum|azami)\s+bütçe\w*|"
+        r"bütçe\w*.{0,25}(?:nedir|ne kadar|belirt|yaz)|"
+        r"(?:максимальн\w*)\s+бюджет\w*|"
+        r"бюджет\w*.{0,25}(?:какой|укажите|напишите)",
         previous_assistant,
         re.I,
     ))
-    if not asked_budget:
+
+    user_was_asking_budget_fit = bool(re.search(
+        r"\b(?:my\s+budget|budget\b|"
+        r"bütçe\w*|butce\w*|"
+        r"бюджет\w*)",
+        previous_user,
+        re.I,
+    ))
+
+    if not assistant_asked_budget and not user_was_asking_budget_fit:
         return raw
 
     amount = _parse_human_number(raw)
     if amount is None:
         return raw
 
-    # A short reply such as "15" after a budget question is naturally £15k in
-    # this market; explicit larger values remain literal.
+    # In a confirmed budget-answer context, "15" conventionally means £15k
+    # for this market. 15.000/15,000 are already parsed as 15000.
     if re.fullmatch(r"\s*\d{1,3}\s*", raw) and amount < 1000:
         amount *= 1000
 
+    if amount < 500 or amount > 500000:
+        return raw
+
     return f"My maximum budget is £{int(round(amount)):,}"
+
 
 def _unsupported_input_answer(language):
     answers = {
@@ -3459,7 +3486,10 @@ def guided_narrowing_question(filters, preferences, count, language="TR", messag
     # Ask for the missing thing the buyer actually referred to.
     asks_budget_fit = bool(re.search(
         r"\b(?:what|which).{0,25}(?:cars?|vehicles?).{0,25}(?:fit|within|under).{0,12}(?:my\s+)?budget\b|"
-        r"\b(?:budget|bütçe|butce|бюджет).{0,20}(?:cars?|vehicles?|araç|arac|araba|машин|автомоб)\b",
+        r"\bbudget\w*.{0,35}(?:cars?|vehicles?)\b|"
+        r"\bbütçe\w*.{0,35}(?:hangi|araç|arac|araba|öner|oner)\w*|"
+        r"\b(?:hangi|araç|arac|araba)\w*.{0,35}bütçe\w*|"
+        r"\bбюджет\w*.{0,35}(?:машин|автомоб|подойд|вариант)\w*",
         low_message,
         re.IGNORECASE,
     ))
@@ -4540,7 +4570,7 @@ def _fast_compare_answer(message, language, filters, model_options):
         )[0]
 
     same_market_winner = label(choice_winner) == label(newest_winner)
-    liquidity_label = label(liquidity_winner) if liquidity_winner is not None else None
+    liquidity_winner_label = label(liquidity_winner) if liquidity_winner is not None else None
 
     # Natural follow-up: "Which one would you choose based on the North Cyprus market?"
     # Keep this deterministic and evidence-bounded. A vehicle is recommended only
@@ -4633,8 +4663,8 @@ def _fast_compare_answer(message, language, filters, model_options):
             intro = prefix + f"{label(choice_winner)} hem daha fazla seçenek hem de daha yeni araçlara erişim sunuyor"
         else:
             intro = prefix + f"{label(choice_winner)} daha fazla seçenek sunarken {label(newest_winner)} daha yeni araçlara erişim sağlıyor"
-        if liquidity_label and liquidity_label != label(choice_winner):
-            intro += f"; {liquidity_label} ise tarihsel yeniden satış kolaylığı sinyalinde daha güçlü."
+        if liquidity_winner_label and liquidity_winner_label != label(choice_winner):
+            intro += f"; {liquidity_winner_label} ise tarihsel yeniden satış kolaylığı sinyalinde daha güçlü."
         else:
             intro += "."
     elif language == "RU":
@@ -4643,8 +4673,8 @@ def _fast_compare_answer(message, language, filters, model_options):
             intro = prefix + f"{label(choice_winner)} предлагает и больший выбор, и доступ к более новым автомобилям"
         else:
             intro = prefix + f"у {label(choice_winner)} больше выбора, а {label(newest_winner)} даёт доступ к более новым автомобилям"
-        if liquidity_label and liquidity_label != label(choice_winner):
-            intro += f"; при этом исторический сигнал по лёгкости перепродажи сильнее у {liquidity_label}."
+        if liquidity_winner_label and liquidity_winner_label != label(choice_winner):
+            intro += f"; при этом исторический сигнал по лёгкости перепродажи сильнее у {liquidity_winner_label}."
         else:
             intro += "."
     else:
@@ -4653,8 +4683,8 @@ def _fast_compare_answer(message, language, filters, model_options):
             intro = prefix + f"{label(choice_winner)} offers considerably more choice and access to newer cars"
         else:
             intro = prefix + f"{label(choice_winner)} offers more choice, while {label(newest_winner)} gives you access to newer cars"
-        if liquidity_label and liquidity_label != label(choice_winner):
-            intro += f", while {liquidity_label} has the stronger historical resale-ease signal."
+        if liquidity_winner_label and liquidity_winner_label != label(choice_winner):
+            intro += f", while {liquidity_winner_label} has the stronger historical resale-ease signal."
         else:
             intro += "."
 
