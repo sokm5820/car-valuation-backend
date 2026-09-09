@@ -286,17 +286,17 @@ def _valuation_response(language):
         "TR": (
             "Aracınızın güncel değerini özel değerleme aracımızla hesaplamak daha doğru olur. "
             "Yıl, marka, model ve versiyonu seçerek birkaç saniyede gerçek piyasa verilerine "
-            "dayalı değer aralığını görebilirsiniz. https://otodeger.online"
+            "dayalı değer aralığını görebilirsiniz."
         ),
         "EN": (
             "For your car's current value, the best route is our dedicated valuation tool. "
             "Select the year, make, model and version and it will show a market-data-based "
-            "value range in a few seconds. https://otodeger.online"
+            "value range in a few seconds."
         ),
         "RU": (
             "Для оценки текущей стоимости автомобиля лучше использовать наш специальный "
             "инструмент оценки. Выберите год, марку, модель и версию — и получите диапазон "
-            "стоимости на основе рыночных данных за несколько секунд. https://otodeger.online"
+            "стоимости на основе рыночных данных за несколько секунд."
         ),
     }
     labels = {
