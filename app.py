@@ -1610,6 +1610,17 @@ def resolve_market_vehicle_mentions(message):
             if category_n:
                 family["categories"][category_n] = category
 
+    # Some real model names are also ordinary words. Model-only matching for
+    # these names is dangerous because normal sentences can otherwise become a
+    # vehicle selection (for example: "What cars fit my budget?" -> Honda Fit).
+    #
+    # We still allow them when the user writes the model with its normal title
+    # casing (e.g. "Fit vs Yaris"), while full Brand + Model mentions always work.
+    ambiguous_model_only_norms = {
+        "fit", "one", "note", "up", "march", "focus", "golf"
+    }
+    raw_message = str(message or "")
+
     candidates = []
     for family in families.values():
         brand = family["brand"]
@@ -1621,14 +1632,28 @@ def resolve_market_vehicle_mentions(message):
         match_strength = 0
         if full_n and f" {full_n} " in padded_message:
             match_strength = 3
-        elif (
-            model_n
-            and len(model_n) >= 3
-            and model_n not in known_brand_norms
-            and f" {model_n} " in padded_message
-            and len(model_to_brands.get(model_n, set())) == 1
-        ):
-            match_strength = 2
+        else:
+            # For ambiguous word-like model names, require the model to appear
+            # with its canonical casing when the brand is omitted. This keeps
+            # natural language such as "cars fit my budget" from resolving to
+            # Honda Fit, while "Compare Fit and Yaris" remains usable.
+            ambiguous_model_only = model_n in ambiguous_model_only_norms
+            canonical_model_only_mention = bool(
+                re.search(
+                    rf"(?<!\\w){re.escape(model)}(?!\\w)",
+                    raw_message,
+                )
+            )
+
+            if (
+                model_n
+                and len(model_n) >= 3
+                and model_n not in known_brand_norms
+                and f" {model_n} " in padded_message
+                and len(model_to_brands.get(model_n, set())) == 1
+                and (not ambiguous_model_only or canonical_model_only_mention)
+            ):
+                match_strength = 2
 
         if not match_strength:
             continue
@@ -7473,6 +7498,11 @@ def api_ai_buying_assistant():
         resolved_targets = resolve_market_vehicle_mentions(message)
         resolved_targets = _attach_explicit_years_to_vehicle_targets(message, resolved_targets)
 
+        # Keep a snapshot before any history-based recovery. An explicit comparison
+        # named in the current message is a self-contained request and must not inherit
+        # stale budget/body-type/model constraints from an unrelated earlier search.
+        explicit_current_message_targets = [dict(t) for t in resolved_targets]
+
         # Contextual English pronoun "one" must not be mistaken for the real
         # vehicle model MINI One. Preserve genuine explicit MINI One requests,
         # but let phrases such as "which one would you choose?" and
@@ -7716,6 +7746,38 @@ def api_ai_buying_assistant():
             current_preferences,
             interpretation.get("preferences", []),
         )
+
+        # A newly stated, explicit multi-vehicle comparison is self-contained.
+        #
+        # Example:
+        #   "My budget is £15k" -> "I want an SUV" ->
+        #   "Compare Honda Fit and Toyota Yaris"
+        #
+        # The final request should compare those named vehicles, not silently retain
+        # the old SUV/budget search. Constraints written in the SAME comparison
+        # message (e.g. "under £15k") are preserved through interpretation["filters"].
+        explicit_named_multi_compare = (
+            decision_mode == "COMPARE"
+            and len(explicit_current_message_targets) >= 2
+        )
+        if explicit_named_multi_compare:
+            fresh_filters = sanitize_ai_filters(
+                interpretation.get("filters") or {}
+            )
+
+            # Brand/model/category are applied target-by-target below; leaving them
+            # as global filters would create invalid cross-products.
+            for key in (
+                "brands", "exclude_brands",
+                "models", "exclude_models",
+                "categories", "exclude_categories",
+            ):
+                fresh_filters.pop(key, None)
+
+            next_filters = fresh_filters
+            next_preferences = _canonicalize_buyer_preferences(
+                interpretation.get("preferences", []) or []
+            )
 
         # Deterministic scope-reset guard for explicit physical-class changes.
         # The interpreter remains responsible for soft use-cases, but phrases such
