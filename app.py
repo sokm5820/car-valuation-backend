@@ -284,20 +284,19 @@ def _valuation_intent(message):
 def _valuation_response(language):
     content = {
         "TR": (
-            "Aracınızın güncel değerini bunun için özel olarak geliştirdiğimiz "
-            "OtoDeğer değerleme aracıyla hesaplamak daha doğru olur. Yıl, marka, "
-            "model ve versiyonu seçerek birkaç saniyede gerçek piyasa verilerine "
-            "dayalı değer aralığını görebilirsiniz."
+            "Aracınızın güncel değerini özel değerleme aracımızla hesaplamak daha doğru olur. "
+            "Yıl, marka, model ve versiyonu seçerek birkaç saniyede gerçek piyasa verilerine "
+            "dayalı değer aralığını görebilirsiniz. https://otodeger.online"
         ),
         "EN": (
-            "For your car's current value, the best route is our dedicated OtoDeğer "
-            "valuation tool. Select the year, make, model and version and it will show "
-            "a market-data-based value range in a few seconds."
+            "For your car's current value, the best route is our dedicated valuation tool. "
+            "Select the year, make, model and version and it will show a market-data-based "
+            "value range in a few seconds. https://otodeger.online"
         ),
         "RU": (
-            "Для оценки текущей стоимости автомобиля лучше использовать специальный "
-            "инструмент OtoDeğer. Выберите год, марку, модель и версию — и получите "
-            "диапазон стоимости на основе рыночных данных за несколько секунд."
+            "Для оценки текущей стоимости автомобиля лучше использовать наш специальный "
+            "инструмент оценки. Выберите год, марку, модель и версию — и получите диапазон "
+            "стоимости на основе рыночных данных за несколько секунд. https://otodeger.online"
         ),
     }
     labels = {
@@ -314,6 +313,62 @@ def _valuation_response(language):
             "url": "https://otodeger.online",
         }],
     }
+
+
+
+def _looks_like_gibberish_message(message):
+    """
+    Catch obvious keyboard-smash / unusable input before the guided narrowing
+    flow mistakes it for a broad vehicle-shopping request.
+
+    This is deliberately conservative: normal short words, vehicle names,
+    budgets and sentences are not blocked.
+    """
+    text = str(message or "").strip()
+    if not text:
+        return True
+
+    # Real market/search signals should always pass through.
+    if re.search(r"£|\b\d{4}\b|\b\d+(?:[.,]\d+)?\s*(?:k|bin|gbp|pounds?|sterlin|km)\b", text, re.I):
+        return False
+
+    cleaned = re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşüА-Яа-яЁё]+", " ", text).strip()
+    tokens = [t for t in cleaned.split() if t]
+
+    if not tokens:
+        return True
+
+    # Only apply the keyboard-smash heuristic to very small inputs.
+    if len(tokens) > 2:
+        return False
+
+    joined = "".join(tokens).casefold()
+    if len(joined) < 6:
+        return False
+
+    vowels = set("aeiouyıöüâîûаеёиоуыэюя")
+    vowel_ratio = sum(ch in vowels for ch in joined) / max(1, len(joined))
+
+    # Examples: bgfbfgbfb, xzczxczxc. Keep the threshold conservative.
+    return vowel_ratio < 0.16
+
+
+def _unsupported_input_answer(language):
+    answers = {
+        "TR": (
+            "Ne demek istediğinizi anlayamadım. Araç önerileri, model karşılaştırmaları, "
+            "fiyat/piyasa analizi veya araç değerleme konusunda yardımcı olabilirim."
+        ),
+        "EN": (
+            "I'm not sure what you mean. I can help with vehicle recommendations, model "
+            "comparisons, pricing and market analysis, or valuing your car."
+        ),
+        "RU": (
+            "Я не уверен, что понял запрос. Я могу помочь с подбором автомобиля, сравнением "
+            "моделей, анализом цен и рынка или оценкой вашего автомобиля."
+        ),
+    }
+    return answers.get(language, answers["TR"])
 
 
 def _fallback_support_payload(language):
@@ -7128,6 +7183,27 @@ def api_ai_buying_assistant():
             access_tier=access_tier,
             company=resolved_business_company,
         )
+
+        # Obvious unusable / keyboard-smash input should never be treated as a
+        # broad shopping request and sent into guided narrowing.
+        if _looks_like_gibberish_message(message):
+            fallback = _fallback_support_payload(language)
+            return jsonify({
+                "success": True,
+                "answer": _unsupported_input_answer(language),
+                "filters": current_filters,
+                "preferences": current_preferences,
+                "count": 0,
+                "returned": 0,
+                "results": [],
+                "model_options": [],
+                "suggestions": fallback["suggestions"],
+                "actions": fallback["actions"],
+                "decision_mode": "FALLBACK",
+                "stage": "unsupported_input",
+                "access_tier": access_tier,
+                "business_capabilities": business_capabilities,
+            })
 
         # Protect proprietary data from bulk reconstruction attempts before
         # any search or model call is made.
