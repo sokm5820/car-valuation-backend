@@ -3059,7 +3059,7 @@ def _listing_sort_mode(preferences):
     return None
 
 
-def guided_narrowing_question(filters, preferences, count, language="TR"):
+def guided_narrowing_question(filters, preferences, count, language="TR", message=""):
     """Only guide when the request is genuinely too broad to be useful yet."""
     flags = _preference_flags(preferences)
 
@@ -3124,6 +3124,21 @@ def guided_narrowing_question(filters, preferences, count, language="TR"):
         },
     }
     t = copy.get(language, copy["TR"])
+    low_message = str(message or "").strip().casefold()
+
+    # Ask for the missing thing the buyer actually referred to.
+    asks_budget_fit = bool(re.search(
+        r"\b(?:what|which).{0,25}(?:cars?|vehicles?).{0,25}(?:fit|within|under).{0,12}(?:my\s+)?budget\b|"
+        r"\b(?:budget|bütçe|butce|бюджет).{0,20}(?:cars?|vehicles?|araç|arac|araba|машин|автомоб)\b",
+        low_message,
+        re.IGNORECASE,
+    ))
+    if asks_budget_fit and not has_budget:
+        return {
+            "TR": "Tabii — maksimum bütçeniz nedir?",
+            "RU": "Конечно — какой у вас максимальный бюджет?",
+            "EN": "Sure — what's your maximum budget?",
+        }.get(language, "Sure — what's your maximum budget?")
 
     missing = []
     if not has_budget:
@@ -3163,11 +3178,13 @@ def _group_market_models(results, max_groups=350):
             "prices": [],
             "years": [],
             "year_prices": {},
+            "_items": [],
             "kms": [],
             "transmissions": set(),
             "locations": set(),
         })
         bucket["count"] += 1
+        bucket["_items"].append(item)
 
         parsed_price = None
         parsed_year = None
@@ -3206,6 +3223,7 @@ def _group_market_models(results, max_groups=350):
         prices = bucket.pop("prices")
         years = bucket.pop("years")
         year_prices = bucket.pop("year_prices")
+        raw_items = bucket.pop("_items")
         kms = bucket.pop("kms")
         bucket["transmissions"] = sorted(bucket["transmissions"])
         bucket["locations"] = sorted(bucket["locations"])
@@ -3232,6 +3250,63 @@ def _group_market_models(results, max_groups=350):
 
         bucket["lowest_km"] = min(kms) if kms else None
         bucket["highest_km"] = max(kms) if kms else None
+
+        # Conservative price-only opportunity signal. Prefer same-year + same
+        # category peers when at least 3 exist; otherwise use same-year peers.
+        best_deal = None
+        for candidate in raw_items:
+            try:
+                candidate_price = float(candidate.get("price"))
+                candidate_year = int(candidate.get("year"))
+            except (TypeError, ValueError):
+                continue
+            if candidate_price <= 0:
+                continue
+
+            candidate_category = str(candidate.get("category") or "").strip().casefold()
+            same_year = []
+            same_year_category = []
+            for peer in raw_items:
+                try:
+                    peer_price = float(peer.get("price"))
+                    peer_year = int(peer.get("year"))
+                except (TypeError, ValueError):
+                    continue
+                if peer_price <= 0 or peer_year != candidate_year:
+                    continue
+                same_year.append(peer_price)
+                peer_category = str(peer.get("category") or "").strip().casefold()
+                if candidate_category and peer_category == candidate_category:
+                    same_year_category.append(peer_price)
+
+            benchmark_prices = same_year_category if len(same_year_category) >= 3 else same_year
+            if len(benchmark_prices) < 3:
+                continue
+
+            median_ask = float(pd.Series(benchmark_prices).median())
+            if median_ask <= 0 or candidate_price >= median_ask:
+                continue
+
+            below_median_pct = (median_ask - candidate_price) / median_ask
+            if below_median_pct < 0.05:
+                continue
+
+            deal = {
+                "year": candidate_year,
+                "price": candidate_price,
+                "median_asking_price": median_ask,
+                "below_median_pct": below_median_pct,
+                "comparison_count": len(benchmark_prices),
+                "comparison_scope": "same_year_category" if len(same_year_category) >= 3 else "same_year",
+                "km": candidate.get("km"),
+                "category": candidate.get("category"),
+                "company": candidate.get("company"),
+                "link": candidate.get("link"),
+            }
+            if best_deal is None or deal["below_median_pct"] > best_deal["below_median_pct"]:
+                best_deal = deal
+
+        bucket["potential_value_listing"] = best_deal
         summaries.append(bucket)
 
     summaries.sort(
@@ -4201,37 +4276,93 @@ def _fast_compare_answer(message, language, filters, model_options):
     for o in chosen:
         name=label(o)
         count=int(o.get("count") or 0)
-        year=o.get("newest_year")
-        price=_format_gbp(o.get("newest_year_starting_price"), language)
-        lo=km_text(o.get("lowest_km")); hi=km_text(o.get("highest_km"))
+        newest_year=o.get("newest_year")
+        newest_price=_format_gbp(o.get("newest_year_starting_price"), language)
+        overall_price=_format_gbp(o.get("starting_price"), language)
+        overall_price_year=o.get("starting_price_year")
         bi=o.get("buyer_intelligence") or {}
         days=bi.get("median_observed_days_to_exit")
-        rate=bi.get("exit_60_rate")
+        deal=o.get("potential_value_listing") or {}
+
+        deal_text = ""
+        if deal:
+            deal_price = _format_gbp(deal.get("price"), language)
+            deal_median = _format_gbp(deal.get("median_asking_price"), language)
+            deal_year = deal.get("year")
+            deal_link = str(deal.get("link") or "").strip()
+            try:
+                pct_number = float(deal.get("below_median_pct")) * 100
+                pct_text = f"{pct_number:.0f}%"
+            except (TypeError, ValueError):
+                pct_text = None
+
+            if language == "TR":
+                deal_text = (
+                    f" Potansiyel fırsat: {deal_year} model bir ilan {deal_price}; "
+                    f"karşılaştırılabilir güncel ilanların medyanı {deal_median}"
+                    + (f" — yaklaşık {pct_text} daha düşük" if pct_text else "")
+                    + "."
+                )
+                if deal_link:
+                    deal_text += f" {deal_link}"
+                deal_text += " Bu yalnızca ilan fiyatına dayalı bir sinyaldir; kilometre, donanım ve kondisyon farkı açıklayabilir."
+            elif language == "RU":
+                deal_text = (
+                    f" Потенциально интересное предложение: {deal_year} за {deal_price}; "
+                    f"медианная цена сопоставимых текущих объявлений — {deal_median}"
+                    + (f" — примерно на {pct_text} ниже" if pct_text else "")
+                    + "."
+                )
+                if deal_link:
+                    deal_text += f" {deal_link}"
+                deal_text += " Это сигнал только по цене объявления; пробег, комплектация и состояние могут объяснять разницу."
+            else:
+                deal_text = (
+                    f" Potential value listing: a {deal_year} is advertised at {deal_price} versus "
+                    f"a {deal_median} median asking price for comparable current listings"
+                    + (f" — about {pct_text} lower" if pct_text else "")
+                    + "."
+                )
+                if deal_link:
+                    deal_text += f" {deal_link}"
+                deal_text += " That's a price-only signal, so mileage, trim and condition still need checking."
 
         if language == "TR":
-            facts=f"{count} eşleşme"
-            if year and price: facts += f" · en yeni uygun yıl {year}, {price}'dan"
-            if lo and hi: facts += f" · km aralığı {lo}–{hi}"
+            facts=f"{count} aktif seçenek"
+            if newest_year and newest_price:
+                facts += f" · {newest_year} model {newest_price}'dan başlıyor"
+            elif overall_price:
+                facts += f" · başlangıç fiyatı {overall_price}"
+                if overall_price_year:
+                    facts += f" ({overall_price_year})"
             resale=""
             if days is not None:
-                resale=f" Tarihsel veride ilanların medyan gözlenen piyasa süresi yaklaşık {float(days):.0f} gündü."
-            sections.append(f"{name}\n{facts}.{resale}")
+                resale=f" Yeniden satış sinyali: tarihsel ilanlarda medyan gözlenen piyasa süresi yaklaşık {float(days):.0f} gün."
+            sections.append(f"{name}\n{facts}.{deal_text}{resale}")
         elif language == "RU":
-            facts=f"{count} подходящих вариантов"
-            if year and price: facts += f" · самый новый доступный год {year}, от {price}"
-            if lo and hi: facts += f" · пробег {lo}–{hi} км"
+            facts=f"{count} активных вариантов"
+            if newest_year and newest_price:
+                facts += f" · {newest_year} год от {newest_price}"
+            elif overall_price:
+                facts += f" · цены от {overall_price}"
+                if overall_price_year:
+                    facts += f" ({overall_price_year})"
             resale=""
             if days is not None:
-                resale=f" Историческая медиана наблюдаемого присутствия объявления на рынке составляла около {float(days):.0f} дней."
-            sections.append(f"{name}\n{facts}.{resale}")
+                resale=f" Сигнал ликвидности: историческая медиана наблюдаемого присутствия на рынке около {float(days):.0f} дней."
+            sections.append(f"{name}\n{facts}.{deal_text}{resale}")
         else:
-            facts=f"{count} matches"
-            if year and price: facts += f" · newest affordable {year} from {price}"
-            if lo and hi: facts += f" · advertised mileage range {lo}–{hi} km"
+            facts=f"{count} currently available"
+            if newest_year and newest_price:
+                facts += f" · {newest_year} starts from {newest_price}"
+            elif overall_price:
+                facts += f" · prices start from {overall_price}"
+                if overall_price_year:
+                    facts += f" for a {overall_price_year}"
             resale=""
             if days is not None:
-                resale=f" Historically, its listings showed a median observed market presence of about {float(days):.0f} days."
-            sections.append(f"{name}\n{facts}.{resale}")
+                resale=f" Resale signal: historical listings had a median observed market presence of about {float(days):.0f} days."
+            sections.append(f"{name}\n{facts}.{deal_text}{resale}")
 
     if language == "TR":
         close_parts=[]
@@ -8017,6 +8148,7 @@ def api_ai_buying_assistant():
                 preferences=next_preferences,
                 count=search_result.get("count", 0),
                 language=language,
+                message=message,
             )
 
         if guide_question:
