@@ -5202,6 +5202,39 @@ def _fast_shop_answer(language, filters, search_result, listing_candidates, pref
     return intro + "\n\n" + "\n".join(lines) + "\n\n" + closing
 
 
+
+def _requested_brand_presence_guard(message, model_options):
+    """
+    Lightweight evidence guard used before natural-language rendering.
+
+    Returns requested brand names that are visibly represented in the supplied
+    model_options. This does not invent availability and does not alter ranking;
+    it simply gives the renderer an explicit cross-brand presence signal so it
+    cannot incorrectly claim that a requested brand has no qualifying option.
+    """
+    msg = str(message or "").casefold()
+    options = list(model_options or [])
+
+    aliases = {
+        "BMW": ("bmw",),
+        "Mercedes-Benz": ("mercedes", "mercedes-benz", "mercedes benz"),
+    }
+
+    present = []
+    for canonical, terms in aliases.items():
+        if not any(term in msg for term in terms):
+            continue
+
+        found = any(
+            str(opt.get("brand") or "").strip().casefold() == canonical.casefold()
+            for opt in options
+        )
+        if found:
+            present.append(canonical)
+
+    return present
+
+
 def generate_grounded_market_answer(message, language, filters, preferences, search_result, conversation_history=None, decision_mode="DISCOVER"):
     """Progressive-disclosure buying advice grounded in deterministic market data."""
     hard_count = int(search_result.get("count", 0) or 0)
@@ -5325,9 +5358,17 @@ DECISION COMPRESSION:
 - Lead with the conclusion. Do not lead with a database overview.
 - If there is a clear best route, recommend ONE route and explain it with 1-2 decisive facts.
 - If there is a genuine tradeoff, show at most 2-3 options and explain the difference in plain language.
+- When the user explicitly gives a small set of acceptable brands, prefer one strong candidate per requested
+  brand before adding secondary candidates from the same brand. This prevents a higher-volume brand from
+  crowding a valid alternative brand out of the answer.
 - Do not list alternatives merely because they exist in model_options.
 - Do not mention counts, mileage ranges, liquidity, price pressure, confidence, oldest/newest years,
   or other statistics unless that fact materially changes the user's decision.
+- NEVER say that a requested brand/model has no matching options unless the authoritative supplied
+  model_options/listing evidence actually contains zero matching candidates for that requested brand/model.
+- If the evidence packet contains a requested brand/model, acknowledge it even when another option ranks higher.
+- When the user explicitly narrows to multiple brands (for example BMW or Mercedes), inspect EACH requested
+  brand represented in model_options before concluding that one brand has no qualifying vehicles.
 - Keep useful evidence in reserve. OtoDeğer should know more than it says.
 - If the user asks for detail, more options, evidence, or "why?", then expand.
 - Never repeat information the user already knows unless it is necessary to explain a consequence.
@@ -5354,6 +5395,8 @@ NEXT BEST ACTION:
 EVIDENCE BOUNDARY:
 - active_hard_filters, soft_preferences, model_options and listing_candidates are the authoritative
   OtoDeğer evidence packet.
+- requested_brand_presence is a deterministic cross-check. If a requested brand appears there, you MUST NOT
+  claim that the brand has no qualifying option; inspect its supplied model_options and describe the strongest one.
 - Prices, years, mileage, counts, sellers, locations, transmissions, current supply, historical
   listing behaviour and price pressure MUST come from supplied evidence.
 - Never invent a model, price, year, mileage, count, seller, location, transmission, statistic,
@@ -5417,6 +5460,7 @@ RESPONSE SHAPE:
         "preference_qualified_count": advisory_count if qualified_results else None,
         "buyer_intelligence_ready": BUYER_INTELLIGENCE_READY,
         "model_options": model_options,
+        "requested_brand_presence": _requested_brand_presence_guard(message, model_options),
         "listing_candidates": listing_candidates,
         "listing_display_limit": 3 if decision_mode == "SHOP" else 0,
         "instruction_note": (
