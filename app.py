@@ -2092,7 +2092,7 @@ def _parse_human_number(token):
 # older prose. current_filters/current_preferences are the authoritative state;
 # recent conversation is used only to understand the latest turn.
 
-ASSISTANT_ORCHESTRATION_VERSION = "8.3"
+ASSISTANT_ORCHESTRATION_VERSION = "8.4"
 
 
 def _v8_previous_assistant_text(conversation_history):
@@ -8499,12 +8499,9 @@ def api_ai_buying_assistant():
                 )
 
             if budget_match:
+                # _parse_human_number() already expands a trailing k exactly once
+                # (e.g. "18k" -> 18000). Do not multiply a second time here.
                 reset_budget = _parse_human_number(budget_match.group(1))
-                if (
-                    reset_budget is not None
-                    and re.search(r"[kK]\s*$", budget_match.group(1).strip())
-                ):
-                    reset_budget *= 1000
 
             if reset_budget is not None:
                 next_filters["budget"] = reset_budget
