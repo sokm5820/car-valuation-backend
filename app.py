@@ -5203,36 +5203,97 @@ def _fast_shop_answer(language, filters, search_result, listing_candidates, pref
 
 
 
-def _requested_brand_presence_guard(message, model_options):
-    """
-    Lightweight evidence guard used before natural-language rendering.
 
-    Returns requested brand names that are visibly represented in the supplied
-    model_options. This does not invent availability and does not alter ranking;
-    it simply gives the renderer an explicit cross-brand presence signal so it
-    cannot incorrectly claim that a requested brand has no qualifying option.
+def _extract_explicit_market_brands(message):
     """
-    msg = str(message or "").casefold()
-    options = list(model_options or [])
+    Deterministically resolve brand names that the user explicitly typed.
 
+    The semantic controller is allowed to understand intent, but it must not be
+    allowed to silently drop one side of a concrete request such as
+    "BMW or Mercedes". Canonical spellings come from the live market data.
+    """
+    raw = str(message or "").strip()
+    if not raw or market_df is None or market_df.empty or "Brand" not in market_df.columns:
+        return []
+
+    def norm(value):
+        value = str(value or "").casefold()
+        value = value.replace("&", " and ")
+        value = re.sub(r"[^a-z0-9çğıöşü]+", " ", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    message_norm = f" {norm(raw)} "
+    brands = [
+        str(v).strip()
+        for v in market_df["Brand"].dropna().astype(str).unique().tolist()
+        if str(v).strip()
+    ]
+
+    # Explicit human aliases that differ from the canonical market spelling.
     aliases = {
-        "BMW": ("bmw",),
-        "Mercedes-Benz": ("mercedes", "mercedes-benz", "mercedes benz"),
+        "mercedes": "Mercedes-Benz",
+        "mercedes benz": "Mercedes-Benz",
+        "mercedes-benz": "Mercedes-Benz",
     }
 
-    present = []
-    for canonical, terms in aliases.items():
-        if not any(term in msg for term in terms):
-            continue
+    found = []
+    seen = set()
 
-        found = any(
-            str(opt.get("brand") or "").strip().casefold() == canonical.casefold()
-            for opt in options
-        )
-        if found:
-            present.append(canonical)
+    # Match canonical live-market brand names first.
+    for brand in brands:
+        bnorm = norm(brand)
+        if bnorm and f" {bnorm} " in message_norm:
+            key = brand.casefold()
+            if key not in seen:
+                found.append(brand)
+                seen.add(key)
 
-    return present
+    # Then resolve common aliases only if that canonical brand exists live.
+    live_by_fold = {b.casefold(): b for b in brands}
+    for alias, canonical in aliases.items():
+        if f" {norm(alias)} " in message_norm:
+            live = live_by_fold.get(canonical.casefold())
+            if live and live.casefold() not in seen:
+                found.append(live)
+                seen.add(live.casefold())
+
+    return found
+
+
+def _apply_authoritative_explicit_brands(message, interpretation):
+    """
+    Concrete brand names typed by the user are authoritative constraints.
+
+    This runs after the semantic controller. It prevents an LLM parse such as
+    ["BMW"] from losing "Mercedes" in "BMW or Mercedes".
+    """
+    explicit_brands = _extract_explicit_market_brands(message)
+    if not explicit_brands:
+        return interpretation
+
+    updated = dict(interpretation or {})
+    filters = dict(updated.get("filters") or {})
+    filters["brands"] = explicit_brands
+    updated["filters"] = sanitize_ai_filters(filters)
+    return updated
+
+
+def _requested_brand_presence_guard(message, model_options):
+    """
+    Cross-check requested brands against the actual option packet.
+
+    This is generic for every live market brand, not hard-coded to BMW/Mercedes.
+    """
+    requested = _extract_explicit_market_brands(message)
+    if not requested:
+        return []
+
+    option_brands = {
+        str(opt.get("brand") or "").strip().casefold()
+        for opt in (model_options or [])
+        if str(opt.get("brand") or "").strip()
+    }
+    return [brand for brand in requested if brand.casefold() in option_brands]
 
 
 def generate_grounded_market_answer(message, language, filters, preferences, search_result, conversation_history=None, decision_mode="DISCOVER"):
@@ -5395,8 +5456,11 @@ NEXT BEST ACTION:
 EVIDENCE BOUNDARY:
 - active_hard_filters, soft_preferences, model_options and listing_candidates are the authoritative
   OtoDeğer evidence packet.
-- requested_brand_presence is a deterministic cross-check. If a requested brand appears there, you MUST NOT
-  claim that the brand has no qualifying option; inspect its supplied model_options and describe the strongest one.
+- requested_brands contains concrete brand names deterministically resolved from the user's latest message.
+- requested_brand_presence is a deterministic cross-check against model_options.
+- If requested_brands contains multiple brands, treat every one as part of the user's hard request.
+- If a requested brand appears in requested_brand_presence, you MUST NOT claim that it has no qualifying option.
+- Never say "only one requested brand is represented" merely because one brand ranks higher.
 - Prices, years, mileage, counts, sellers, locations, transmissions, current supply, historical
   listing behaviour and price pressure MUST come from supplied evidence.
 - Never invent a model, price, year, mileage, count, seller, location, transmission, statistic,
@@ -5460,6 +5524,7 @@ RESPONSE SHAPE:
         "preference_qualified_count": advisory_count if qualified_results else None,
         "buyer_intelligence_ready": BUYER_INTELLIGENCE_READY,
         "model_options": model_options,
+        "requested_brands": _extract_explicit_market_brands(message),
         "requested_brand_presence": _requested_brand_presence_guard(message, model_options),
         "listing_candidates": listing_candidates,
         "listing_display_limit": 3 if decision_mode == "SHOP" else 0,
@@ -8341,6 +8406,14 @@ def api_ai_buying_assistant():
         interpretation = _v8_apply_authoritative_numeric_constraints(
             message,
             explicit_current_message_targets,
+            interpretation,
+        )
+
+        # Concrete brands typed by the user are deterministic evidence too.
+        # Example: "BMW or Mercedes" must become both canonical brands even if
+        # the semantic controller happens to emit only one of them.
+        interpretation = _apply_authoritative_explicit_brands(
+            message,
             interpretation,
         )
 
