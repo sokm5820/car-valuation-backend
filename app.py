@@ -69,6 +69,13 @@ PUBLIC_SEARCH_RESULT_CAP = int(
     os.environ.get("PUBLIC_SEARCH_RESULT_CAP", "20")
 )
 
+# TEMPORARY TESTING SWITCH
+# Set DISABLE_ASSISTANT_RATE_LIMITS=true on Render while only the owner is testing.
+# IMPORTANT: set it back to false (or remove the env var) before public launch.
+DISABLE_ASSISTANT_RATE_LIMITS = str(
+    os.environ.get("DISABLE_ASSISTANT_RATE_LIMITS", "false")
+).strip().casefold() in {"1", "true", "yes", "on"}
+
 _RATE_LOCK = threading.Lock()
 _RATE_BUCKETS = defaultdict(lambda: defaultdict(deque))
 
@@ -114,6 +121,9 @@ def _consume_rate(bucket, key, window_seconds, max_events):
 
 
 def _assistant_request_allowed():
+    if DISABLE_ASSISTANT_RATE_LIMITS:
+        return True, 0
+
     ip = _client_ip()
 
     ok, retry = _consume_rate(
@@ -132,6 +142,9 @@ def _assistant_request_allowed():
 
 
 def _search_request_allowed():
+    if DISABLE_ASSISTANT_RATE_LIMITS:
+        return True, 0
+
     ip = _client_ip()
 
     ok, retry = _consume_rate(
@@ -153,7 +166,13 @@ def _reserve_openai_call():
     """
     Hard server-side call ceilings. Client-supplied account tiers do not bypass
     these limits, so changing JSON to BUSINESS cannot defeat cost protection.
+
+    During owner-only testing, DISABLE_ASSISTANT_RATE_LIMITS can temporarily
+    bypass these ceilings. Re-enable before public launch.
     """
+    if DISABLE_ASSISTANT_RATE_LIMITS:
+        return
+
     ip = _client_ip()
 
     ok, retry = _consume_rate(
