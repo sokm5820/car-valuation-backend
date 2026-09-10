@@ -2092,7 +2092,7 @@ def _parse_human_number(token):
 # older prose. current_filters/current_preferences are the authoritative state;
 # recent conversation is used only to understand the latest turn.
 
-ASSISTANT_ORCHESTRATION_VERSION = "9.0"
+ASSISTANT_ORCHESTRATION_VERSION = "9.1"
 
 
 def _v8_previous_assistant_text(conversation_history):
@@ -5419,25 +5419,54 @@ LANGUAGE AND STYLE:
         ),
     }
 
-    response = _openai_post(
-        payload={
-            "model": OPENAI_MODEL,
-            "reasoning": {"effort": "none"},
-            "max_output_tokens": 900,
-            "instructions": instructions,
-            "input": json.dumps(payload, ensure_ascii=False),
-        },
-        timeout=(1.0, 4.0),
-    )
-    response.raise_for_status()
+    try:
+        response = _openai_post(
+            payload={
+                "model": OPENAI_MODEL,
+                "reasoning": {"effort": "none"},
+                "max_output_tokens": 900,
+                "instructions": instructions,
+                "input": json.dumps(payload, ensure_ascii=False),
+            },
+            # V9 conversational rendering is a real model turn rather than the old
+            # deterministic fast path. Give it a realistic network/read window.
+            timeout=(2.0, 12.0),
+        )
+        response.raise_for_status()
 
-    answer = extract_response_text(response.json()).strip()
-    if not answer:
-        raise ValueError("AI_ASSISTANT_EMPTY_RESPONSE")
+        answer = extract_response_text(response.json()).strip()
+        if not answer:
+            raise ValueError("AI_ASSISTANT_EMPTY_RESPONSE")
 
-    answer = answer.replace("$", "£").replace(" USD", " GBP").replace("USD ", "GBP ")
-    answer = normalize_assistant_format(answer)
-    return answer, advisory_results, advisory_count, model_options
+        answer = answer.replace("$", "£").replace(" USD", " GBP").replace("USD ", "GBP ")
+        answer = normalize_assistant_format(answer)
+        return answer, advisory_results, advisory_count, model_options
+
+    except AIUsageLimitExceeded:
+        # Preserve the existing usage-control semantics.
+        raise
+    except Exception as exc:
+        # A writing-model/network failure must never make grounded market data
+        # disappear. Degrade to the proven deterministic V8 renderer for this turn.
+        print(f"V9_CONVERSATIONAL_RENDERER_FALLBACK: {type(exc).__name__}: {exc}", flush=True)
+
+        if decision_mode == "DISCOVER":
+            fallback_answer = _fast_discover_answer(
+                language, filters, preferences, model_options
+            )
+            if fallback_answer:
+                return fallback_answer, advisory_results, advisory_count, model_options
+
+        if decision_mode == "COMPARE":
+            fallback_answer = _fast_compare_answer(
+                message, language, filters, model_options
+            )
+            if fallback_answer:
+                return fallback_answer, advisory_results, advisory_count, model_options
+
+        # If no safe deterministic answer exists, allow the endpoint's existing
+        # error handling to report the failure rather than fabricating an answer.
+        raise
 
 
 
