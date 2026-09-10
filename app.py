@@ -5587,6 +5587,103 @@ RESPONSE SHAPE:
 
 
 
+
+def _recover_latest_assistant_compare_offer(message, conversation_history):
+    """
+    Recover the exact pair from the immediately preceding assistant offer.
+
+    This handles natural follow-ups such as:
+        Assistant: "...I'd focus on BMW X1 and Mercedes-Benz GLA.
+                    Want me to compare those two directly?"
+        User:      "Yes, compare them"
+
+    It is intentionally narrow:
+    - only runs for explicit compare/acceptance language;
+    - only inspects the most recent assistant turn before the current user turn;
+    - prefers the sentence(s) immediately preceding the assistant's compare offer;
+    - requires at least two live-market vehicle targets.
+
+    This prevents stale comparisons from being resurrected from older conversation history.
+    """
+    low = str(message or "").strip().casefold()
+    if not low or not conversation_history:
+        return []
+
+    compare_followup = bool(re.search(
+        r"\b(?:yes(?:,)?\s*)?(?:compare|comparison|compare them|compare those|"
+        r"compare the two|compare those two|yes|yeah|yep|sure|okay|ok)\b",
+        low,
+        re.IGNORECASE,
+    ))
+    if not compare_followup:
+        return []
+
+    # Only the immediately preceding assistant turn is eligible.
+    previous_assistant = None
+    for item in reversed(conversation_history or []):
+        role = str(item.get("role") or "").casefold()
+        content = str(item.get("text") or item.get("content") or "").strip()
+        if not content:
+            continue
+
+        if role == "assistant":
+            previous_assistant = content
+            break
+
+        # If we encounter another substantive user turn before an assistant turn,
+        # do not search farther back.
+        if role == "user":
+            return []
+
+    if not previous_assistant:
+        return []
+
+    assistant_low = previous_assistant.casefold()
+    if not re.search(
+        r"\b(?:compare|comparison|karşılaştır|karsilastir|сравн)\w*\b",
+        assistant_low,
+        re.IGNORECASE,
+    ):
+        return []
+
+    # Split into conversational sentences/lines. Find the final compare-offer sentence.
+    sentences = [
+        part.strip()
+        for part in re.split(r"(?<=[.!?])\s+|\n+", previous_assistant)
+        if part.strip()
+    ]
+
+    compare_idx = None
+    for i in range(len(sentences) - 1, -1, -1):
+        if re.search(
+            r"\b(?:compare|comparison|karşılaştır|karsilastir|сравн)\w*\b",
+            sentences[i].casefold(),
+            re.IGNORECASE,
+        ):
+            compare_idx = i
+            break
+
+    if compare_idx is None:
+        return []
+
+    # If the compare sentence itself names both vehicles, use those.
+    direct_targets = resolve_market_vehicle_mentions(sentences[compare_idx])
+    if len(direct_targets) >= 2:
+        return direct_targets[:2]
+
+    # Otherwise "those two/them" normally refers to the closest named pair just before it.
+    # Search a very small local window so older alternatives in the same answer do not leak in.
+    for window_size in (1, 2, 3):
+        start = max(0, compare_idx - window_size)
+        context = " ".join(sentences[start:compare_idx])
+        targets = resolve_market_vehicle_mentions(context)
+        if len(targets) >= 2:
+            # Prefer the last two targets mentioned closest to the compare offer.
+            return targets[-2:]
+
+    return []
+
+
 def _recover_recent_compare_targets(message, conversation_history):
     """
     Recover the most recent explicit multi-model comparison only for a genuine
@@ -8435,7 +8532,21 @@ def api_ai_buying_assistant():
             interpretation["decision_mode"] = "COMPARE"
             interpretation["operation"] = "NEW_TASK"
 
-        # History is now subordinate to semantic task state.
+        # First resolve explicit follow-ups to the immediately preceding assistant
+        # offer, e.g. "Want me to compare the X1 and GLA?" -> "Yes, compare them".
+        # This is safer and more precise than searching older user turns.
+        if not resolved_targets and str(decision_mode).upper() == "COMPARE":
+            offered_compare_targets = _recover_latest_assistant_compare_offer(
+                message,
+                conversation_history,
+            )
+            if len(offered_compare_targets) >= 2:
+                resolved_targets = offered_compare_targets
+                interpretation["decision_mode"] = "COMPARE"
+                interpretation["operation"] = "CONTINUE"
+
+        # Older history recovery remains subordinate to semantic task state and
+        # only runs when the immediate assistant offer did not resolve the pair.
         if not resolved_targets and _v8_should_recover_compare_targets(
             message, interpretation
         ):
