@@ -2092,7 +2092,7 @@ def _parse_human_number(token):
 # older prose. current_filters/current_preferences are the authoritative state;
 # recent conversation is used only to understand the latest turn.
 
-ASSISTANT_ORCHESTRATION_VERSION = "8.4"
+ASSISTANT_ORCHESTRATION_VERSION = "8.5"
 
 
 def _v8_previous_assistant_text(conversation_history):
@@ -4436,100 +4436,186 @@ def _format_gbp(value, language="EN"):
     return "£" + f"{number:,.0f}"
 
 
-def _fast_discover_answer(language, filters, model_options):
-    """Render the factual discovery list locally so DISCOVER needs no final writing LLM."""
-    options = list(model_options or [])[:12]
+def _discover_profile_reason(option, preferences, language):
+    """Return only profile-catalogue-supported reasons for a DISCOVER recommendation."""
+    key = (
+        str(option.get("brand") or "").strip().casefold(),
+        str(option.get("model") or "").strip().casefold(),
+    )
+    profile = MODEL_PROFILE_LOOKUP.get(key) if MODEL_PROFILE_READY else None
+    if not profile:
+        return None
+
+    preferences = _canonicalize_buyer_preferences(preferences)
+    reasons = []
+
+    def strong(field):
+        return _profile_level(profile.get(field)) >= 2
+
+    for pref in preferences:
+        p = str(pref or "").casefold()
+        if p == "priority:economy" and strong("Economy"):
+            reasons.append({"EN": "economy fit", "TR": "ekonomi önceliğine uygun", "RU": "подходит по экономичности"}[language])
+        elif p == "priority:luxury" and strong("Luxury"):
+            reasons.append({"EN": "luxury fit", "TR": "lüks önceliğine uygun", "RU": "подходит по уровню премиальности"}[language])
+        elif p == "priority:comfort" and strong("Comfort"):
+            reasons.append({"EN": "comfort fit", "TR": "konfor önceliğine uygun", "RU": "подходит по комфорту"}[language])
+        elif p == "priority:performance" and strong("Performance"):
+            reasons.append({"EN": "performance fit", "TR": "performans önceliğine uygun", "RU": "подходит по динамике"}[language])
+        elif p == "priority:practicality" and strong("Practicality"):
+            reasons.append({"EN": "practicality fit", "TR": "pratiklik önceliğine uygun", "RU": "подходит по практичности"}[language])
+        elif p == "use_case:family" and strong("Family"):
+            reasons.append({"EN": "family fit", "TR": "aile kullanımına uygun", "RU": "подходит для семьи"}[language])
+        elif p == "use_case:commute" and strong("Commute"):
+            reasons.append({"EN": "commute fit", "TR": "günlük kullanıma uygun", "RU": "подходит для ежедневных поездок"}[language])
+        elif p == "vehicle_type:small_car" and _profile_matches_vehicle_type(profile, "small_car"):
+            reasons.append({"EN": "small-car fit", "TR": "küçük araç tercihine uygun", "RU": "подходит как компактный автомобиль"}[language])
+
+    return ", ".join(reasons[:2]) if reasons else None
+
+
+def _build_discover_response_plan(language, filters, preferences, model_options):
+    """
+    Structured response planning layer for DISCOVER.
+
+    It never invents vehicle facts. Every surfaced market fact comes from the
+    deterministic option/evidence packet; soft-fit explanations come only from
+    buyer_model_profiles.csv.
+    """
+    options = list(model_options or [])[:5]
     if not options:
         return None
 
     budget = filters.get("budget")
     budget_text = _format_gbp(budget, language) if budget not in [None, ""] else None
 
-    if language == "TR":
-        intro = (
-            f"{budget_text} bütçeyle mevcut piyasada değerlendirebileceğiniz güçlü bir seçenek yelpazesi var."
-            if budget_text else
-            "Mevcut piyasada değerlendirebileceğiniz geniş bir seçenek yelpazesi var."
-        )
-    elif language == "RU":
-        intro = (
-            f"С бюджетом до {budget_text} на текущем рынке есть широкий выбор подходящих вариантов."
-            if budget_text else
-            "На текущем рынке есть широкий выбор подходящих вариантов."
-        )
-    else:
-        intro = (
-            f"With a {budget_text} ceiling, the current North Cyprus market gives you a broad range of relevant options."
-            if budget_text else
-            "The current North Cyprus market gives you a broad range of relevant options."
-        )
+    planned = []
+    for index, item in enumerate(options):
+        bi = item.get("buyer_intelligence") or {}
+        planned.append({
+            "rank": index + 1,
+            "name": f"{item.get('brand','')} {item.get('model','')}".strip(),
+            "newest_year": item.get("newest_year"),
+            "newest_year_price": _format_gbp(item.get("newest_year_starting_price"), language),
+            "count": int(item.get("count") or 0),
+            "fit_reason": _discover_profile_reason(item, preferences, language),
+            "liquidity_confidence": str(bi.get("liquidity_confidence") or "").strip().upper(),
+        })
 
-    lines = []
-    for item in options:
-        name = f"{item.get('brand','')} {item.get('model','')}".strip()
-        year = item.get("newest_year")
-        year_price = _format_gbp(item.get("newest_year_starting_price"), language)
-        count = int(item.get("count") or 0)
-        if language == "TR":
-            if year and year_price:
-                lines.append(f"{name} — {year}'e kadar · {year} {year_price}'dan · bütçe içinde {count} ilan")
-            else:
-                lines.append(f"{name} — bütçe içinde {count} ilan")
-        elif language == "RU":
-            if year and year_price:
-                lines.append(f"{name} — до {year} · {year} от {year_price} · {count} в рамках бюджета")
-            else:
-                lines.append(f"{name} — {count} в рамках бюджета")
-        else:
-            if year and year_price:
-                lines.append(f"{name} — up to {year} · {year} from {year_price} · {count} within budget")
-            else:
-                lines.append(f"{name} — {count} matching listings")
+    confidences = [x["liquidity_confidence"] for x in planned]
+    thin_evidence = bool(confidences) and all(c in {"LOW", "INSUFFICIENT", ""} for c in confidences)
 
-    newest = max((int(x.get("newest_year") or 0) for x in options), default=0)
-    newest_names = [
-        f"{x.get('brand','')} {x.get('model','')}".strip()
-        for x in options if int(x.get("newest_year") or 0) == newest
-    ][:3]
-    confidences = [
-        str((x.get("buyer_intelligence") or {}).get("liquidity_confidence") or "").strip().upper()
-        for x in options
-    ]
-    thin_evidence_group = bool(confidences) and all(
-        c in {"LOW", "INSUFFICIENT", ""} for c in confidences
-    )
+    return {
+        "goal": "DISCOVER",
+        "budget_text": budget_text,
+        "recommendation": planned[0],
+        "alternatives": planned[1:],
+        "thin_evidence": thin_evidence,
+        "preferences": list(_canonicalize_buyer_preferences(preferences)),
+    }
 
-    caveat = None
-    if thin_evidence_group:
-        if language == "TR":
-            caveat = (
-                "Bu grupta geçmiş piyasa verisi daha sınırlı; bu nedenle sıralamayı daha düşük güvenle "
-                "değerlendirip tek tek ilanları yakından karşılaştırmak daha doğru olur."
-            )
-        elif language == "RU":
-            caveat = (
-                "По этой группе исторических рыночных данных меньше, поэтому к порядку рекомендаций "
-                "стоит относиться с меньшей уверенностью и внимательнее сравнивать конкретные объявления."
-            )
-        else:
-            caveat = (
-                "Market-history evidence is thinner for this group, so I’d treat the ordering as "
-                "lower-confidence and compare individual listings closely."
-            )
+
+def _render_discover_response_plan(language, plan):
+    """Premium, concise renderer for the deterministic DISCOVER response plan."""
+    if not plan:
+        return None
+
+    top = plan["recommendation"]
+    budget_text = plan.get("budget_text")
 
     if language == "TR":
-        closing = f"En yeni seçenekler {newest} model yılına kadar çıkıyor. İsterseniz buradan belirli modelleri karşılaştırabilir veya yıl/kilometre sınırı ekleyebilirsiniz."
-    elif language == "RU":
-        closing = f"Самые новые варианты доходят до {newest} года. Дальше можно сравнить конкретные модели или задать ограничение по году и пробегу."
-    else:
-        names = ", ".join(newest_names)
-        closing = f"The newest options reach {newest}" + (f", including {names}" if names else "") + ". You can now compare specific models or narrow the search further."
+        intro = (
+            f"{budget_text} bütçeyle ilk bakacağım seçenek **{top['name']}**."
+            if budget_text else
+            f"İlk bakacağım seçenek **{top['name']}**."
+        )
+        if top.get("fit_reason"):
+            intro += f" Profil verimizde {top['fit_reason']}."
+        detail = []
+        if top.get("newest_year") and top.get("newest_year_price"):
+            detail.append(f"{top['newest_year']} modeller {top['newest_year_price']}'dan başlıyor")
+        detail.append(f"mevcut filtrelerde {top['count']} ilan var")
+        intro += " " + "; ".join(detail) + "."
 
-    parts = [intro, "\n".join(lines)]
-    if caveat:
-        parts.append(caveat)
+        alt_lines = []
+        for x in plan["alternatives"]:
+            reason = f" · {x['fit_reason']}" if x.get("fit_reason") else ""
+            if x.get("newest_year") and x.get("newest_year_price"):
+                alt_lines.append(f"**{x['name']}** — {x['newest_year']} {x['newest_year_price']}'dan · {x['count']} ilan{reason}")
+            else:
+                alt_lines.append(f"**{x['name']}** — {x['count']} ilan{reason}")
+        closing = "İsterseniz ilk 2–3 seçeneği doğrudan karşılaştırabilir veya gerçek ilanlara geçebiliriz."
+
+    elif language == "RU":
+        intro = (
+            f"При бюджете {budget_text} я бы сначала посмотрел **{top['name']}**."
+            if budget_text else
+            f"Я бы сначала посмотрел **{top['name']}**."
+        )
+        if top.get("fit_reason"):
+            intro += f" По профилю модели: {top['fit_reason']}."
+        detail = []
+        if top.get("newest_year") and top.get("newest_year_price"):
+            detail.append(f"{top['newest_year']} год от {top['newest_year_price']}")
+        detail.append(f"{top['count']} объявлений по текущим фильтрам")
+        intro += " " + "; ".join(detail) + "."
+
+        alt_lines = []
+        for x in plan["alternatives"]:
+            reason = f" · {x['fit_reason']}" if x.get("fit_reason") else ""
+            if x.get("newest_year") and x.get("newest_year_price"):
+                alt_lines.append(f"**{x['name']}** — {x['newest_year']} от {x['newest_year_price']} · {x['count']} объявлений{reason}")
+            else:
+                alt_lines.append(f"**{x['name']}** — {x['count']} объявлений{reason}")
+        closing = "Дальше можно напрямую сравнить 2–3 лучших варианта или перейти к конкретным объявлениям."
+
+    else:
+        intro = (
+            f"With a {budget_text} ceiling, my first look would be **{top['name']}**."
+            if budget_text else
+            f"My first look would be **{top['name']}**."
+        )
+        if top.get("fit_reason"):
+            intro += f" Its model profile is a {top['fit_reason']}."
+        detail = []
+        if top.get("newest_year") and top.get("newest_year_price"):
+            detail.append(f"{top['newest_year']} examples start at {top['newest_year_price']}")
+        detail.append(f"{top['count']} listings match your current filters")
+        intro += " " + "; ".join(detail) + "."
+
+        alt_lines = []
+        for x in plan["alternatives"]:
+            reason = f" · {x['fit_reason']}" if x.get("fit_reason") else ""
+            if x.get("newest_year") and x.get("newest_year_price"):
+                alt_lines.append(f"**{x['name']}** — {x['newest_year']} from {x['newest_year_price']} · {x['count']} listings{reason}")
+            else:
+                alt_lines.append(f"**{x['name']}** — {x['count']} listings{reason}")
+        closing = "From here, I can compare the strongest 2–3 directly or move into actual listings."
+
+    parts = [intro]
+    if alt_lines:
+        parts.append("\n".join(alt_lines))
+
+    if plan.get("thin_evidence"):
+        if language == "TR":
+            parts.append("Bu grupta geçmiş piyasa verisi daha sınırlı; sıralamayı daha düşük güvenle değerlendirmek doğru olur.")
+        elif language == "RU":
+            parts.append("По этой группе исторических данных меньше, поэтому порядок рекомендаций стоит считать менее уверенным.")
+        else:
+            parts.append("Market-history evidence is thinner for this group, so I’d treat the ordering as lower-confidence.")
+
     parts.append(closing)
     return "\n\n".join(parts)
+
+
+def _fast_discover_answer(language, filters, preferences, model_options):
+    plan = _build_discover_response_plan(
+        language=language,
+        filters=filters,
+        preferences=preferences,
+        model_options=model_options,
+    )
+    return _render_discover_response_plan(language, plan)
 
 
 def _fast_compare_answer(message, language, filters, model_options):
@@ -5208,7 +5294,7 @@ def generate_grounded_market_answer(message, language, filters, preferences, sea
     # Avoid a second writing-model request; this removes one sequential network/LLM
     # round trip from the two most common customer journeys.
     if decision_mode == "DISCOVER":
-        fast_answer = _fast_discover_answer(language, filters, model_options)
+        fast_answer = _fast_discover_answer(language, filters, preferences, model_options)
         if fast_answer:
             return fast_answer, advisory_results, advisory_count, model_options
 
