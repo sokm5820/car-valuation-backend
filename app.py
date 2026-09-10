@@ -2092,7 +2092,7 @@ def _parse_human_number(token):
 # older prose. current_filters/current_preferences are the authoritative state;
 # recent conversation is used only to understand the latest turn.
 
-ASSISTANT_ORCHESTRATION_VERSION = "8.0"
+ASSISTANT_ORCHESTRATION_VERSION = "8.3"
 
 
 def _v8_previous_assistant_text(conversation_history):
@@ -2303,6 +2303,53 @@ JSON shape:
         "orchestration_version": ASSISTANT_ORCHESTRATION_VERSION,
     }
 
+
+
+def _v8_apply_authoritative_numeric_constraints(message, resolved_targets, interpretation):
+    """
+    Numeric constraints stated explicitly in the latest user turn are deterministic
+    application facts, not semantic guesses.
+
+    The LLM controller decides conversational meaning/state, but explicit amounts
+    such as £18k, £12k, 80,000 km, and year bounds are re-parsed by the deterministic
+    parser and overwrite any malformed numeric value returned by the controller.
+
+    This prevents failures such as £18k becoming £18,000,000 while preserving the
+    semantic controller's operation/mode/preference understanding.
+    """
+    try:
+        deterministic = fast_common_interpretation(
+            message=message,
+            resolved_targets=resolved_targets or [],
+        ) or {}
+    except Exception:
+        return interpretation
+
+    authoritative_keys = (
+        "budget",
+        "min_budget",
+        "min_year",
+        "max_year",
+        "min_km",
+        "max_km",
+    )
+
+    deterministic_filters = sanitize_ai_filters(
+        deterministic.get("filters") or {}
+    )
+    if not deterministic_filters:
+        return interpretation
+
+    merged = dict(interpretation or {})
+    semantic_filters = dict(merged.get("filters") or {})
+
+    for key in authoritative_keys:
+        value = deterministic_filters.get(key)
+        if value is not None:
+            semantic_filters[key] = value
+
+    merged["filters"] = sanitize_ai_filters(semantic_filters)
+    return merged
 
 def _v8_apply_preference_changes(previous_preferences, interpretation):
     """Apply semantic preference removals, then normal replacement-aware merging."""
@@ -8171,6 +8218,15 @@ def api_ai_buying_assistant():
                         "degraded": True,
                         "orchestration_version": ASSISTANT_ORCHESTRATION_VERSION,
                     }
+
+        # Explicit numeric constraints are deterministic evidence. The semantic
+        # controller remains responsible for task meaning, but it cannot redefine
+        # £18k as £18m or otherwise distort a number the user directly supplied.
+        interpretation = _v8_apply_authoritative_numeric_constraints(
+            message,
+            explicit_current_message_targets,
+            interpretation,
+        )
 
         interpretation.setdefault("operation", "CONTINUE")
         interpretation.setdefault(
