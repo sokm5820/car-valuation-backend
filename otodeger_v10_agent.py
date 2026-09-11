@@ -23,7 +23,7 @@ from otodeger_v10_state import (
     apply_turn_plan, get_state_service, register_object,
 )
 
-V10_VERSION = "10.5-guided-refinement"
+V10_VERSION = "10.5.1-decision-prompts"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -254,16 +254,6 @@ def _deterministic_followup_plan(message: str, state: Mapping[str, Any]) -> Opti
         }[lang]
         return {"transition":Transition.CONTINUE.value,"action":Action.ASK_CLARIFICATION.value,
                 "job":state.get("job") or Job.FIND_A_CAR.value,"awaiting":{"field":"preference_direction","question":q}}
-
-    if low in {"german or japanese?", "german or japanese", "choose german or japanese",
-               "alman mı japon mu?", "alman mi japon mu?", "немецкие или японские?"}:
-        q = {
-            "EN":"Do you want me to focus on German brands, Japanese brands, or keep both in the mix?",
-            "TR":"Alman markalarına mı, Japon markalarına mı odaklanalım, yoksa ikisini de açık mı tutalım?",
-            "RU":"Сфокусироваться на немецких марках, японских или оставить оба варианта?",
-        }[lang]
-        return {"transition":Transition.CONTINUE.value,"action":Action.ASK_CLARIFICATION.value,
-                "job":state.get("job") or Job.FIND_A_CAR.value,"awaiting":{"field":"brand_origin","question":q}}
 
     if low in {"broaden year range", "broaden the year range", "older cars too", "consider older years",
                "yıl aralığını genişlet", "yil araligini genislet", "daha eski araçlar da", "расширить диапазон лет"}:
@@ -1392,13 +1382,13 @@ def _suggestions_from_context(state: Mapping[str, Any], evidence: Mapping[str, A
     base={
         "EN": {"year":"Set minimum year","km":"Set mileage limit","auto":"Automatic only","gallery":"Gallery sellers only",
                "links":"Show listings","compare":"Compare these options","other":"Show other brands",
-               "econlux":"Economy or luxury?","origin":"German or Japanese?","broaden":"Broaden year range"},
+               "econlux":"Economy or luxury?","broaden":"Broaden year range"},
         "TR": {"year":"Minimum yılı belirle","km":"KM sınırı belirle","auto":"Sadece otomatik","gallery":"Sadece galeriler",
                "links":"İlanları göster","compare":"Bu seçenekleri karşılaştır","other":"Diğer markaları göster",
-               "econlux":"Ekonomik mi lüks mü?","origin":"Alman mı Japon mu?","broaden":"Yıl aralığını genişlet"},
+               "econlux":"Ekonomik mi lüks mü?","broaden":"Yıl aralığını genişlet"},
         "RU": {"year":"Задать минимальный год","km":"Задать лимит пробега","auto":"Только автомат","gallery":"Только автосалоны",
                "links":"Показать объявления","compare":"Сравнить эти варианты","other":"Показать другие марки",
-               "econlux":"Экономичность или премиум?","origin":"Немецкие или японские?","broaden":"Расширить диапазон лет"},
+               "econlux":"Экономичность или премиум?","broaden":"Расширить диапазон лет"},
     }[lang]
 
     out=[]
@@ -1406,7 +1396,7 @@ def _suggestions_from_context(state: Mapping[str, Any], evidence: Mapping[str, A
         # Broad discovery should learn taste before stacking arbitrary hard filters.
         named = bool(c.get("brands") or c.get("models"))
         if not named:
-            out.extend([base["econlux"], base["year"], base["origin"]])
+            out.extend([base["econlux"], base["year"], base["km"]])
         else:
             if len(models)>=2:
                 out.append(base["compare"])
