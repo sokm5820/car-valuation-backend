@@ -687,41 +687,14 @@ BUSINESS_ACTIVITY_VERSION = "10.0"
 
 
 def _load_assistant_csv_local_first(filename, url, timeout=25):
-    """Load an intelligence CSV from the best available local source first.
+    """Prefer repo-local intelligence files; fall back to GitHub if absent.
 
-    Search order:
-      1. OTODEGER_INTELLIGENCE_DIR (when explicitly configured)
-      2. Beside app.py (production/repo-local layout)
-      3. A sibling ``otodeger_intelligence`` folder next to the backend folder
-         (the current Windows development layout)
-      4. The configured GitHub/raw URL fallback
-
-    This keeps local development compatible with the user's existing Desktop
-    folder structure without hard-coding a Windows username or Desktop path, while
-    preserving the production fallback behaviour.
+    This removes an unnecessary network dependency on normal production boots while
+    preserving the existing refresh/fallback behaviour.
     """
-    app_dir = os.path.dirname(os.path.abspath(__file__))
-
-    candidate_dirs = []
-    configured_dir = str(os.environ.get("OTODEGER_INTELLIGENCE_DIR", "") or "").strip()
-    if configured_dir:
-        candidate_dirs.append(os.path.abspath(os.path.expanduser(configured_dir)))
-
-    candidate_dirs.append(app_dir)
-    candidate_dirs.append(os.path.abspath(os.path.join(app_dir, os.pardir, "otodeger_intelligence")))
-
-    seen = set()
-    for directory in candidate_dirs:
-        normalized = os.path.normcase(os.path.normpath(directory))
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-
-        local_path = os.path.join(directory, filename)
-        if os.path.isfile(local_path):
-            print(f"Loading intelligence CSV locally: {local_path}")
-            return pd.read_csv(local_path, low_memory=False)
-
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    if os.path.exists(local_path):
+        return pd.read_csv(local_path, low_memory=False)
     response = requests.get(url, timeout=timeout)
     response.raise_for_status()
     return pd.read_csv(io.StringIO(response.text), low_memory=False)
