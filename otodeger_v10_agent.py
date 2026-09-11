@@ -1199,11 +1199,37 @@ def _actions_from_evidence(state: Mapping[str, Any], action: str, evidence: Mapp
     }[_lang(language)]
     actions=[]
     if evidence.get("kind") == "listings":
+        # Listing actions are the actual shortlist presentation. Make each clickable
+        # row information-rich enough for the buyer to decide whether it is worth
+        # opening; do not reduce it to a generic year/brand/model card.
+        currency = str(((state.get("constraints") or {}).get("currency") or "GBP")).upper()
+        symbol = {"GBP":"£", "EUR":"€", "USD":"$"}.get(currency, currency + " ")
         for row in (evidence.get("listings") or [])[:5]:
             url=_text(row.get("link"),500)
             if not url: continue
-            name=" ".join(str(x) for x in [row.get("year"),row.get("brand"),row.get("model")] if x not in (None,""))
-            actions.append({"type":"LISTING","label":f"{labels['listing']}: {name}","url":url})
+            vehicle=" ".join(str(x) for x in [row.get("year"),row.get("brand"),row.get("model"),row.get("category")] if x not in (None,""))
+            details=[]
+            price=_finite(row.get("price"))
+            if price is not None:
+                details.append(f"{symbol}{price:,.0f}")
+            km=_int(row.get("km"))
+            if km is not None:
+                details.append(f"{km:,} km")
+            transmission=_text(row.get("transmission"),80)
+            if transmission:
+                details.append(transmission)
+            location=_text(row.get("location"),100)
+            if location:
+                details.append(location)
+            company=_text(row.get("company"),160)
+            if company:
+                seller = ({"EN":"Private seller","TR":"Bireysel","RU":"Частный продавец"}[_lang(language)]
+                          if company.casefold()=="bireysel" else company)
+                details.append(seller)
+            label=vehicle
+            if details:
+                label += " — " + " · ".join(details)
+            actions.append({"type":"LISTING","label":label,"url":url})
         return actions, None
     if evidence.get("kind") in {"vehicle_search","comparison"}:
         target_ids=list(((state.get("focus") or {}).get("object_ids") or []))
@@ -1286,9 +1312,9 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
     if kind=="listings":
         n=min(5,len(evidence.get("listings") or []))
         total=int(evidence.get("count") or n)
-        if lang=="TR": return f"Aşağıda {n} güncel ilan gösteriyorum" + (f" ({total} eşleşme içinden)." if total>n else ".") + " Kartlardan ilanları açabilirsiniz; sonuçları yıl, kilometre veya satıcı tipine göre daha da daraltabiliriz."
-        if lang=="RU": return f"Ниже показаны {n} актуальных объявлений" + (f" из {total} совпадений." if total>n else ".") + " Откройте их карточками ниже; затем можно сузить по году, пробегу или типу продавца."
-        return f"I’ve put {n} current listings below" + (f" from {total} matches." if total>n else ".") + " Open them from the cards; we can narrow the set further by year, mileage or seller type."
+        if lang=="TR": return f"Aşağıda {n} güncel ilan gösteriyorum" + (f" ({total} eşleşme içinden)." if total>n else ".") + " Aşağıdaki her satır tıklanabilir ve temel ilan bilgilerini içerir; sonuçları yıl, kilometre veya satıcı tipine göre daha da daraltabiliriz."
+        if lang=="RU": return f"Ниже показаны {n} актуальных объявлений" + (f" из {total} совпадений." if total>n else ".") + " Каждая строка ниже кликабельна и содержит основные данные объявления; затем можно сузить выбор по году, пробегу или типу продавца."
+        return f"I’ve put {n} current listings below" + (f" from {total} matches." if total>n else ".") + " Each row below is clickable and includes the key advert details; we can narrow the set further by year, mileage or seller type."
     if kind=="comparison":
         vs=evidence.get("vehicles") or []
         if len(vs)>=2:
@@ -1331,7 +1357,7 @@ Rules:
 - When a budget exists, model discovery is about WHAT THAT BUDGET BUYS. Prefer: MODEL — up to YEAR · YEAR from £PRICE · N options. Do not lead with an old model's overall minimum price.
 - When the user names brands (for example BMW or Mercedes), show the relevant models under those brands with newest affordable year + asking price at that year + option count. Do not introduce mileage yet unless the user asks for mileage or is filtering listings by mileage.
 - COMPARISON: make it scan-friendly. Give one compact line per model using newest affordable year, price at that year, median asking price and current option count. Do not compare median/representative mileage unless the user explicitly asks about mileage. Only recommend a winner if the user's latest message asks which to choose/buy/prefer or their stated preferences clearly support one.
-- SHOW_LISTINGS: the UI displays at most five listing cards below the prose. Say how many are actually being shown (max 5), not merely the total number of matches. You may separately say 'from N matches'. DO NOT repeat/list the vehicles in the prose and do not create markdown links; the structured UI cards are the single listing presentation.
+- SHOW_LISTINGS: the UI displays at most five information-rich clickable listing rows below the prose. Each row contains the exact year/brand/model/variant plus available price, KM, transmission, location and seller/gallery. Say how many are actually being shown (max 5), not merely the total number of matches. You may separately say 'from N matches'. DO NOT repeat/list the vehicles in the prose and do not create markdown links; these structured clickable rows are the single listing presentation.
 - Ordinary response 35-130 words; simple answers may be shorter. Do not exceed 170 words unless essential.
 - Use short paragraphs and compact model-per-line formatting. Avoid long prose comparisons.
 - Mention only facts present in VERIFIED_EVIDENCE. Never invent prices, years, mileage, availability, counts, dealers or links. If a hard budget is active, do not mention above-budget alternatives unless the user explicitly asks what spending more would unlock.
