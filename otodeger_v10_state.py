@@ -152,6 +152,7 @@ ALLOWED_CONSTRAINTS = {
     "seller_type",
     "location",
     "fuel_type",
+    "exclude_locations",
     "category",
     "company",
     "period_start",
@@ -176,6 +177,7 @@ ALLOWED_PREFERENCES = {
     "resale",
     "low_mileage",
     "newer",
+    "avoid_fuel",
 }
 
 
@@ -243,7 +245,7 @@ def _normalize_constraints(raw: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     for key, value in raw.items():
         if key not in ALLOWED_CONSTRAINTS:
             continue
-        if key in {"brands", "models"}:
+        if key in {"brands", "models", "exclude_locations"}:
             out[key] = _unique_strings(value)
         elif key in {"budget_min", "budget_max", "asking_price", "offer_price", "acquisition_price", "desired_sale_price"}:
             number = _safe_number(value)

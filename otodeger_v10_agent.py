@@ -15,6 +15,9 @@ import math
 import re
 import statistics
 import time
+import calendar
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from otodeger_v10_state import (
@@ -265,6 +268,43 @@ def _deterministic_followup_plan(message: str, state: Mapping[str, Any]) -> Opti
         return {"transition":Transition.CONTINUE.value,"action":Action.ASK_CLARIFICATION.value,
                 "job":state.get("job") or Job.FIND_A_CAR.value,"awaiting":{"field":"min_year","question":q}}
 
+    # Ordinal references are state-resolution, not an LLM judgment. Resolve
+    # common "the second one"-style selections against the structured
+    # shortlist/focus so the user can narrow a comparison without a needless
+    # clarification turn.
+    ordinal_patterns = [
+        (1, r"^(?:the\s+)?(?:first|1st)(?:\s+one)?[.!]?$|^(?:ilk(?:i| olan)?)?[.!]?$|^(?:перв(?:ый|ая|ое))(?:\s+вариант)?[.!]?$"),
+        (2, r"^(?:the\s+)?(?:second|2nd)(?:\s+one)?[.!]?$|^(?:ikinci(?:si| olan)?)[.!]?$|^(?:втор(?:ой|ая|ое))(?:\s+вариант)?[.!]?$"),
+        (3, r"^(?:the\s+)?(?:third|3rd)(?:\s+one)?[.!]?$|^(?:üçüncü(?:sü| olan)?|ucuncu(?:su| olan)?)[.!]?$|^(?:трет(?:ий|ья|ье))(?:\s+вариант)?[.!]?$"),
+        (4, r"^(?:the\s+)?(?:fourth|4th)(?:\s+one)?[.!]?$|^(?:dördüncü(?:sü| olan)?|dorduncu(?:su| olan)?)[.!]?$|^(?:четв[её]рт(?:ый|ая|ое))(?:\s+вариант)?[.!]?$"),
+    ]
+    candidates = list(state.get("shortlist") or []) or focus_ids
+    # Python casefold represents Turkish capital İ as ``i`` + combining dot.
+    # Remove that combining mark for these narrow ordinal phrase checks.
+    ordinal_text = low.replace("\u0307", "")
+    for ordinal, pattern in ordinal_patterns:
+        if re.fullmatch(pattern, ordinal_text, flags=re.I) and len(candidates) >= ordinal:
+            selected_id = candidates[ordinal - 1]
+            selected = (state.get("objects") or {}).get(selected_id) or {}
+            selected_type = str(selected.get("type") or "").upper()
+            delta: Dict[str, Any] = {}
+            if selected_type == ObjectType.MODEL.value:
+                brand = _text(selected.get("brand"), 100)
+                model_name = _text(selected.get("model"), 120)
+                if brand:
+                    delta["brands"] = [brand]
+                if model_name:
+                    delta["models"] = [model_name]
+                return {
+                    "transition": Transition.SWITCH_SUBTASK.value,
+                    "action": Action.SEARCH_VEHICLES.value,
+                    "job": Job.FIND_A_CAR.value if state.get("audience") == Audience.PERSONAL.value else state.get("job"),
+                    "constraints_delta": delta,
+                    "target_ids": [selected_id],
+                    "shortlist_ids": [selected_id],
+                    "awaiting": None,
+                }
+
     acceptance = bool(re.fullmatch(r"\s*(?:yes|yeah|yep|sure|ok|okay|do it|go ahead|please|evet|tamam|olur|göster|goster|да|хорошо|давай)\s*[.!]?\s*", low, flags=re.I))
     show_links = bool(re.search(r"\b(?:show|see|send|give|open).{0,20}\b(?:links?|listings?|ads?)\b|\b(?:links?|listings?)\b|\b(?:ilanları|ilanlari|linkleri|göster|goster)\b|\b(?:ссылк|объявлен)", low, re.I))
     compare = bool(re.search(r"\bcompare\b|\bcomparison\b|\bcompare them\b|\bthose two\b|\bkarşılaştır|karsilastir|сравн", low, re.I))
@@ -350,8 +390,7 @@ BUSINESS jobs: ACQUIRE_STOCK, PRICE_STOCK, MOVE_AGING_STOCK, ANALYZE_BUSINESS, U
 Actions: ASK_CLARIFICATION, SEARCH_VEHICLES, SHOW_LISTINGS, COMPARE_VEHICLES,
 EVALUATE_PURCHASE, EVALUATE_SALE, VALUE_VEHICLE, ANALYZE_MARKET,
 ANALYZE_STOCK_PRICES, ANALYZE_AGING_STOCK, RECOMMEND_ACQUISITIONS,
-ANALYZE_BUSINESS_PERIOD, EXPLAIN_RESULT, CHANGE_CONSTRAINTS, CHANGE_FOCUS,
-START_NEW_GOAL, CONTINUE_CURRENT_GOAL.
+ANALYZE_BUSINESS_PERIOD, EXPLAIN_RESULT.
 Transitions: CONTINUE, REFINE, SWITCH_SUBTASK, START_NEW_GOAL, CORRECT.
 Object types: MODEL, LISTING, OWNED_VEHICLE, STOCK_ITEM, COMPANY, MARKET_SEGMENT.
 
@@ -372,11 +411,18 @@ State rules:
 - Business pricing question: PRICE_STOCK + ANALYZE_STOCK_PRICES.
 - Business aging/sitting/slow-stock question: MOVE_AGING_STOCK + ANALYZE_AGING_STOCK.
 - Business period/change/recap question: ANALYZE_BUSINESS + ANALYZE_BUSINESS_PERIOD.
+- In a focused PRICE_STOCK conversation, wording such as "sell it quickly", "get it gone", or "not maximum margin" is a pricing-strategy refinement: stay PRICE_STOCK + ANALYZE_STOCK_PRICES. Do not switch to MOVE_AGING_STOCK unless the user is asking which stock is old/slow/stuck.
+- Historical questions about asking-price reductions/cuts (for example "which price cuts were biggest?") are ANALYZE_BUSINESS + ANALYZE_BUSINESS_PERIOD, not PRICE_STOCK. PRICE_STOCK is for what price to set now.
+- A business question contrasting the company with the wider market (for example "was it us or the whole market?") is UNDERSTAND_MARKET + ANALYZE_MARKET. Do not ask for sales/revenue/margin metrics first.
+- Month names without a year mean the most recent occurrence of that month relative to current_date supplied in the input. Do not ask which year when that interpretation is unambiguous.
+- For North Cyprus vehicle discovery, location normally does not block a useful first answer. If a new broad vehicle goal has a body type but no numeric budget, ask only for maximum budget rather than also asking for a preferred location.
 
 Hard constraints keys allowed: budget_min,budget_max,vehicle_type,brands,models,min_year,max_year,max_km,min_km,
-transmission,seller_type,location,fuel_type,category,company,period_start,period_end,asking_price,offer_price,
+transmission,seller_type,location,fuel_type,exclude_locations,category,company,period_start,period_end,asking_price,offer_price,
 acquisition_price,desired_sale_price,currency.
-Preference keys: economy,reliability,performance,luxury,comfort,practicality,family,commute,size,resale,low_mileage,newer.
+Preference keys: economy,reliability,performance,luxury,comfort,practicality,family,commute,size,resale,low_mileage,newer,avoid_fuel.
+Use avoid_fuel for negative fuel preferences such as "I hate diesels"; preserve it across turns until explicitly changed or cleared.
+Use exclude_locations when the user says a place is unacceptable (for example "no Güzelyurt"); do not convert an exclusion into a positive location filter.
 
 When the user explicitly names a model, add an object spec and target it. Use authoritative vehicle targets exactly; do not alter their canonical brand/model.
 When the user clearly describes their own vehicle, use OWNED_VEHICLE. When they describe a specific advertised/purchase candidate (for example year + model + asking price and/or mileage), use LISTING even if no URL is supplied; LISTING identity can use brand/model/year/price/km. Use MODEL only for a model family rather than one specific advertised car.
@@ -400,8 +446,14 @@ Required JSON shape:
 Do not return offered_action/result; those are produced by the application after execution.
 """.strip()
 
+    try:
+        current_date = datetime.now(ZoneInfo("Europe/Nicosia")).date().isoformat()
+    except Exception:
+        current_date = datetime.utcnow().date().isoformat()
+
     payload = {
         "latest_message": message,
+        "current_date": current_date,
         "authoritative_message_evidence": authoritative,
         "current_state": state_context,
     }
@@ -451,7 +503,132 @@ Do not return offered_action/result; those are produced by the application after
         delta["brands"] = explicit_brands
         parsed["constraints_delta"] = delta
     parsed = _authoritative_numeric_constraints(message, parsed, state, host)
+    parsed = _normalize_semantic_plan(parsed, message, state, language)
     return parsed
+
+
+def _most_recent_named_month_period(message: str) -> Optional[Tuple[str, str]]:
+    """Resolve a named month without a year to its most recent occurrence in Cyprus."""
+    low = str(message or "").casefold()
+    month_aliases = {
+        1: ("january", "jan", "ocak", "январь", "января"),
+        2: ("february", "feb", "şubat", "subat", "февраль", "февраля"),
+        3: ("march", "mar", "mart", "март", "марта"),
+        4: ("april", "apr", "nisan", "апрель", "апреля"),
+        5: ("may", "mayıs", "mayis", "май", "мая"),
+        6: ("june", "jun", "haziran", "июнь", "июня"),
+        7: ("july", "jul", "temmuz", "июль", "июля"),
+        8: ("august", "aug", "ağustos", "agustos", "август", "августа"),
+        9: ("september", "sep", "sept", "eylül", "eylul", "сентябрь", "сентября"),
+        10: ("october", "oct", "ekim", "октябрь", "октября"),
+        11: ("november", "nov", "kasım", "kasim", "ноябрь", "ноября"),
+        12: ("december", "dec", "aralık", "aralik", "декабрь", "декабря"),
+    }
+    # If the user supplied a year, leave the exact interpretation to the semantic plan.
+    if re.search(r"\b(?:19|20)\d{2}\b", low):
+        return None
+    month = None
+    for number, aliases in month_aliases.items():
+        if any(re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", low, re.I) for alias in aliases):
+            month = number
+            break
+    if month is None:
+        return None
+    try:
+        today = datetime.now(ZoneInfo("Europe/Nicosia")).date()
+    except Exception:
+        today = datetime.utcnow().date()
+    year = today.year if month <= today.month else today.year - 1
+    last_day = calendar.monthrange(year, month)[1]
+    return f"{year:04d}-{month:02d}-01", f"{year:04d}-{month:02d}-{last_day:02d}"
+
+
+def _normalize_semantic_plan(parsed: Mapping[str, Any], message: str, state: Mapping[str, Any], language: str) -> Dict[str, Any]:
+    """Deterministic repair for state-safe, high-value conversational semantics.
+
+    This does not infer market facts. It canonicalizes object identity and resolves
+    a few product-contract decisions that should not drift between model calls.
+    """
+    out = copy.deepcopy(dict(parsed))
+    low = str(message or "").casefold()
+    audience = str(state.get("audience") or Audience.PERSONAL.value).upper()
+    current_job = str(state.get("job") or "").upper()
+
+    # COMPANY object identity must use canonical `name`/`company_id`. Models may
+    # naturally emit {"company": "Demo Motors"}; repair that before state hashing.
+    specs = []
+    for raw_spec in list(out.get("objects") or []):
+        if not isinstance(raw_spec, Mapping):
+            specs.append(raw_spec)
+            continue
+        spec = copy.deepcopy(dict(raw_spec))
+        if str(spec.get("type") or "").upper() == ObjectType.COMPANY.value:
+            payload = dict(spec.get("payload") or {})
+            if not payload.get("name") and not payload.get("company_id"):
+                candidate = payload.get("company") or payload.get("company_name") or payload.get("business_name")
+                if not candidate:
+                    candidate = (state.get("constraints") or {}).get("company")
+                if candidate:
+                    payload["name"] = candidate
+            spec["payload"] = payload
+        specs.append(spec)
+    if specs or "objects" in out:
+        out["objects"] = specs
+
+    if audience == Audience.BUSINESS.value:
+        # Pricing-strategy refinement on one focused stock item stays in PRICE_STOCK.
+        quick_strategy = bool(re.search(
+            r"\b(?:gone quickly|sell (?:it )?quickly|sell (?:it )?fast|quick sale|faster sale|not maximum margin|not max(?:imum)? margin|"
+            r"hızlı sat|hizli sat|çabuk sat|cabuk sat|marjı? maks|marji? maks|"
+            r"продат.{0,10}быстр|быстр.{0,10}продаж|не максимальн.{0,10}марж)",
+            low, re.I))
+        if current_job == Job.PRICE_STOCK.value and quick_strategy:
+            out["job"] = Job.PRICE_STOCK.value
+            out["action"] = Action.ANALYZE_STOCK_PRICES.value
+            out["transition"] = Transition.REFINE.value
+            out["awaiting"] = None
+
+        # Historical asking-price-cut analysis belongs to business performance,
+        # not the forward-looking stock pricing job.
+        price_cut_history = bool(re.search(
+            r"(?:which|what|biggest|largest).{0,30}(?:price cuts?|price reductions?)|"
+            r"(?:price cuts?|price reductions?).{0,30}(?:biggest|largest)|"
+            r"(?:en büyük|en buyuk).{0,25}(?:fiyat indir|indirim)|"
+            r"(?:сам(?:ые|ый)).{0,25}(?:снижени.{0,10}цен|уценк)",
+            low, re.I))
+        if price_cut_history and current_job == Job.ANALYZE_BUSINESS.value:
+            out["job"] = Job.ANALYZE_BUSINESS.value
+            out["action"] = Action.ANALYZE_BUSINESS_PERIOD.value
+            out["transition"] = Transition.CONTINUE.value
+            out["awaiting"] = None
+
+        # Company-vs-market attribution is explicitly an UNDERSTAND_MARKET task.
+        market_contrast = bool(re.search(
+            r"\b(?:us|our|we).{0,35}(?:whole market|market weak|market down)|"
+            r"(?:whole market|market weak|market down).{0,35}(?:us|our|we)|"
+            r"(?:bizde|bizim).{0,35}(?:piyasa|pazar)|(?:piyasa|pazar).{0,35}(?:bizde|bizim)|"
+            r"(?:у нас).{0,35}(?:рынок)|(?:рынок).{0,35}(?:у нас)",
+            low, re.I))
+        if market_contrast:
+            out["job"] = Job.UNDERSTAND_MARKET.value
+            out["action"] = Action.ANALYZE_MARKET.value
+            out["transition"] = Transition.SWITCH_SUBTASK.value if current_job and current_job != Job.UNDERSTAND_MARKET.value else Transition.CONTINUE.value
+            out["awaiting"] = None
+
+        # A named month without a year uses the most recent occurrence. This
+        # prevents needless "which year?" turns for normal business reporting.
+        month_period = _most_recent_named_month_period(message)
+        if month_period and (str(out.get("job") or "").upper() == Job.ANALYZE_BUSINESS.value or current_job == Job.ANALYZE_BUSINESS.value):
+            delta = dict(out.get("constraints_delta") or {})
+            delta["period_start"], delta["period_end"] = month_period
+            out["constraints_delta"] = delta
+            out["job"] = Job.ANALYZE_BUSINESS.value
+            out["action"] = Action.ANALYZE_BUSINESS_PERIOD.value
+            out["awaiting"] = None
+            if str(out.get("transition") or "").upper() == Transition.START_NEW_GOAL.value and current_job:
+                out["transition"] = Transition.CONTINUE.value
+
+    return out
 
 
 def _authoritative_numeric_constraints(message: str, parsed: Mapping[str, Any], state: Mapping[str, Any], host: Mapping[str, Any]) -> Dict[str, Any]:
@@ -562,13 +739,13 @@ def _legacy_filters(state: Mapping[str, Any]) -> Dict[str, Any]:
         "budget_max": "budget", "budget_min": "min_budget", "brands": "brands",
         "models": "models", "min_year": "min_year", "max_year": "max_year",
         "min_km": "min_km", "max_km": "max_km", "location": "locations",
-        "transmission": "transmissions", "category": "categories", "company": "companies",
+        "exclude_locations": "exclude_locations", "transmission": "transmissions", "fuel_type": "fuels", "category": "categories", "company": "companies",
     }
     for src, dest in mapping.items():
         val = c.get(src)
         if val in (None, "", [], {}):
             continue
-        if dest in {"locations", "transmissions", "categories", "companies"} and not isinstance(val, list):
+        if dest in {"locations", "transmissions", "fuels", "categories", "companies"} and not isinstance(val, list):
             val = [val]
         out[dest] = val
 
@@ -609,13 +786,66 @@ def _search_all(state: Mapping[str, Any], host: Mapping[str, Any]) -> Dict[str, 
     if not callable(fn):
         return {"success": False, "error": "MARKET_SEARCH_UNAVAILABLE", "count": 0, "results": []}
     f = _legacy_filters(state)
-    result = fn(
-        budget=f.get("budget"), min_budget=f.get("min_budget"), brands=f.get("brands"),
-        models=f.get("models"), categories=f.get("categories"), locations=f.get("locations"),
-        companies=f.get("companies"), exclude_companies=f.get("exclude_companies"), transmissions=f.get("transmissions"),
-        min_year=f.get("min_year"), max_year=f.get("max_year"), min_km=f.get("min_km"), max_km=f.get("max_km"),
-        limit=5000, max_limit=5000, analysis_mode=True,
-    )
+    search_kwargs = {
+        "budget": f.get("budget"), "min_budget": f.get("min_budget"), "brands": f.get("brands"),
+        "models": f.get("models"), "categories": f.get("categories"), "locations": f.get("locations"), "exclude_locations": f.get("exclude_locations"),
+        "companies": f.get("companies"), "exclude_companies": f.get("exclude_companies"), "transmissions": f.get("transmissions"),
+        "min_year": f.get("min_year"), "max_year": f.get("max_year"), "min_km": f.get("min_km"), "max_km": f.get("max_km"),
+        "limit": 5000, "max_limit": 5000, "analysis_mode": True,
+    }
+    # Compatibility: older/mock host search functions do not know the new Fuel
+    # keyword. Only send it when the user actually has a hard fuel constraint.
+    if f.get("fuels") not in (None, "", [], {}):
+        search_kwargs["fuels"] = f.get("fuels")
+    result = fn(**search_kwargs)
+
+    # Negative fuel preference is soft: avoid it when alternatives exist, but do
+    # not turn a preference into a silent hard zero-result constraint.
+    avoid_fuel = str((state.get("preferences") or {}).get("avoid_fuel") or "").strip().casefold()
+    fuel_aliases = {
+        "benzin": "petrol", "benzinli": "petrol", "gasoline": "petrol", "бензин": "petrol",
+        "dizel": "diesel", "дизель": "diesel",
+        "hibrit": "hybrid", "гибрид": "hybrid",
+        "mild hibrit": "mild hybrid", "mild-hibrit": "mild hybrid", "мягкий гибрид": "mild hybrid",
+        "plug in hibrit": "plug-in hybrid", "plug-in hibrit": "plug-in hybrid", "подключаемый гибрид": "plug-in hybrid",
+        "elektrik": "electric", "elektrikli": "electric", "электро": "electric", "электрический": "electric", "ev": "electric",
+    }
+    avoid_fuel = fuel_aliases.get(avoid_fuel, avoid_fuel)
+    if avoid_fuel and isinstance(result, Mapping):
+        source_rows = [dict(x) for x in (result.get("results") or []) if isinstance(x, Mapping)]
+        if source_rows:
+            def fuel_text(row):
+                text = str(row.get("fuel") or row.get("fuel_type") or row.get("Fuel") or "").strip().casefold()
+                replacements = [
+                    ("подключаемый гибрид", "plug-in hybrid"),
+                    ("plug-in hibrit", "plug-in hybrid"),
+                    ("plug in hibrit", "plug-in hybrid"),
+                    ("мягкий гибрид", "mild hybrid"),
+                    ("mild-hibrit", "mild hybrid"),
+                    ("mild hibrit", "mild hybrid"),
+                    ("электрический", "electric"),
+                    ("электричество", "electric"),
+                    ("elektrikli", "electric"),
+                    ("elektrik", "electric"),
+                    ("электро", "electric"),
+                    ("бензин", "petrol"),
+                    ("benzinli", "petrol"),
+                    ("benzin", "petrol"),
+                    ("gasoline", "petrol"),
+                    ("дизель", "diesel"),
+                    ("dizel", "diesel"),
+                    ("гибрид", "hybrid"),
+                    ("hibrit", "hybrid"),
+                ]
+                for src, dest in replacements:
+                    text = text.replace(src, dest)
+                return text
+            preferred = [row for row in source_rows if avoid_fuel not in fuel_text(row)]
+            if preferred:
+                result = dict(result)
+                result["results"] = preferred
+                result["count"] = len(preferred)
+                result["returned"] = len(preferred)
 
     # Vehicle type is a physical-class constraint, not a text preference. The
     # legacy market_search does not own that taxonomy, so enforce it with the
@@ -1362,6 +1592,17 @@ def _actions_from_evidence(state: Mapping[str, Any], action: str, evidence: Mapp
                 details.append(transmission)
             fuel=_text(row.get("fuel"),80) or _text(row.get("fuel_type"),80)
             if fuel:
+                fuel_key=fuel.casefold()
+                fuel_labels={
+                    "petrol":{"EN":"Petrol","TR":"Benzin","RU":"Бензин"},
+                    "diesel":{"EN":"Diesel","TR":"Dizel","RU":"Дизель"},
+                    "hybrid":{"EN":"Hybrid","TR":"Hibrit","RU":"Гибрид"},
+                    "mild hybrid petrol":{"EN":"Mild hybrid petrol","TR":"Mild hibrit benzin","RU":"Мягкий гибрид, бензин"},
+                    "mild hybrid diesel":{"EN":"Mild hybrid diesel","TR":"Mild hibrit dizel","RU":"Мягкий гибрид, дизель"},
+                    "plug-in hybrid":{"EN":"Plug-in hybrid","TR":"Plug-in hibrit","RU":"Подключаемый гибрид"},
+                    "electric":{"EN":"Electric","TR":"Elektrik","RU":"Электро"},
+                }
+                fuel=(fuel_labels.get(fuel_key) or {}).get(_lang(language), fuel)
                 details.append(fuel)
             location=_text(row.get("location"),100)
             if location:

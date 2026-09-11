@@ -1277,6 +1277,39 @@ def load_market_data():
             )
 
         # -----------------------
+        # FUEL (ROLLOUT-SAFE)
+        # -----------------------
+        # New market builds persist Fuel directly. During deployment, an older
+        # market_base.csv may still be live for a few minutes, so derive the same
+        # canonical value from Link rather than failing the entire market loader.
+        def fuel_from_link(link):
+            text = str(link or "").strip().casefold()
+            patterns = [
+                (r"(?:^|-)mild-hibrit-benzin(?:-|$)", "Mild Hybrid Petrol"),
+                (r"(?:^|-)mild-hibrit-dizel(?:-|$)", "Mild Hybrid Diesel"),
+                (r"(?:^|-)plug-in-hibrit(?:-|$)", "Plug-in Hybrid"),
+                (r"(?:^|-)elektrik(?:-|$)", "Electric"),
+                (r"(?:^|-)hibrit(?:-|$)", "Hybrid"),
+                (r"(?:^|-)dizel(?:-|$)", "Diesel"),
+                (r"(?:^|-)benzin(?:-|$)", "Petrol"),
+            ]
+            for pattern, label in patterns:
+                if re.search(pattern, text, flags=re.IGNORECASE):
+                    return label
+            return ""
+
+        if "Fuel" not in new_market_df.columns:
+            new_market_df["Fuel"] = new_market_df["Link"].apply(fuel_from_link)
+            print("Market CSV Fuel column missing; derived Fuel from Link for compatibility")
+        else:
+            # Backfill any isolated blank Fuel rows from their listing URL.
+            blank_fuel = new_market_df["Fuel"].fillna("").astype(str).str.strip().eq("")
+            if blank_fuel.any():
+                new_market_df.loc[blank_fuel, "Fuel"] = (
+                    new_market_df.loc[blank_fuel, "Link"].apply(fuel_from_link)
+                )
+
+        # -----------------------
         # NUMERIC TYPES
         # -----------------------
         new_market_df["Year"] = pd.to_numeric(
@@ -1304,6 +1337,7 @@ def load_market_data():
             "Company",
             "Location",
             "Transmission",
+            "Fuel",
             "Color",
             "Image",
             "Link"
@@ -3053,6 +3087,8 @@ def market_search(
     companies=None,
     exclude_companies=None,
     transmissions=None,
+    fuels=None,
+    exclude_fuels=None,
     colors=None,
     min_year=None,
     max_year=None,
@@ -3258,6 +3294,66 @@ def market_search(
         ]
 
     # -----------------------
+    # FUEL
+    # -----------------------
+    # Fuel is derived from the KKTCarabam listing URL by market.py and stored
+    # canonically in market_base.csv. Accept English and Turkish user/planner
+    # forms so EN/TR/RU conversations resolve to the same underlying values.
+
+    def normalize_fuel_query(value):
+        text = normalize(value)
+        aliases = {
+            "benzin": "petrol",
+            "benzinli": "petrol",
+            "gasoline": "petrol",
+            "petrol": "petrol",
+            "бензин": "petrol",
+            "dizel": "diesel",
+            "diesel": "diesel",
+            "дизель": "diesel",
+            "hibrit": "hybrid",
+            "hybrid": "hybrid",
+            "гибрид": "hybrid",
+            "mild hibrit": "mild hybrid",
+            "mild-hibrit": "mild hybrid",
+            "mild hybrid": "mild hybrid",
+            "мягкий гибрид": "mild hybrid",
+            "plug in hibrit": "plug-in hybrid",
+            "plug-in hibrit": "plug-in hybrid",
+            "plug in hybrid": "plug-in hybrid",
+            "plug-in hybrid": "plug-in hybrid",
+            "подключаемый гибрид": "plug-in hybrid",
+            "elektrik": "electric",
+            "elektrikli": "electric",
+            "electric": "electric",
+            "электро": "electric",
+            "электрический": "electric",
+            "электричество": "electric",
+            "ev": "electric",
+        }
+        return aliases.get(text, text)
+
+    def fuel_mask(series, values):
+        if not values:
+            return pd.Series(True, index=series.index)
+        if not isinstance(values, list):
+            values = [values]
+        wanted = [normalize_fuel_query(v) for v in values if v not in [None, ""]]
+        normalized_series = series.fillna("").astype(str).map(normalize)
+        mask = pd.Series(False, index=series.index)
+        for value in wanted:
+            # Deliberately use contains: "hybrid" includes mild/plug-in hybrid,
+            # and "diesel" includes mild-hybrid diesel.
+            mask = mask | normalized_series.str.contains(value, regex=False, na=False)
+        return mask
+
+    if fuels and "Fuel" in filtered.columns:
+        filtered = filtered[fuel_mask(filtered["Fuel"], fuels)]
+
+    if exclude_fuels and "Fuel" in filtered.columns:
+        filtered = filtered[~fuel_mask(filtered["Fuel"], exclude_fuels)]
+
+    # -----------------------
     # COLOR
     # -----------------------
 
@@ -3348,7 +3444,7 @@ def market_search(
     # assistant asks for thousands of internal candidates.
     raw_records = results_df[[
         "Brand", "Model", "Category", "Year", "Price", "KM",
-        "Company", "Location", "Transmission", "Color", "Image", "Link"
+        "Company", "Location", "Transmission", "Fuel", "Color", "Image", "Link"
     ]].to_dict(orient="records")
 
     results = [
@@ -3362,6 +3458,7 @@ def market_search(
             "company": row["Company"],
             "location": row["Location"],
             "transmission": row["Transmission"],
+            "fuel": row.get("Fuel", ""),
             "color": row["Color"],
             "image": row["Image"],
             "link": row["Link"],
