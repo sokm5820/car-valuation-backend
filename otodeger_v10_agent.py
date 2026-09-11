@@ -23,7 +23,7 @@ from otodeger_v10_state import (
     apply_turn_plan, get_state_service, register_object,
 )
 
-V10_VERSION = "10.1-conversation"
+V10_VERSION = "10.2-guided-market"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -464,6 +464,18 @@ def _legacy_filters(state: Mapping[str, Any]) -> Dict[str, Any]:
         if dest in {"locations", "transmissions", "categories", "companies"} and not isinstance(val, list):
             val = [val]
         out[dest] = val
+
+    # Canonical V10 seller_type maps onto the legacy market's Company field.
+    # "Bireysel" is the private-seller marker in the source dataset.
+    seller_type = str(c.get("seller_type") or "").strip().casefold()
+    if seller_type in {"private", "individual", "bireysel"}:
+        out["companies"] = ["Bireysel"]
+        out.pop("exclude_companies", None)
+    elif seller_type in {"gallery", "dealer", "dealership", "galeri"}:
+        out["exclude_companies"] = ["Bireysel"]
+        # Do not let a stale company filter override the requested seller class.
+        if c.get("company") in (None, "", [], {}):
+            out.pop("companies", None)
     return out
 
 
@@ -493,7 +505,7 @@ def _search_all(state: Mapping[str, Any], host: Mapping[str, Any]) -> Dict[str, 
     return fn(
         budget=f.get("budget"), min_budget=f.get("min_budget"), brands=f.get("brands"),
         models=f.get("models"), categories=f.get("categories"), locations=f.get("locations"),
-        companies=f.get("companies"), transmissions=f.get("transmissions"),
+        companies=f.get("companies"), exclude_companies=f.get("exclude_companies"), transmissions=f.get("transmissions"),
         min_year=f.get("min_year"), max_year=f.get("max_year"), min_km=f.get("min_km"), max_km=f.get("max_km"),
         limit=5000, max_limit=5000, analysis_mode=True,
     )
@@ -546,6 +558,57 @@ def _model_summary(rows: Sequence[Mapping[str, Any]], max_groups: int = 80) -> L
     return out[:max_groups]
 
 
+def _historical_model_activity(host: Mapping[str, Any]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Aggregate buyer-intelligence history to model-family activity signals.
+
+    This is an internal ranking signal only. Historical listing observations and
+    observed market exits are not confirmed transactions/sales.
+    """
+    df = _host(host, "buyer_model_df")
+    if df is None or getattr(df, "empty", True):
+        return {}
+    required = {"Brand", "Model"}
+    if not required.issubset(set(getattr(df, "columns", []))):
+        return {}
+    try:
+        work = df.copy()
+        out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for (brand, model), grp in work.groupby(["Brand", "Model"], dropna=False):
+            b, m = _text(brand, 100), _text(model, 120)
+            if not b or not m:
+                continue
+            hist = 0.0
+            if "Buyer_HistoricalDistinctListings" in grp.columns:
+                vals = grp["Buyer_HistoricalDistinctListings"].dropna()
+                hist = float(vals.sum()) if len(vals) else 0.0
+            eligible = 0.0
+            exit_proxy = 0.0
+            if {"Buyer_Exit60EligibleListings", "Buyer_ObservedExitWithin60DaysRate"}.issubset(grp.columns):
+                for _, r in grp.iterrows():
+                    e = _finite(r.get("Buyer_Exit60EligibleListings")) or 0.0
+                    rate = _finite(r.get("Buyer_ObservedExitWithin60DaysRate"))
+                    if rate is None:
+                        continue
+                    if rate > 1.5:
+                        rate = rate / 100.0
+                    eligible += max(0.0, e)
+                    exit_proxy += max(0.0, e) * max(0.0, min(1.0, rate))
+            weighted_exit_rate = (exit_proxy / eligible) if eligible > 0 else 0.0
+            # Volume says how often this family appears in the observed market;
+            # the exit component rewards evidence of listings leaving the market.
+            activity_score = hist * (0.55 + weighted_exit_rate)
+            out[(b.casefold(), m.casefold())] = {
+                "historical_distinct_listings": int(round(hist)),
+                "exit60_eligible": int(round(eligible)),
+                "observed_exit60_proxy": round(exit_proxy, 1),
+                "observed_exit60_rate": round(weighted_exit_rate, 4),
+                "activity_score": round(activity_score, 3),
+            }
+        return out
+    except Exception:
+        return {}
+
+
 def _search_vehicle_models(state: Mapping[str, Any], message: str, host: Mapping[str, Any]) -> Dict[str, Any]:
     search = _search_all(state, host)
     rows = _normal_vehicle_default_filter(search.get("results") or [], state, host)
@@ -555,29 +618,51 @@ def _search_vehicle_models(state: Mapping[str, Any], message: str, host: Mapping
     shortlist = _host(host, "shortlist_models_for_preferences")
     selector = _host(host, "_select_model_options")
     options: List[Dict[str, Any]] = []
+    summaries: List[Dict[str, Any]] = []
+    reasons: List[Dict[str, Any]] = []
+    qualified: Sequence[Mapping[str, Any]] = rows
     if callable(shortlist) and callable(selector):
         try:
-            qualified, reasons, summaries = shortlist(message, state.get("language") or "EN", _legacy_filters(state), _legacy_preferences(state), rows)
+            qualified, reasons, summaries = shortlist(
+                message, state.get("language") or "EN",
+                _legacy_filters(state), _legacy_preferences(state), rows
+            )
             summaries = summaries or _model_summary(qualified or rows)
             options = selector(summaries, reasons or [], _legacy_filters(state), max_options=8)
         except Exception:
             options = []
+            summaries = []
+            reasons = []
     if not options:
-        options = _model_summary(rows, max_groups=8)
+        summaries = _model_summary(rows, max_groups=80)
+        options = summaries[:8]
 
-    # Broad discovery should show the useful market landscape rather than anointing
-    # a niche model simply because it is one year newer. When the buyer has not
-    # named a brand/model or a qualitative priority, use current choice breadth as
-    # the first ordering signal, then recency and the price of the newest year.
     constraints = state.get("constraints") or {}
     preferences = state.get("preferences") or {}
     has_named_vehicle = bool(constraints.get("brands") or constraints.get("models"))
-    preference_values = [str(v).casefold() for v in preferences.values() if v not in (None, "", [], {})]
-    has_decision_priority = any(x for x in preference_values if not x.startswith("suv") and x not in {"car", "crossover", "pickup", "small_car", "motorcycle", "scooter"})
+    has_decision_priority = any(
+        preferences.get(k) not in (None, False, 0, "", [], {})
+        for k in ("economy","reliability","performance","luxury","comfort","practicality","family","commute","size","resale","low_mileage","newer")
+    )
+
+    # Broad discovery should favour places where the observed North Cyprus market
+    # is genuinely active, not merely whichever niche model happens to have two
+    # very new ads today. Rank the FULL matching model set by historical observed
+    # listing activity + observed exits, then use current choice/newness as ties.
     if not has_named_vehicle and not has_decision_priority:
+        broad = _model_summary(rows, max_groups=120)
+        activity = _historical_model_activity(host)
+        enriched = []
+        for item in broad:
+            x = dict(item)
+            hist = activity.get((str(x.get("brand") or "").casefold(), str(x.get("model") or "").casefold()), {})
+            x.update(hist)
+            enriched.append(x)
         options = sorted(
-            [dict(x) for x in options],
+            enriched,
             key=lambda x: (
+                -float(x.get("activity_score") or 0.0),
+                -int(x.get("historical_distinct_listings") or 0),
                 -int(x.get("count") or 0),
                 -int(x.get("newest_year") or 0),
                 float(x.get("newest_year_starting_price") or 1e18),
@@ -590,8 +675,8 @@ def _search_vehicle_models(state: Mapping[str, Any], message: str, host: Mapping
         "models":[dict(x) for x in options[:8]],
         "listings":[],
         "discovery_style":"OPTIONS" if not has_named_vehicle else "BRAND_OPTIONS",
+        "ranking_basis":"observed_market_activity" if not has_named_vehicle and not has_decision_priority else "current_fit",
     }
-
 
 def _target_listing_search(state: Mapping[str, Any], target_ids: Sequence[str], host: Mapping[str, Any]) -> Dict[str, Any]:
     targets = _model_targets_from_objects(state, target_ids)
@@ -1144,9 +1229,9 @@ def _suggestions_from_context(state: Mapping[str, Any], evidence: Mapping[str, A
             brands.append(b)
 
     text={
-        "EN": {"km":"Under 100,000 km","year":"2018 or newer","auto":"Automatic only","private":"Private sellers only","links":"Show listings","compare":"Compare these options"},
-        "TR": {"km":"100.000 km altı","year":"2018 ve üzeri","auto":"Sadece otomatik","private":"Sadece bireysel satıcılar","links":"İlanları göster","compare":"Bu seçenekleri karşılaştır"},
-        "RU": {"km":"До 100 000 км","year":"2018 года и новее","auto":"Только автомат","private":"Только частные продавцы","links":"Показать объявления","compare":"Сравнить эти варианты"},
+        "EN": {"km":"Under 100,000 km","year":"2018 or newer","auto":"Automatic only","gallery":"Gallery sellers only","links":"Show listings","compare":"Compare these options"},
+        "TR": {"km":"100.000 km altı","year":"2018 ve üzeri","auto":"Sadece otomatik","gallery":"Sadece galeriler","links":"İlanları göster","compare":"Bu seçenekleri karşılaştır"},
+        "RU": {"km":"До 100 000 км","year":"2018 года и новее","auto":"Только автомат","gallery":"Только автосалоны","links":"Показать объявления","compare":"Сравнить эти варианты"},
     }[lang]
     out=[]
     if kind=="vehicle_search":
@@ -1169,8 +1254,8 @@ def _suggestions_from_context(state: Mapping[str, Any], evidence: Mapping[str, A
             out.append(text["km"])
         if not c.get("min_year"):
             out.append(text["year"])
-        if not c.get("seller_mode"):
-            out.append(text["private"])
+        if not c.get("seller_type"):
+            out.append(text["gallery"])
     return out[:3]
 
 
@@ -1201,9 +1286,9 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
     if kind=="listings":
         n=min(5,len(evidence.get("listings") or []))
         total=int(evidence.get("count") or n)
-        if lang=="TR": return f"Önce bakmanız için {n} güncel ilan gösteriyorum" + (f" ({total} eşleşme içinden)." if total>n else ".") + " Sonuçları yıl, kilometre veya satıcı tipine göre daha da daraltabiliriz."
-        if lang=="RU": return f"Показываю {n} актуальных объявлений" + (f" из {total} совпадений." if total>n else ".") + " Дальше можно сузить по году, пробегу или типу продавца."
-        return f"Here are {n} current listings" + (f" from {total} matches." if total>n else ".") + " We can narrow them further by year, mileage or seller type."
+        if lang=="TR": return f"Aşağıda {n} güncel ilan gösteriyorum" + (f" ({total} eşleşme içinden)." if total>n else ".") + " Kartlardan ilanları açabilirsiniz; sonuçları yıl, kilometre veya satıcı tipine göre daha da daraltabiliriz."
+        if lang=="RU": return f"Ниже показаны {n} актуальных объявлений" + (f" из {total} совпадений." if total>n else ".") + " Откройте их карточками ниже; затем можно сузить по году, пробегу или типу продавца."
+        return f"I’ve put {n} current listings below" + (f" from {total} matches." if total>n else ".") + " Open them from the cards; we can narrow the set further by year, mileage or seller type."
     if kind=="comparison":
         vs=evidence.get("vehicles") or []
         if len(vs)>=2:
@@ -1242,14 +1327,14 @@ The user is trying to accomplish a decision, not receive a market report.
 
 Rules:
 - Match the response depth to the stage of the decision. Do not force a recommendation before the buyer has supplied preferences that make one meaningful.
-- DISCOVERY / vehicle_search: map the useful option set. For a broad budget + body-type request, show 4-6 model families rather than naming a winner. Current listing count may be described as current choice/supply, never as popularity or sales.
+- DISCOVERY / vehicle_search: map the useful option set. For a broad budget + body-type request, show 4-6 model families rather than naming a winner. The deterministic model order already prioritises observed market activity (historical listing volume + observed market exits) before current supply. Respect that order. You may describe these as more active parts of the observed market, but NEVER call an observed exit a confirmed sale/transaction and never equate current listing count alone with popularity.
 - When a budget exists, model discovery is about WHAT THAT BUDGET BUYS. Prefer: MODEL — up to YEAR · YEAR from £PRICE · N options. Do not lead with an old model's overall minimum price.
 - When the user names brands (for example BMW or Mercedes), show the relevant models under those brands with newest affordable year + asking price at that year + option count. Do not introduce mileage yet unless the user asks for mileage or is filtering listings by mileage.
 - COMPARISON: make it scan-friendly. Give one compact line per model using newest affordable year, price at that year, median asking price and current option count. Do not compare median/representative mileage unless the user explicitly asks about mileage. Only recommend a winner if the user's latest message asks which to choose/buy/prefer or their stated preferences clearly support one.
-- SHOW_LISTINGS: the UI displays at most five listing buttons/cards. Say how many are actually being shown (max 5), not merely the total number of matches. You may separately say 'from N matches'. Never claim 12 are shown when only 5 are surfaced.
+- SHOW_LISTINGS: the UI displays at most five listing cards below the prose. Say how many are actually being shown (max 5), not merely the total number of matches. You may separately say 'from N matches'. DO NOT repeat/list the vehicles in the prose and do not create markdown links; the structured UI cards are the single listing presentation.
 - Ordinary response 35-130 words; simple answers may be shorter. Do not exceed 170 words unless essential.
 - Use short paragraphs and compact model-per-line formatting. Avoid long prose comparisons.
-- Mention only facts present in VERIFIED_EVIDENCE. Never invent prices, years, mileage, availability, counts, dealers or links.
+- Mention only facts present in VERIFIED_EVIDENCE. Never invent prices, years, mileage, availability, counts, dealers or links. If a hard budget is active, do not mention above-budget alternatives unless the user explicitly asks what spending more would unlock.
 - Only describe something as the user's requirement/criterion if it is present in the supplied constraints/preferences or explicitly stated in user_message. Evidence attributes (for example an automatic transmission on a listing) are facts about the vehicle, not automatically user requirements.
 - Current listing asking prices are not confirmed transaction prices.
 - Observed market exit is not a confirmed sale.
@@ -1299,6 +1384,28 @@ def _evidence_validate(answer: str, evidence: Mapping[str, Any], state: Optional
         if (re.search(transmission_terms+r".{0,70}"+requirement_terms,low,re.I) or
                 re.search(requirement_terms+r".{0,70}"+transmission_terms,low,re.I)):
             return False,"UNSUPPORTED_TRANSMISSION_REQUIREMENT"
+
+    # With a hard buyer budget, do not let the renderer wander into unrelated
+    # above-budget alternatives. Small formatting/rounding tolerance only.
+    if evidence.get("kind") in {"vehicle_search", "comparison", "listings"}:
+        budget = _finite(constraints.get("budget_max"))
+        if budget is not None:
+            for token in re.findall(r"£\s*([0-9][0-9,\.]*)", answer):
+                try:
+                    value = float(token.replace(",", ""))
+                except Exception:
+                    continue
+                if value > budget * 1.02:
+                    return False,"ABOVE_BUDGET_PRICE_MENTION"
+
+    # Counts attached to 'options/listings' in discovery/comparison must come
+    # from deterministic evidence, not model improvisation.
+    if evidence.get("kind") in {"vehicle_search", "comparison"}:
+        allowed_counts = {int(x.get("count") or 0) for x in ((evidence.get("models") or []) + (evidence.get("vehicles") or []))}
+        allowed_counts.add(int(evidence.get("count") or 0))
+        for m in re.finditer(r"\b(\d{1,4})\s+(?:current\s+)?(?:options?|listings?|seçenek|ilan|вариант)", answer, re.I):
+            if int(m.group(1)) not in allowed_counts:
+                return False,"UNSUPPORTED_OPTION_COUNT"
     return True,"OK"
 
 
