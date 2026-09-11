@@ -950,7 +950,12 @@ def _register_evidence_objects(state: Dict[str, Any], evidence: Mapping[str, Any
         for item in (evidence.get("models") or [])[:12]:
             oid=register_object(state,ObjectType.MODEL.value,{"brand":item.get("brand"),"model":item.get("model")})
             shortlist.append(oid)
-        focus=shortlist[:3]
+        # Search results may contain many viable models, but conversational focus
+        # should represent the two primary options the assistant is presenting.
+        # The wider set remains in shortlist for discovery; pronouns such as
+        # "them" therefore resolve to the two active options rather than a
+        # silent third model.
+        focus=shortlist[:2]
     elif kind == "listings":
         for item in (evidence.get("listings") or [])[:12]:
             oid=register_object(state,ObjectType.LISTING.value,dict(item))
@@ -1110,8 +1115,13 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
         verdict=decision.get("verdict")
         return {"EN":f"My current view is **{str(verdict).replace('_',' ').lower()}** based on comparable asking prices. Asking prices are not confirmed sale prices, so I'd use this as a negotiation/decision signal rather than an exact valuation.","TR":f"Benim mevcut görüşüm, karşılaştırılabilir ilan fiyatlarına göre **{str(verdict).replace('_',' ').lower()}**. İlan fiyatları doğrulanmış satış fiyatları değildir; bunu kesin değer yerine karar/pazarlık sinyali olarak kullanmak daha doğru olur.","RU":f"По текущим сопоставимым ценам объявлений мой вывод: **{str(verdict).replace('_',' ').lower()}**. Цены объявлений не являются подтверждёнными ценами сделок, поэтому это ориентир для решения/торга, а не точная оценка."}[lang]
     if kind=="clarification":
-        awaiting=evidence.get("awaiting") or {}
-        q=_text((awaiting or {}).get("question"),500)
+        awaiting=evidence.get("awaiting")
+        if isinstance(awaiting, Mapping):
+            q=_text(awaiting.get("question"),500)
+        elif isinstance(awaiting, str):
+            q=_text(awaiting,500)
+        else:
+            q=None
         if q: return q
     return {"EN":"I don't have enough verified market evidence to give you a confident recommendation yet. Give me the missing vehicle or decision detail and I'll narrow it properly.","TR":"Henüz güvenli bir öneri vermek için yeterli doğrulanmış piyasa verim yok. Eksik araç veya karar detayını verirseniz doğru şekilde daraltırım.","RU":"Пока недостаточно проверенных рыночных данных для уверенной рекомендации. Дайте недостающую деталь по автомобилю или решению, и я уточню ответ."}[lang]
 
@@ -1132,6 +1142,7 @@ Rules:
 - Ordinary response 35-110 words; simple answers may be shorter. Do not exceed 150 words unless essential.
 - Use 1-3 short paragraphs; bullets only for a genuine 2-3 option comparison.
 - Mention only facts present in VERIFIED_EVIDENCE. Never invent prices, years, mileage, availability, counts, dealers or links.
+- Only describe something as the user's requirement/criterion if it is present in the supplied constraints/preferences or explicitly stated in user_message. Evidence attributes (for example an automatic transmission on a listing) are facts about the vehicle, not automatically user requirements.
 - Current listing asking prices are not confirmed transaction prices.
 - Observed market exit is not a confirmed sale.
 - Price reduction is asking-price pressure, not depreciation/value retention.
@@ -1158,7 +1169,7 @@ Rules:
         return fallback
 
 
-def _evidence_validate(answer: str, evidence: Mapping[str, Any]) -> Tuple[bool,str]:
+def _evidence_validate(answer: str, evidence: Mapping[str, Any], state: Optional[Mapping[str, Any]]=None) -> Tuple[bool,str]:
     """Conservative post-render checks for high-risk hallucination classes."""
     low=answer.casefold()
     # No raw URL should be emitted; structured actions own listing links.
@@ -1170,6 +1181,16 @@ def _evidence_validate(answer: str, evidence: Mapping[str, Any]) -> Tuple[bool,s
         if isinstance(evidence.get(key),list): evidence_count=max(evidence_count,len(evidence.get(key)))
     if evidence_count>0 and re.search(r"\b(?:no|none|nothing)\b.{0,40}\b(?:listing|option|vehicle|car|match)|\b(?:ilan|seçenek|arac).{0,30}(?:yok|bulunm)|\bнет.{0,30}(?:объяв|вариант)",low,re.I):
         return False,"FALSE_ABSENCE_CLAIM"
+
+    # A listing/model attribute must never be promoted into a user requirement.
+    # This catches the high-value transmission case deterministically in EN/TR/RU.
+    constraints=((state or {}).get("constraints") or {}) if isinstance(state, Mapping) else {}
+    if not constraints.get("transmission"):
+        transmission_terms=r"(?:automatic(?:-transmission)?|manual|otomatik|manuel|автомат(?:ическ)?|механическ)"
+        requirement_terms=r"(?:requirement|requirements|criteria|criterion|kriter|gereksin|şart|требован|критер)"
+        if (re.search(transmission_terms+r".{0,70}"+requirement_terms,low,re.I) or
+                re.search(requirement_terms+r".{0,70}"+transmission_terms,low,re.I)):
+            return False,"UNSUPPORTED_TRANSMISSION_REQUIREMENT"
     return True,"OK"
 
 
@@ -1260,7 +1281,7 @@ def handle_v10_request(data: Mapping[str, Any], host: Mapping[str, Any]) -> Tupl
     updated_state["awaiting"]=resolved_plan.get("awaiting") if action==Action.ASK_CLARIFICATION.value else None
 
     answer=_render_answer(message,language,updated_state,action,evidence,decision,host)
-    valid,reason=_evidence_validate(answer,evidence)
+    valid,reason=_evidence_validate(answer,evidence,updated_state)
     if not valid:
         print(f"V10_RENDER_VALIDATION_FALLBACK: {reason}",flush=True)
         answer=_fallback_answer(language,updated_state,decision,evidence)
