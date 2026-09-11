@@ -23,7 +23,7 @@ from otodeger_v10_state import (
     apply_turn_plan, get_state_service, register_object,
 )
 
-V10_VERSION = "10.4-relevance-consistency"
+V10_VERSION = "10.5-guided-refinement"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -180,12 +180,100 @@ def _audience_from_access(access_tier: str) -> str:
 
 
 def _deterministic_followup_plan(message: str, state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """Execute explicit offered actions without making an LLM rediscover referents."""
-    low = _text(message, 1200).casefold()
+    """Execute explicit offered actions and guided filter prompts deterministically."""
+    raw = _text(message, 1200)
+    low = raw.casefold().strip()
     offered = state.get("offered_action") or {}
     offered_type = str(offered.get("type") or "").upper()
     offered_targets = list(offered.get("target_ids") or [])
     focus_ids = list(((state.get("focus") or {}).get("object_ids") or []))
+    lang = _lang(state.get("language") or "EN")
+
+    # If the UI has asked the user for a bound, a bare numeric reply is enough.
+    awaiting = state.get("awaiting") or {}
+    awaiting_field = str(awaiting.get("field") or "") if isinstance(awaiting, Mapping) else ""
+    if awaiting_field in {"min_year", "max_km"}:
+        m = re.search(r"\b([\d.,]+\s*[kK]?)\b", raw)
+        if m:
+            token = m.group(1).replace(" ", "")
+            try:
+                if token.lower().endswith("k"):
+                    value = float(token[:-1].replace(",", ".")) * 1000
+                else:
+                    value = float(token.replace(",", ""))
+            except Exception:
+                value = None
+            if value is not None:
+                if awaiting_field == "min_year" and 1950 <= value <= 2100:
+                    return {
+                        "transition": Transition.REFINE.value,
+                        "action": Action.SEARCH_VEHICLES.value,
+                        "job": state.get("job") or Job.FIND_A_CAR.value,
+                        "constraints_delta": {"min_year": int(round(value))},
+                        "awaiting": None,
+                    }
+                if awaiting_field == "max_km" and 0 <= value <= 2_000_000:
+                    return {
+                        "transition": Transition.REFINE.value,
+                        "action": Action.SEARCH_VEHICLES.value,
+                        "job": state.get("job") or Job.FIND_A_CAR.value,
+                        "constraints_delta": {"max_km": int(round(value))},
+                        "awaiting": None,
+                    }
+
+    # Generic UI controls intentionally ask for the user's own bound instead of
+    # silently applying an arbitrary 2018/100k rule.
+    if low in {"set minimum year", "set a minimum year", "set year minimum", "minimum year filter",
+               "minimum yılı belirle", "minimum yili belirle", "minimum model yılı", "minimum model yili",
+               "задать минимальный год", "минимальный год"}:
+        q = {
+            "EN":"What is the oldest model year you would still consider?",
+            "TR":"Değerlendireceğiniz en eski model yılı kaç olsun?",
+            "RU":"Какой самый ранний год выпуска вы готовы рассматривать?",
+        }[lang]
+        return {"transition":Transition.CONTINUE.value,"action":Action.ASK_CLARIFICATION.value,
+                "job":state.get("job") or Job.FIND_A_CAR.value,"awaiting":{"field":"min_year","question":q}}
+
+    if low in {"set mileage limit", "set a mileage limit", "set km limit", "set a km limit", "maximum mileage",
+               "km sınırı belirle", "km siniri belirle", "kilometre sınırı belirle", "kilometre siniri belirle",
+               "задать лимит пробега", "максимальный пробег"}:
+        q = {
+            "EN":"What maximum mileage would you be comfortable with?",
+            "TR":"En fazla kaç kilometre sizin için uygun olur?",
+            "RU":"Какой максимальный пробег для вас приемлем?",
+        }[lang]
+        return {"transition":Transition.CONTINUE.value,"action":Action.ASK_CLARIFICATION.value,
+                "job":state.get("job") or Job.FIND_A_CAR.value,"awaiting":{"field":"max_km","question":q}}
+
+    if low in {"economy or luxury?", "economy or luxury", "choose economy or luxury",
+               "ekonomik mi lüks mü?", "ekonomik mi luks mu?", "ekonomik mi lüks mü", "экономичность или премиум?"}:
+        q = {
+            "EN":"Would you rather prioritise economical ownership or a more premium/luxury feel?",
+            "TR":"Daha ekonomik kullanım mı, yoksa daha premium/lüks bir araç mı önceliğiniz?",
+            "RU":"Что важнее: экономичность владения или более премиальное ощущение?",
+        }[lang]
+        return {"transition":Transition.CONTINUE.value,"action":Action.ASK_CLARIFICATION.value,
+                "job":state.get("job") or Job.FIND_A_CAR.value,"awaiting":{"field":"preference_direction","question":q}}
+
+    if low in {"german or japanese?", "german or japanese", "choose german or japanese",
+               "alman mı japon mu?", "alman mi japon mu?", "немецкие или японские?"}:
+        q = {
+            "EN":"Do you want me to focus on German brands, Japanese brands, or keep both in the mix?",
+            "TR":"Alman markalarına mı, Japon markalarına mı odaklanalım, yoksa ikisini de açık mı tutalım?",
+            "RU":"Сфокусироваться на немецких марках, японских или оставить оба варианта?",
+        }[lang]
+        return {"transition":Transition.CONTINUE.value,"action":Action.ASK_CLARIFICATION.value,
+                "job":state.get("job") or Job.FIND_A_CAR.value,"awaiting":{"field":"brand_origin","question":q}}
+
+    if low in {"broaden year range", "broaden the year range", "older cars too", "consider older years",
+               "yıl aralığını genişlet", "yil araligini genislet", "daha eski araçlar da", "расширить диапазон лет"}:
+        q = {
+            "EN":"What is the oldest model year you would be comfortable considering?",
+            "TR":"En eski hangi model yılına kadar inmeyi düşünürsünüz?",
+            "RU":"До какого минимального года выпуска вы готовы расширить поиск?",
+        }[lang]
+        return {"transition":Transition.CONTINUE.value,"action":Action.ASK_CLARIFICATION.value,
+                "job":state.get("job") or Job.FIND_A_CAR.value,"awaiting":{"field":"min_year","question":q}}
 
     acceptance = bool(re.fullmatch(r"\s*(?:yes|yeah|yep|sure|ok|okay|do it|go ahead|please|evet|tamam|olur|göster|goster|да|хорошо|давай)\s*[.!]?\s*", low, flags=re.I))
     show_links = bool(re.search(r"\b(?:show|see|send|give|open).{0,20}\b(?:links?|listings?|ads?)\b|\b(?:links?|listings?)\b|\b(?:ilanları|ilanlari|linkleri|göster|goster)\b|\b(?:ссылк|объявлен)", low, re.I))
@@ -415,7 +503,15 @@ def _authoritative_numeric_constraints(message: str, parsed: Mapping[str, Any], 
     # A bare 15k / 15.000 next to clear budget wording.
     if not flat:
         m=re.search(r"\b([\d.,]+\s*[kK]?)\b", str(message))
-        if m and re.search(r"\b(?:budget|bütçe|butce|бюджет|under|below|up to|max(?:imum)?|ceiling|spend|afford)\b", low, re.I):
+        # Do not mistake mileage language such as "under 100,000 km" for a
+        # budget update merely because it contains the word "under". Budget
+        # inference from a bare number is only allowed when that number is not
+        # immediately qualified as kilometres/mileage.
+        number_is_mileage = False
+        if m:
+            after = low[m.end():m.end()+24]
+            number_is_mileage = bool(re.match(r"\s*(?:km|kilomet(?:er|re)s?)\b", after, re.I))
+        if m and not number_is_mileage and re.search(r"\b(?:budget|bütçe|butce|бюджет|under|below|up to|max(?:imum)?|ceiling|spend|afford)\b", low, re.I):
             v=parse_token(m.group(1).replace(" ",""))
             if v is not None and 100 <= v <= 1_000_000: flat.append(v)
     if flat:
@@ -1287,47 +1383,67 @@ def _actions_from_evidence(state: Mapping[str, Any], action: str, evidence: Mapp
 
 
 def _suggestions_from_context(state: Mapping[str, Any], evidence: Mapping[str, Any], language: str) -> List[str]:
-    """Deterministic, useful narrowing prompts. Keep them actionable and short."""
+    """Decision-guiding prompts. Ask for the user's bounds instead of inventing them."""
     lang=_lang(language)
     kind=evidence.get("kind")
     c=state.get("constraints") or {}
     models=evidence.get("models") or evidence.get("vehicles") or []
 
     base={
-        "EN": {"km":"Under 100,000 km","year18":"2018 or newer","year15":"2015 or newer","auto":"Automatic only","gallery":"Gallery sellers only","links":"Show listings","compare":"Compare these options","other":"Show other brands"},
-        "TR": {"km":"100.000 km altı","year18":"2018 ve üzeri","year15":"2015 ve üzeri","auto":"Sadece otomatik","gallery":"Sadece galeriler","links":"İlanları göster","compare":"Bu seçenekleri karşılaştır","other":"Diğer markaları göster"},
-        "RU": {"km":"До 100 000 км","year18":"2018 года и новее","year15":"2015 года и новее","auto":"Только автомат","gallery":"Только автосалоны","links":"Показать объявления","compare":"Сравнить эти варианты","other":"Показать другие марки"},
+        "EN": {"year":"Set minimum year","km":"Set mileage limit","auto":"Automatic only","gallery":"Gallery sellers only",
+               "links":"Show listings","compare":"Compare these options","other":"Show other brands",
+               "econlux":"Economy or luxury?","origin":"German or Japanese?","broaden":"Broaden year range"},
+        "TR": {"year":"Minimum yılı belirle","km":"KM sınırı belirle","auto":"Sadece otomatik","gallery":"Sadece galeriler",
+               "links":"İlanları göster","compare":"Bu seçenekleri karşılaştır","other":"Diğer markaları göster",
+               "econlux":"Ekonomik mi lüks mü?","origin":"Alman mı Japon mu?","broaden":"Yıl aralığını genişlet"},
+        "RU": {"year":"Задать минимальный год","km":"Задать лимит пробега","auto":"Только автомат","gallery":"Только автосалоны",
+               "links":"Показать объявления","compare":"Сравнить эти варианты","other":"Показать другие марки",
+               "econlux":"Экономичность или премиум?","origin":"Немецкие или японские?","broaden":"Расширить диапазон лет"},
     }[lang]
 
     out=[]
     if kind=="vehicle_search":
-        if len(models)>=2:
-            out.append(base["compare"])
-        # If the current brand refinement has very thin choice, offer a slightly
-        # broader minimum-year filter instead of always forcing 2018+.
-        thin = bool(models) and sum(int(x.get("count") or 0) for x in models[:5]) <= 8
-        if not c.get("min_year"):
-            out.append(base["year15"] if thin else base["year18"])
-        elif evidence.get("alternative_brands"):
-            out.append(base["other"])
-        if not c.get("max_km"):
-            out.append(base["km"])
-        if not c.get("transmission") and not c.get("transmissions") and len(out)<3:
-            out.append(base["auto"])
+        # Broad discovery should learn taste before stacking arbitrary hard filters.
+        named = bool(c.get("brands") or c.get("models"))
+        if not named:
+            out.extend([base["econlux"], base["year"], base["origin"]])
+        else:
+            if len(models)>=2:
+                out.append(base["compare"])
+            if not c.get("min_year"):
+                out.append(base["year"])
+            if not c.get("max_km") and len(out)<3:
+                out.append(base["km"])
+            if evidence.get("alternative_brands") and len(out)<3:
+                out.append(base["other"])
     elif kind=="comparison":
-        out.append(base["links"])
-        if not c.get("max_km"):
-            out.append(base["km"])
-        if not c.get("min_year"):
-            out.append(base["year18"])
+        vehicles=evidence.get("vehicles") or []
+        # If each newest-year route is represented by only one or two cars, the
+        # best next step is to choose a model or broaden the year range—not add
+        # another arbitrary filter.
+        thin = bool(vehicles) and max(int(x.get("newest_year_count") or 0) for x in vehicles) <= 2
+        if thin and vehicles:
+            for x in vehicles[:2]:
+                label=" ".join(v for v in [_text(x.get("brand"),80),_text(x.get("model"),100)] if v)
+                if label:
+                    out.append(("Focus on " + label) if lang=="EN" else ((label + "'e odaklan") if lang=="TR" else ("Сфокусироваться на " + label)))
+            if len(out)<3:
+                out.append(base["broaden"])
+        else:
+            out.append(base["links"])
+            if not c.get("min_year"):
+                out.append(base["year"])
+            if not c.get("max_km") and len(out)<3:
+                out.append(base["km"])
     elif kind=="listings":
+        if not c.get("min_year"):
+            out.append(base["year"])
         if not c.get("max_km"):
             out.append(base["km"])
-        if not c.get("min_year"):
-            out.append(base["year18"])
         if not c.get("seller_type"):
             out.append(base["gallery"])
     return out[:3]
+
 
 def _compact_evidence(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     e=copy.deepcopy(dict(evidence))
@@ -1404,6 +1520,10 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
 def _render_answer(message: str, language: str, state: Mapping[str, Any], action: str, evidence: Mapping[str, Any], decision: Mapping[str, Any], host: Mapping[str, Any]) -> str:
     post=_host(host,"_openai_post"); model=_host(host,"OPENAI_MODEL","gpt-5.6-luna")
     fallback=_fallback_answer(language,state,decision,evidence)
+    # Guided UI prompts are deterministic questions; do not let the renderer turn
+    # them into a search result or invent a bound.
+    if evidence.get("kind") == "clarification":
+        return fallback
     if not callable(post): return fallback
     instructions=f"""
 You are OtoDeğer AI, a premium decision copilot for the North Cyprus vehicle market.
@@ -1415,6 +1535,8 @@ Rules:
 - DISCOVERY / vehicle_search: map the useful option set. For a broad budget + body-type request, show 4-6 model families rather than naming a winner. The deterministic model order already prioritises observed market activity (historical listing volume + observed market exits) before current supply. Respect that order. Explicitly make clear these are SOME of the more active matches, not the entire market. If VERIFIED_EVIDENCE contains alternative_brands, briefly leave the door open to those lower-activity alternatives. Never call an observed exit a confirmed sale/transaction and never equate current listing count alone with popularity.
 - When a budget exists, model discovery is about WHAT THAT BUDGET BUYS. Prefer: MODEL — up to YEAR · YEAR from £PRICE · N options. Do not lead with an old model's overall minimum price.
 - When the user names brands (for example BMW or Mercedes), show the relevant models under those brands with newest affordable year + asking price at that year + option count. Do not introduce mileage yet unless the user asks for mileage or is filtering listings by mileage.
+- Do not append routine caveats such as "asking prices are not confirmed transaction prices" to ordinary discovery/comparison replies. Preserve that distinction internally and mention it only when it materially affects the decision.
+- When the filtered choice is thin (especially 1-2 cars at the newest viable year), do not pretend the market is broad. Say it is thin and guide the user toward choosing a model, relaxing the minimum year, widening brand scope, or another constraint that actually increases choice.
 - COMPARISON: make it scan-friendly. Stay on the SAME newest affordable year when quoting price statistics. Give one compact line per model using newest affordable year, the price/range at that year, number of listings at that year, and optionally the total number matching the user's active filters. NEVER pair a newest-year headline with a median calculated across older years. Do not compare mileage unless the user explicitly asks about mileage. Only recommend a winner if the user's latest message asks which to choose/buy/prefer or their stated preferences clearly support one.
 - SHOW_LISTINGS: the UI displays at most five information-rich clickable listing rows below the prose. Each row contains the exact year/brand/model/variant plus available price, KM, transmission, location and seller/gallery. The prose must be ONE short introductory sentence only; NEVER repeat/list any vehicle, price, seller, mileage or model in the prose. The structured clickable rows are the single listing presentation.
 - Ordinary response 35-130 words; simple answers may be shorter. Do not exceed 170 words unless essential.
