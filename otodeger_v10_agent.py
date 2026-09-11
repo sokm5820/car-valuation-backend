@@ -23,7 +23,7 @@ from otodeger_v10_state import (
     apply_turn_plan, get_state_service, register_object,
 )
 
-V10_VERSION = "10.0-gold"
+V10_VERSION = "10.1-conversation"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -565,8 +565,32 @@ def _search_vehicle_models(state: Mapping[str, Any], message: str, host: Mapping
     if not options:
         options = _model_summary(rows, max_groups=8)
 
-    # Keep a compact evidence-first top set. The renderer normally surfaces <=3.
-    return {"kind":"vehicle_search", "count":len(rows), "models":[dict(x) for x in options[:8]], "listings":[]}
+    # Broad discovery should show the useful market landscape rather than anointing
+    # a niche model simply because it is one year newer. When the buyer has not
+    # named a brand/model or a qualitative priority, use current choice breadth as
+    # the first ordering signal, then recency and the price of the newest year.
+    constraints = state.get("constraints") or {}
+    preferences = state.get("preferences") or {}
+    has_named_vehicle = bool(constraints.get("brands") or constraints.get("models"))
+    preference_values = [str(v).casefold() for v in preferences.values() if v not in (None, "", [], {})]
+    has_decision_priority = any(x for x in preference_values if not x.startswith("suv") and x not in {"car", "crossover", "pickup", "small_car", "motorcycle", "scooter"})
+    if not has_named_vehicle and not has_decision_priority:
+        options = sorted(
+            [dict(x) for x in options],
+            key=lambda x: (
+                -int(x.get("count") or 0),
+                -int(x.get("newest_year") or 0),
+                float(x.get("newest_year_starting_price") or 1e18),
+            ),
+        )
+
+    return {
+        "kind":"vehicle_search",
+        "count":len(rows),
+        "models":[dict(x) for x in options[:8]],
+        "listings":[],
+        "discovery_style":"OPTIONS" if not has_named_vehicle else "BRAND_OPTIONS",
+    }
 
 
 def _target_listing_search(state: Mapping[str, Any], target_ids: Sequence[str], host: Mapping[str, Any]) -> Dict[str, Any]:
@@ -677,7 +701,9 @@ def _compare_models(state: Mapping[str, Any], target_ids: Sequence[str], host: M
             "object_id": oid, "brand":payload.get("brand"), "model":payload.get("model"),
             "count":len(rows), "starting_price":min(prices) if prices else None,
             "median_price":statistics.median(prices) if prices else None,
-            "newest_year":max(years) if years else None, "median_km":statistics.median(kms) if kms else None,
+            "newest_year":max(years) if years else None,
+            "newest_year_starting_price":_finite(best_newest.get("price")),
+            "median_km":statistics.median(kms) if kms else None,
             "representative_listing":best_newest,
         })
     return {"kind":"comparison", "vehicles":comps}
@@ -1009,7 +1035,7 @@ def _register_evidence_objects(state: Dict[str, Any], evidence: Mapping[str, Any
     return focus, shortlist
 
 
-def _decision_policy(state: Mapping[str, Any], action: str, evidence: Mapping[str, Any]) -> Dict[str, Any]:
+def _decision_policy(state: Mapping[str, Any], action: str, evidence: Mapping[str, Any], message: str = "") -> Dict[str, Any]:
     kind=evidence.get("kind")
     if kind == "purchase_evaluation":
         if evidence.get("status") != "ok" or evidence.get("price") is None:
@@ -1029,12 +1055,30 @@ def _decision_policy(state: Mapping[str, Any], action: str, evidence: Mapping[st
         return {"verdict":verdict,"reason":f"Offer is {abs(vs):.1f}% {'above' if vs>0 else 'below'} the comparable asking-price median."}
     if kind == "vehicle_search":
         models=evidence.get("models") or []
-        return {"verdict":"RECOMMEND_TOP_OPTION" if models else "NO_MATCHES", "preferred":models[0] if models else None}
+        # Discovery is an option-mapping step unless the buyer has supplied a
+        # decision preference strong enough to justify a recommendation.
+        preferences=state.get("preferences") or {}
+        priority_text=" ".join(str(v).casefold() for v in preferences.values() if v not in (None, "", [], {}))
+        has_decision_priority=any(term in priority_text for term in ("econom", "reliab", "performance", "luxury", "comfort", "practical", "family", "commute"))
+        return {
+            "verdict": ("RECOMMEND_TOP_OPTION" if models and has_decision_priority else "PRESENT_OPTIONS") if models else "NO_MATCHES",
+            "preferred": models[0] if models and has_decision_priority else None,
+        }
     if kind == "comparison":
         vehicles=evidence.get("vehicles") or []
         if not vehicles: return {"verdict":"INSUFFICIENT_EVIDENCE"}
-        # Neutral deterministic utility score: newer reachable representative + lower mileage + lower entry price.
-        ranked=sorted(vehicles,key=lambda x:(-(_int(x.get("newest_year")) or 0), _finite(x.get("median_km")) or 1e12, _finite(x.get("starting_price")) or 1e18))
+        low=_text(message,500).casefold()
+        asks_for_choice=bool(re.search(r"\b(?:which|choose|pick|prefer|better|recommend|would you)\b|hangisi|seç|sec|tercih|öner|oner|какой|выбрать|лучше|предпоч", low, re.I))
+        if not asks_for_choice:
+            return {"verdict":"COMPARE_OPTIONS"}
+        # When the buyer explicitly asks for a choice, compare what the budget
+        # actually reaches: newest affordable year, its asking price, then breadth.
+        ranked=sorted(vehicles,key=lambda x:(
+            -(_int(x.get("newest_year")) or 0),
+            _finite(x.get("newest_year_starting_price")) or 1e18,
+            -int(x.get("count") or 0),
+            _finite(x.get("median_price")) or 1e18,
+        ))
         return {"verdict":"PREFER", "preferred_object_id":ranked[0].get("object_id")}
     if kind == "business_pricing":
         return {"verdict":"REVIEW_PRIORITY_PRICES" if evidence.get("vehicles") else "NO_PRIORITY_ISSUES_FOUND"}
@@ -1087,6 +1131,49 @@ def _actions_from_evidence(state: Mapping[str, Any], action: str, evidence: Mapp
     return actions,None
 
 
+def _suggestions_from_context(state: Mapping[str, Any], evidence: Mapping[str, Any], language: str) -> List[str]:
+    """Deterministic, useful narrowing prompts. Keep them actionable and short."""
+    lang=_lang(language)
+    kind=evidence.get("kind")
+    c=state.get("constraints") or {}
+    models=evidence.get("models") or evidence.get("vehicles") or []
+    brands=[]
+    for item in models:
+        b=_text(item.get("brand"),80)
+        if b and b not in brands:
+            brands.append(b)
+
+    text={
+        "EN": {"km":"Under 100,000 km","year":"2018 or newer","auto":"Automatic only","private":"Private sellers only","links":"Show listings","compare":"Compare these options"},
+        "TR": {"km":"100.000 km altı","year":"2018 ve üzeri","auto":"Sadece otomatik","private":"Sadece bireysel satıcılar","links":"İlanları göster","compare":"Bu seçenekleri karşılaştır"},
+        "RU": {"km":"До 100 000 км","year":"2018 года и новее","auto":"Только автомат","private":"Только частные продавцы","links":"Показать объявления","compare":"Сравнить эти варианты"},
+    }[lang]
+    out=[]
+    if kind=="vehicle_search":
+        if len(models)>=2:
+            out.append(text["compare"])
+        if not c.get("min_year"):
+            out.append(text["year"])
+        if not c.get("max_km"):
+            out.append(text["km"])
+        if not c.get("transmission") and not c.get("transmissions"):
+            out.append(text["auto"])
+    elif kind=="comparison":
+        out.append(text["links"])
+        if not c.get("max_km"):
+            out.append(text["km"])
+        if not c.get("min_year"):
+            out.append(text["year"])
+    elif kind=="listings":
+        if not c.get("max_km"):
+            out.append(text["km"])
+        if not c.get("min_year"):
+            out.append(text["year"])
+        if not c.get("seller_mode"):
+            out.append(text["private"])
+    return out[:3]
+
+
 def _compact_evidence(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     e=copy.deepcopy(dict(evidence))
     # Keep model context rich but bounded.
@@ -1101,16 +1188,34 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
         models=evidence.get("models") or []
         if not models:
             return {"EN":"I couldn't find a current match for those constraints. The most useful next step is to loosen one constraint.","TR":"Bu kriterlere uyan güncel bir seçenek bulamadım. En faydalı sonraki adım kriterlerden birini gevşetmek.","RU":"Я не нашёл актуальных вариантов по этим условиям. Лучше всего немного ослабить одно из ограничений."}[lang]
-        m=models[0]; label=f"{m.get('brand')} {m.get('model')}"; year=m.get('newest_year'); price=_money(m.get('newest_year_starting_price') or m.get('starting_price'))
-        return {"EN":f"I'd start with the **{label}**. Your current constraints reach up to {year or 'the available model years'} from about {price or 'the current market level'}. I can also show the strongest current listings for it.","TR":f"İlk olarak **{label}** modeline bakardım. Mevcut kriterlerinizle {year or 'uygun model yıllarına'} yaklaşık {price or 'güncel piyasa seviyesinden'} ulaşabiliyorsunuz. İsterseniz en güçlü güncel ilanları da gösterebilirim.","RU":f"Я бы начал с **{label}**. При ваших условиях доступны варианты вплоть до {year or 'подходящих годов'} примерно от {price or 'текущего рыночного уровня'}. Могу также показать лучшие актуальные объявления."}[lang]
+        shown=models[:5]
+        def line(m):
+            label=f"{m.get('brand')} {m.get('model')}"
+            year=m.get('newest_year'); price=_money(m.get('newest_year_starting_price'))
+            count=int(m.get('count') or 0)
+            if lang=="TR": return f"**{label}** — {year or 'yıl bilgisi yok'} · {price or 'fiyat yok'}'dan · {count} seçenek"
+            if lang=="RU": return f"**{label}** — до {year or '—'} · {price or '—'} · {count} вариантов"
+            return f"**{label}** — up to {year or '—'} · {year or 'newest year'} from {price or '—'} · {count} options"
+        intro={"EN":"Your budget reaches several current options. I’d narrow the field before choosing a favourite.","TR":"Bütçeniz birkaç güncel seçeneğe ulaşıyor. Bir favori seçmeden önce alanı daraltmak daha doğru.","RU":"Ваш бюджет охватывает несколько актуальных вариантов. Сначала лучше сузить выбор, а не выбирать фаворита."}[lang]
+        return intro+"\n"+"\n".join(line(m) for m in shown)
     if kind=="listings":
-        n=len(evidence.get("listings") or [])
-        return {"EN":f"I found {n} current listing{'s' if n!=1 else ''} worth opening first. I've put the direct listing buttons below.","TR":f"İlk bakmaya değer {n} güncel ilan buldum. Doğrudan ilan bağlantılarını aşağıya ekledim.","RU":f"Я нашёл {n} актуальных объявлений, которые стоит открыть в первую очередь. Прямые ссылки ниже."}[lang]
+        n=min(5,len(evidence.get("listings") or []))
+        total=int(evidence.get("count") or n)
+        if lang=="TR": return f"Önce bakmanız için {n} güncel ilan gösteriyorum" + (f" ({total} eşleşme içinden)." if total>n else ".") + " Sonuçları yıl, kilometre veya satıcı tipine göre daha da daraltabiliriz."
+        if lang=="RU": return f"Показываю {n} актуальных объявлений" + (f" из {total} совпадений." if total>n else ".") + " Дальше можно сузить по году, пробегу или типу продавца."
+        return f"Here are {n} current listings" + (f" from {total} matches." if total>n else ".") + " We can narrow them further by year, mileage or seller type."
     if kind=="comparison":
         vs=evidence.get("vehicles") or []
         if len(vs)>=2:
             a,b=vs[0],vs[1]
-            return {"EN":f"Between the **{a.get('brand')} {a.get('model')}** and **{b.get('brand')} {b.get('model')}**, I'd focus first on the option that gives you the better combination of year, mileage and asking price within your constraints. The current evidence is summarized above internally; I can show the actual listings next.","TR":f"**{a.get('brand')} {a.get('model')}** ile **{b.get('brand')} {b.get('model')}** arasında, kriterleriniz içinde yıl, kilometre ve fiyat dengesini daha iyi veren seçeneğe öncelik verirdim. Sonraki adımda gerçek ilanları gösterebilirim.","RU":f"Между **{a.get('brand')} {a.get('model')}** и **{b.get('brand')} {b.get('model')}** я бы сначала смотрел на вариант с лучшим сочетанием года, пробега и цены в рамках ваших условий. Следующим шагом могу показать конкретные объявления."}[lang]
+            def comp_line(x):
+                label=f"{x.get('brand')} {x.get('model')}"
+                year=x.get('newest_year'); price=_money(x.get('newest_year_starting_price'))
+                med=_money(x.get('median_price')); count=int(x.get('count') or 0)
+                if lang=="TR": return f"**{label}** — en yeni {year or '—'} · {year or 'bu yıl'} {price or '—'}'dan · medyan {med or '—'} · {count} seçenek"
+                if lang=="RU": return f"**{label}** — новейший {year or '—'} · {price or '—'} · медиана {med or '—'} · {count} вариантов"
+                return f"**{label}** — newest {year or '—'} · {year or 'newest year'} from {price or '—'} · median {med or '—'} · {count} options"
+            return comp_line(a)+"\n"+comp_line(b)
     if kind in {"purchase_evaluation","sale_evaluation"}:
         verdict=decision.get("verdict")
         return {"EN":f"My current view is **{str(verdict).replace('_',' ').lower()}** based on comparable asking prices. Asking prices are not confirmed sale prices, so I'd use this as a negotiation/decision signal rather than an exact valuation.","TR":f"Benim mevcut görüşüm, karşılaştırılabilir ilan fiyatlarına göre **{str(verdict).replace('_',' ').lower()}**. İlan fiyatları doğrulanmış satış fiyatları değildir; bunu kesin değer yerine karar/pazarlık sinyali olarak kullanmak daha doğru olur.","RU":f"По текущим сопоставимым ценам объявлений мой вывод: **{str(verdict).replace('_',' ').lower()}**. Цены объявлений не являются подтверждёнными ценами сделок, поэтому это ориентир для решения/торга, а не точная оценка."}[lang]
@@ -1136,11 +1241,14 @@ Respond entirely in {_lang(language)}. Do not switch languages because vehicle n
 The user is trying to accomplish a decision, not receive a market report.
 
 Rules:
-- Lead with the conclusion/recommendation when evidence supports one.
-- Clear best route: normally one recommendation + 1-2 decisive facts.
-- Genuine tradeoff: at most 2-3 options.
-- Ordinary response 35-110 words; simple answers may be shorter. Do not exceed 150 words unless essential.
-- Use 1-3 short paragraphs; bullets only for a genuine 2-3 option comparison.
+- Match the response depth to the stage of the decision. Do not force a recommendation before the buyer has supplied preferences that make one meaningful.
+- DISCOVERY / vehicle_search: map the useful option set. For a broad budget + body-type request, show 4-6 model families rather than naming a winner. Current listing count may be described as current choice/supply, never as popularity or sales.
+- When a budget exists, model discovery is about WHAT THAT BUDGET BUYS. Prefer: MODEL — up to YEAR · YEAR from £PRICE · N options. Do not lead with an old model's overall minimum price.
+- When the user names brands (for example BMW or Mercedes), show the relevant models under those brands with newest affordable year + asking price at that year + option count. Do not introduce mileage yet unless the user asks for mileage or is filtering listings by mileage.
+- COMPARISON: make it scan-friendly. Give one compact line per model using newest affordable year, price at that year, median asking price and current option count. Do not compare median/representative mileage unless the user explicitly asks about mileage. Only recommend a winner if the user's latest message asks which to choose/buy/prefer or their stated preferences clearly support one.
+- SHOW_LISTINGS: the UI displays at most five listing buttons/cards. Say how many are actually being shown (max 5), not merely the total number of matches. You may separately say 'from N matches'. Never claim 12 are shown when only 5 are surfaced.
+- Ordinary response 35-130 words; simple answers may be shorter. Do not exceed 170 words unless essential.
+- Use short paragraphs and compact model-per-line formatting. Avoid long prose comparisons.
 - Mention only facts present in VERIFIED_EVIDENCE. Never invent prices, years, mileage, availability, counts, dealers or links.
 - Only describe something as the user's requirement/criterion if it is present in the supplied constraints/preferences or explicitly stated in user_message. Evidence attributes (for example an automatic transmission on a listing) are facts about the vehicle, not automatically user requirements.
 - Current listing asking prices are not confirmed transaction prices.
@@ -1269,7 +1377,7 @@ def handle_v10_request(data: Mapping[str, Any], host: Mapping[str, Any]) -> Tupl
     if evidence_focus:
         updated_state["focus"]={"object_ids":evidence_focus[:20]}
 
-    decision=_decision_policy(updated_state,action,evidence)
+    decision=_decision_policy(updated_state,action,evidence,message)
     actions,offered=_actions_from_evidence(updated_state,action,evidence,language)
     if offered is not None:
         updated_state["offered_action"]=offered
@@ -1309,7 +1417,7 @@ def handle_v10_request(data: Mapping[str, Any], host: Mapping[str, Any]) -> Tupl
         "stage":"v10_decision_agent","filters":compat_filters,"preferences":compat_preferences,
         "count":int(evidence.get("count") or len(listings) or len(models) or len(business_options) or 0),
         "returned":len(listings),"results":listings[:20],"model_options":models[:8],
-        "business_options":business_options[:12],"actions":actions,"suggestions":[],
+        "business_options":business_options[:12],"actions":actions,"suggestions":_suggestions_from_context(saved.state,evidence,language),
         "assistant_state":_public_state_summary(saved.state),
     },200
 
