@@ -1,6 +1,8 @@
-flask
-flask-cors
-pandas
-requests
-gspread
-google-auth
+Flask>=3.0,<4
+flask-cors>=4.0,<7
+pandas>=2.1,<3
+requests>=2.31,<3
+gspread>=6.0,<7
+google-auth>=2.29,<3
+gunicorn>=21.2,<24
+redis>=5.0,<7

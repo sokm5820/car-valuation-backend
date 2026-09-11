@@ -13,6 +13,11 @@ import re
 from datetime import datetime, timezone
 from collections import defaultdict, deque
 
+# OtoDeğer V10 decision-agent orchestration. The valuation engine remains
+# isolated below; V10 only replaces the conversational assistant route.
+from otodeger_v10_agent import V10_VERSION, handle_v10_request
+from otodeger_v10_state import get_state_service, StorageUnavailable
+
 # AI interpreter configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
@@ -526,14 +531,34 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly"
 ]
 
-credentials = Credentials.from_service_account_info(
-    json.loads(GOOGLE_CREDENTIALS),
-    scopes=SCOPES
-)
+sheet = None
 
-gc = gspread.authorize(credentials)
 
-sheet = gc.open("North Cyprus Vehicle Leads").sheet1
+def initialize_lead_sheet():
+    """Initialize Google Sheets only when credentials are configured.
+
+    This keeps local/V10 development bootable without weakening production lead
+    capture. Production should continue supplying GOOGLE_CREDENTIALS.
+    """
+    global sheet
+    if not GOOGLE_CREDENTIALS:
+        print("GOOGLE_CREDENTIALS not configured; lead capture is disabled.")
+        sheet = None
+        return
+    try:
+        credentials = Credentials.from_service_account_info(
+            json.loads(GOOGLE_CREDENTIALS),
+            scopes=SCOPES,
+        )
+        gc = gspread.authorize(credentials)
+        sheet = gc.open("North Cyprus Vehicle Leads").sheet1
+        print("Google Sheets lead capture ready")
+    except Exception as exc:
+        print("GOOGLE SHEETS INITIALIZATION FAILED:", exc)
+        sheet = None
+
+
+initialize_lead_sheet()
 
 # -----------------------
 # LOAD DATA (GITHUB CSV SOURCE - SAFE VERSION)
@@ -646,12 +671,60 @@ BUSINESS_MARKET_CSV_URL = (
     "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
     "business_market_intelligence.csv"
 )
+BUSINESS_ACTIVITY_CSV_URL = (
+    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
+    "business_company_activity_daily.csv"
+)
 
 business_stock_df = pd.DataFrame()
 business_company_df = pd.DataFrame()
 business_market_df = pd.DataFrame()
+business_activity_df = pd.DataFrame()
 BUSINESS_INTELLIGENCE_READY = False
+BUSINESS_ACTIVITY_READY = False
 BUSINESS_INTELLIGENCE_VERSION = "1.5"
+BUSINESS_ACTIVITY_VERSION = "10.0"
+
+
+def _load_assistant_csv_local_first(filename, url, timeout=25):
+    """Load an intelligence CSV from the best available local source first.
+
+    Search order:
+      1. OTODEGER_INTELLIGENCE_DIR (when explicitly configured)
+      2. Beside app.py (production/repo-local layout)
+      3. A sibling ``otodeger_intelligence`` folder next to the backend folder
+         (the current Windows development layout)
+      4. The configured GitHub/raw URL fallback
+
+    This keeps local development compatible with the user's existing Desktop
+    folder structure without hard-coding a Windows username or Desktop path, while
+    preserving the production fallback behaviour.
+    """
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+
+    candidate_dirs = []
+    configured_dir = str(os.environ.get("OTODEGER_INTELLIGENCE_DIR", "") or "").strip()
+    if configured_dir:
+        candidate_dirs.append(os.path.abspath(os.path.expanduser(configured_dir)))
+
+    candidate_dirs.append(app_dir)
+    candidate_dirs.append(os.path.abspath(os.path.join(app_dir, os.pardir, "otodeger_intelligence")))
+
+    seen = set()
+    for directory in candidate_dirs:
+        normalized = os.path.normcase(os.path.normpath(directory))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+
+        local_path = os.path.join(directory, filename)
+        if os.path.isfile(local_path):
+            print(f"Loading intelligence CSV locally: {local_path}")
+            return pd.read_csv(local_path, low_memory=False)
+
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    return pd.read_csv(io.StringIO(response.text), low_memory=False)
 
 
 def _prepare_buyer_intelligence_frame(frame):
@@ -843,16 +916,15 @@ def load_business_intelligence():
     global BUSINESS_INTELLIGENCE_READY
 
     try:
-        stock_r = requests.get(BUSINESS_STOCK_CSV_URL, timeout=25)
-        stock_r.raise_for_status()
-        company_r = requests.get(BUSINESS_COMPANY_CSV_URL, timeout=25)
-        company_r.raise_for_status()
-        market_r = requests.get(BUSINESS_MARKET_CSV_URL, timeout=25)
-        market_r.raise_for_status()
-
-        new_stock = pd.read_csv(io.StringIO(stock_r.text), low_memory=False)
-        new_company = pd.read_csv(io.StringIO(company_r.text), low_memory=False)
-        new_market = pd.read_csv(io.StringIO(market_r.text), low_memory=False)
+        new_stock = _load_assistant_csv_local_first(
+            "business_stock_intelligence.csv", BUSINESS_STOCK_CSV_URL, timeout=25
+        )
+        new_company = _load_assistant_csv_local_first(
+            "business_company_intelligence.csv", BUSINESS_COMPANY_CSV_URL, timeout=25
+        )
+        new_market = _load_assistant_csv_local_first(
+            "business_market_intelligence.csv", BUSINESS_MARKET_CSV_URL, timeout=25
+        )
 
         required_stock = {
             "Link", "Company", "Brand", "Model", "Year",
@@ -908,6 +980,37 @@ def load_business_intelligence():
             business_company_df = pd.DataFrame()
             business_market_df = pd.DataFrame()
             BUSINESS_INTELLIGENCE_READY = False
+
+
+
+def load_business_activity():
+    global business_activity_df, BUSINESS_ACTIVITY_READY
+    try:
+        frame = _load_assistant_csv_local_first(
+            "business_company_activity_daily.csv", BUSINESS_ACTIVITY_CSV_URL, timeout=25
+        )
+        required = {
+            "Date", "Company", "OpeningObservedStockCount",
+            "ClosingObservedStockCount", "NetObservedStockChange",
+            "NewlyObservedListings", "ObservedMarketExits",
+            "AskingPriceReductions", "AskingPriceIncreases",
+        }
+        missing = required - set(frame.columns)
+        if missing:
+            raise ValueError(f"Business activity schema mismatch: {sorted(missing)}")
+        frame = frame.copy()
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+        frame["Company"] = frame["Company"].fillna("").astype(str).str.strip()
+        for col in required - {"Date", "Company"}:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        business_activity_df = frame[frame["Date"].notna() & (frame["Company"] != "")].copy()
+        BUSINESS_ACTIVITY_READY = not business_activity_df.empty
+        print(f"Business activity loaded successfully: {len(business_activity_df)} company-day rows")
+    except Exception as exc:
+        print("BUSINESS ACTIVITY LOAD FAILED:", exc)
+        if business_activity_df is None or business_activity_df.empty:
+            business_activity_df = pd.DataFrame()
+            BUSINESS_ACTIVITY_READY = False
 
 
 def load_model_profiles():
@@ -1266,6 +1369,7 @@ load_market_data()
 load_buyer_intelligence()
 load_model_profiles()
 load_business_intelligence()
+load_business_activity()
 
 
 # =========================================================
@@ -1285,6 +1389,8 @@ def refresh_market_data_loop():
         load_model_profiles()
         print("Refreshing Business Intelligence from GitHub...")
         load_business_intelligence()
+        print("Refreshing Business activity intelligence...")
+        load_business_activity()
 
 
 threading.Thread(
@@ -8092,8 +8198,8 @@ def _business_acquisition_answer(message, language):
     return intro + "\n\n" + "\n\n".join(lines) + "\n\n" + note, result
 
 
-@app.route("/api/assistant", methods=["POST"])
-def api_ai_buying_assistant():
+@app.route("/api/assistant_legacy", methods=["POST"])
+def api_ai_buying_assistant_legacy():
     request_started = time.perf_counter()
     try:
         data = request.json or {}
@@ -9108,6 +9214,93 @@ def api_ai_buying_assistant():
         }), 500
 
 
+
+# =========================================================
+# OTODEĞER V10 DECISION AGENT
+# =========================================================
+@app.route("/api/assistant", methods=["POST"])
+def api_v10_decision_agent():
+    """Production conversational endpoint for OtoDeğer V10.
+
+    V10 owns conversational state server-side and delegates all market facts to
+    deterministic functions/dataframes already loaded by this application.
+    The legacy V9.5 route remains temporarily available at /api/assistant_legacy
+    for rollback during deployment, but the frontend should use this route.
+    """
+    try:
+        data = request.json or {}
+        message = str(data.get("message") or "").strip()
+        language = str(data.get("language") or "EN").upper()
+
+        if not message:
+            return jsonify({"success": False, "error": "MESSAGE_REQUIRED"}), 400
+        if len(message) > ASSISTANT_MAX_MESSAGE_CHARS:
+            return jsonify({
+                "success": False,
+                "error": "MESSAGE_TOO_LONG",
+                "max_chars": ASSISTANT_MAX_MESSAGE_CHARS,
+            }), 413
+
+        allowed, retry_after = _assistant_request_allowed()
+        if not allowed:
+            response = jsonify({
+                "success": False,
+                "error": "RATE_LIMITED",
+                "retry_after_seconds": retry_after,
+            })
+            response.status_code = 429
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+
+        # Proprietary dataset protection remains ahead of every model/tool call.
+        if _looks_like_dataset_extraction_request(message):
+            return jsonify({
+                "success": True,
+                "answer": _data_protection_answer(language),
+                "conversation_id": data.get("conversation_id"),
+                "state_revision": data.get("state_revision"),
+                "decision_mode": "PROTECTED_DATA",
+                "stage": "protected_data",
+                "filters": {}, "preferences": [], "results": [],
+                "model_options": [], "actions": [], "suggestions": [],
+            })
+
+        if _looks_like_gibberish_message(message):
+            fallback = _fallback_support_payload(language)
+            return jsonify({
+                "success": True,
+                "answer": _unsupported_input_answer(language),
+                "conversation_id": data.get("conversation_id"),
+                "state_revision": data.get("state_revision"),
+                "decision_mode": "FALLBACK",
+                "stage": "unsupported_input",
+                "filters": {}, "preferences": [], "results": [],
+                "model_options": [], "actions": fallback.get("actions") or [],
+                "suggestions": fallback.get("suggestions") or [],
+            })
+
+        host = globals()
+        payload, status = handle_v10_request(data, host)
+        return jsonify(payload), status
+
+    except StorageUnavailable as exc:
+        print("V10 STATE STORAGE UNAVAILABLE:", exc, flush=True)
+        return jsonify({
+            "success": False,
+            "error": "ASSISTANT_STATE_TEMPORARILY_UNAVAILABLE",
+        }), 503
+    except AIUsageLimitExceeded as exc:
+        print("V10 AI USAGE LIMIT:", exc, flush=True)
+        return jsonify({"success": False, "error": "AI_USAGE_LIMIT_REACHED"}), 429
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        print("V10 OPENAI HTTP ERROR:", status_code, flush=True)
+        return jsonify({"success": False, "error": "AI_ASSISTANT_TEMPORARILY_UNAVAILABLE"}), 502
+    except Exception as exc:
+        print("V10 ASSISTANT FAILED:", repr(exc), flush=True)
+        traceback.print_exc()
+        return jsonify({"success": False, "error": "AI_ASSISTANT_FAILED"}), 500
+
 # =========================================================
 # AI BUYING ASSISTANT - MARKET SEARCH API
 # =========================================================
@@ -9246,23 +9439,12 @@ def market_options():
             .tolist()
         )
 
-        companies = sorted(
-            market_df["Company"]
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .loc[lambda s: s != ""]
-            .unique()
-            .tolist()
-        )
-
         return jsonify({
             "success": True,
             "brands": brands,
             "models": models,
             "locations": locations,
-            "transmissions": transmissions,
-            "companies": companies
+            "transmissions": transmissions
         })
 
     except Exception as e:
@@ -9294,6 +9476,9 @@ def market_health():
             if MARKET_READY and market_df is not None and not market_df.empty else 0
         ),
         "assistant_profile_version": ASSISTANT_PROFILE_VERSION,
+        "v10_version": V10_VERSION,
+        "business_activity_ready": BUSINESS_ACTIVITY_READY,
+        "business_activity_rows": len(business_activity_df),
     })
 
 # =========================================================
@@ -9359,6 +9544,12 @@ def submit_lead():
         # -----------------------
         # ADD LEAD TO GOOGLE SHEET
         # -----------------------
+
+        if sheet is None:
+            return jsonify({
+                "success": False,
+                "error": "LEAD_CAPTURE_TEMPORARILY_UNAVAILABLE"
+            }), 503
 
         sheet.append_row([
             submitted_at.strftime("%Y-%m-%d %H:%M:%S"),
