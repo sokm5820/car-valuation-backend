@@ -23,7 +23,7 @@ from otodeger_v10_state import (
     apply_turn_plan, get_state_service, register_object,
 )
 
-V10_VERSION = "10.5.1-decision-prompts"
+V10_VERSION = "11.0-conversation-contract"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -732,7 +732,7 @@ def _search_vehicle_models(state: Mapping[str, Any], message: str, host: Mapping
     search = _search_all(state, host)
     rows = _normal_vehicle_default_filter(search.get("results") or [], state, host)
     if not rows:
-        return {"kind":"vehicle_search", "count":0, "models":[], "listings":[], "alternative_brands":[]}
+        return {"kind":"vehicle_search", "count":0, "models":[], "listings":[], "alternative_models":[]}
 
     # IMPORTANT: every displayed metric must be calculated from the exact current
     # filtered listing set. Do not borrow counts/medians from broader intelligence
@@ -776,15 +776,27 @@ def _search_vehicle_models(state: Mapping[str, Any], message: str, host: Mapping
             -int(x.get("count") or 0),
         ))
 
-    shown = ranked[:8]
-    shown_brands = {str(x.get("brand") or "").casefold() for x in shown[:5]}
-    alternative_brands: List[str] = []
-    for x in ranked[5:]:
-        b = _text(x.get("brand"), 80)
-        if not b or b.casefold() in shown_brands or b in alternative_brands:
+    # Do not impose an arbitrary five-model catalogue. Keep the useful active
+    # set, but suppress the long tail of niche/low-evidence models. The activity
+    # threshold is relative to the strongest matching model so it adapts to the
+    # query rather than hard-coding a brand list.
+    if not has_named_vehicle and not has_decision_priority and ranked:
+        top_activity = float(ranked[0].get("activity_score") or 0.0)
+        useful = [x for x in ranked if int(x.get("count") or 0) >= 2 and (top_activity <= 0 or float(x.get("activity_score") or 0.0) >= top_activity * 0.12)]
+        shown = (useful or ranked)[:8]
+    else:
+        shown = ranked[:8]
+
+    shown_pairs = {(str(x.get("brand") or "").casefold(), str(x.get("model") or "").casefold()) for x in shown}
+    alternative_models: List[str] = []
+    for x in ranked:
+        pair=(str(x.get("brand") or "").casefold(), str(x.get("model") or "").casefold())
+        if pair in shown_pairs:
             continue
-        alternative_brands.append(b)
-        if len(alternative_brands) >= 4:
+        label=" ".join(v for v in [_text(x.get("brand"),80), _text(x.get("model"),100)] if v)
+        if label and label not in alternative_models:
+            alternative_models.append(label)
+        if len(alternative_models) >= 4:
             break
 
     return {
@@ -792,7 +804,7 @@ def _search_vehicle_models(state: Mapping[str, Any], message: str, host: Mapping
         "count":len(rows),
         "models":shown,
         "listings":[],
-        "alternative_brands":alternative_brands,
+        "alternative_models":alternative_models,
         "discovery_style":"OPTIONS" if not has_named_vehicle else "BRAND_OPTIONS",
         "ranking_basis":"observed_market_activity" if not has_named_vehicle and not has_decision_priority else "current_fit",
     }
@@ -1329,7 +1341,7 @@ def _actions_from_evidence(state: Mapping[str, Any], action: str, evidence: Mapp
         # opening; do not reduce it to a generic year/brand/model card.
         currency = str(((state.get("constraints") or {}).get("currency") or "GBP")).upper()
         symbol = {"GBP":"£", "EUR":"€", "USD":"$"}.get(currency, currency + " ")
-        for row in (evidence.get("listings") or [])[:5]:
+        for row in (evidence.get("listings") or [])[:10]:
             url=_text(row.get("link"),500)
             if not url: continue
             vehicle=" ".join(str(x) for x in [row.get("year"),row.get("brand"),row.get("model"),row.get("category")] if x not in (None,""))
@@ -1348,6 +1360,9 @@ def _actions_from_evidence(state: Mapping[str, Any], action: str, evidence: Mapp
                 elif "manuel" in tcf or "manual" in tcf:
                     transmission={"EN":"Manual","TR":"Manuel","RU":"Механика"}[_lang(language)]
                 details.append(transmission)
+            fuel=_text(row.get("fuel"),80) or _text(row.get("fuel_type"),80)
+            if fuel:
+                details.append(fuel)
             location=_text(row.get("location"),100)
             if location:
                 details.append(location)
@@ -1368,7 +1383,7 @@ def _actions_from_evidence(state: Mapping[str, Any], action: str, evidence: Mapp
     if evidence.get("kind") in {"purchase_evaluation","sale_evaluation"}:
         shortlist=list(state.get("shortlist") or [])
         if shortlist:
-            return actions,{"type":Action.SHOW_LISTINGS.value,"target_ids":shortlist[:5],"metadata":{}}
+            return actions,{"type":Action.SHOW_LISTINGS.value,"target_ids":shortlist[:10],"metadata":{}}
     return actions,None
 
 
@@ -1404,7 +1419,7 @@ def _suggestions_from_context(state: Mapping[str, Any], evidence: Mapping[str, A
                 out.append(base["year"])
             if not c.get("max_km") and len(out)<3:
                 out.append(base["km"])
-            if evidence.get("alternative_brands") and len(out)<3:
+            if evidence.get("alternative_models") and len(out)<3:
                 out.append(base["other"])
     elif kind=="comparison":
         vehicles=evidence.get("vehicles") or []
@@ -1438,7 +1453,7 @@ def _suggestions_from_context(state: Mapping[str, Any], evidence: Mapping[str, A
 def _compact_evidence(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     e=copy.deepcopy(dict(evidence))
     # Keep model context rich but bounded.
-    for key, limit in (("models",5),("listings",5),("vehicles",5),("options",5),("comparables",5),("rows",8),("daily",35)):
+    for key, limit in (("models",8),("listings",10),("vehicles",8),("options",8),("comparables",8),("rows",12),("daily",35)):
         if isinstance(e.get(key),list): e[key]=e[key][:limit]
     return e
 
@@ -1449,7 +1464,7 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
         models=evidence.get("models") or []
         if not models:
             return {"EN":"I couldn't find a current match for those constraints. The most useful next step is to loosen one constraint.","TR":"Bu kriterlere uyan güncel bir seçenek bulamadım. En faydalı sonraki adım kriterlerden birini gevşetmek.","RU":"Я не нашёл актуальных вариантов по этим условиям. Лучше всего немного ослабить одно из ограничений."}[lang]
-        shown=models[:5]
+        shown=models[:8]
         def line(m):
             label=f"{m.get('brand')} {m.get('model')}"
             year=m.get('newest_year'); price=_money(m.get('newest_year_starting_price'))
@@ -1457,19 +1472,19 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
             if lang=="TR": return f"**{label}** — {year or 'yıl bilgisi yok'} · {price or 'fiyat yok'}'dan · {count} seçenek"
             if lang=="RU": return f"**{label}** — до {year or '—'} · {price or '—'} · {count} вариантов"
             return f"**{label}** — up to {year or '—'} · {year or 'newest year'} from {price or '—'} · {count} options"
-        alt=evidence.get("alternative_brands") or []
+        alt=evidence.get("alternative_models") or []
         if lang=="TR":
             intro="Bunlar mevcut kriterleriniz içinde daha aktif görünen seçeneklerden bazıları; piyasanın tamamı değil."
-            tail=(" Daha az aktif alternatifler de var" + (", örneğin " + ", ".join(alt[:3]) if alt else "") + ".")
+            tail=(" Daha az aktif model alternatifleri de var" + (", örneğin " + ", ".join(alt[:3]) if alt else "") + ".")
         elif lang=="RU":
             intro="Это несколько более активных вариантов в рамках ваших условий, а не весь рынок."
-            tail=(" Есть и менее активные альтернативы" + (", например " + ", ".join(alt[:3]) if alt else "") + ".")
+            tail=(" Есть и менее активные модели" + (", например " + ", ".join(alt[:3]) if alt else "") + ".")
         else:
             intro="These are some of the more active matches within your criteria, not the full market."
-            tail=(" Less-active alternatives also exist" + (", including " + ", ".join(alt[:3]) if alt else "") + ".")
+            tail=(" Other lower-activity model options also exist" + (", including " + ", ".join(alt[:3]) if alt else "") + ".")
         return intro+"\n"+"\n".join(line(m) for m in shown)+tail
     if kind=="listings":
-        n=min(5,len(evidence.get("listings") or []))
+        n=min(10,len(evidence.get("listings") or []))
         total=int(evidence.get("count") or n)
         if lang=="TR": return f"Aşağıda {n} güncel ilan gösteriyorum" + (f" ({total} eşleşme içinden)." if total>n else ".") + " Aşağıdaki her satır tıklanabilir ve temel ilan bilgilerini içerir; sonuçları yıl, kilometre veya satıcı tipine göre daha da daraltabiliriz."
         if lang=="RU": return f"Ниже показаны {n} актуальных объявлений" + (f" из {total} совпадений." if total>n else ".") + " Каждая строка ниже кликабельна и содержит основные данные объявления; затем можно сузить выбор по году, пробегу или типу продавца."
@@ -1520,15 +1535,32 @@ You are OtoDeğer AI, a premium decision copilot for the North Cyprus vehicle ma
 Respond entirely in {_lang(language)}. Do not switch languages because vehicle names are foreign.
 The user is trying to accomplish a decision, not receive a market report.
 
+V11 product contract:
+- Utility over verbosity: provide exactly the evidence needed for the decision and a sensible next step.
+- Hard constraints are budget, explicit year bounds, body type, mileage bounds, transmission and explicit brand constraints. Never silently relax them. Explicit regional exclusions must also be respected.
+- If a request is too broad to be useful (for example only "find me a vehicle"), ask ONE high-value narrowing question such as body type before searching. Budget + body type is enough to begin discovery.
+- If zero matches remain, state the active restrictions and ask which one the user wants to relax. Do not choose for them.
+- If only one or two good matches remain, show them and also explain which single relaxation would most plausibly broaden choice.
+- A small budget stretch may be mentioned only when verified evidence shows a materially better option just above budget; otherwise respect the budget without upselling.
+- Purchase evaluation: judge price competitiveness against genuinely comparable vehicles, show useful comparables, and explain that trim, condition, history, equipment or damage can justify differences. Do not tell the user categorically to buy/not buy. A mechanical inspection matters before a purchase recommendation.
+- Sale evaluation: compare an offer/asking price with relevant market evidence and support negotiation decisions. Never turn observed listing removals into confirmed sales.
+- Business acquisition: prioritise strong observed demand/activity and faster observed exits, with extra value when current supply is low.
+- Business pricing: when evidence permits, frame quick-sale / competitive-market / premium strategies and note vehicle-specific condition/trim adjustments.
+- Aging stock: focus on actionable price-position changes that can improve competitiveness.
+- ANALYZE_BUSINESS covers business health, stock in/out, asking-price changes, inventory count/value, stock age, mix and trends for arbitrary periods; month-to-date, YTD and trailing 12 months are especially useful. Surface material changes proactively.
+- UNDERSTAND_MARKET should answer the decision context: personal users care about buying timing/negotiating room; businesses care whether their performance reflects the wider market.
+- Outside proprietary market scope, only answer North-Cyprus vehicle-adjacent questions when reliable external evidence is actually available; otherwise say it cannot be reliably verified. Do not become a generic assistant.
+- English, Turkish and Russian must follow the same decision policy.
+
 Rules:
 - Match the response depth to the stage of the decision. Do not force a recommendation before the buyer has supplied preferences that make one meaningful.
-- DISCOVERY / vehicle_search: map the useful option set. For a broad budget + body-type request, show 4-6 model families rather than naming a winner. The deterministic model order already prioritises observed market activity (historical listing volume + observed market exits) before current supply. Respect that order. Explicitly make clear these are SOME of the more active matches, not the entire market. If VERIFIED_EVIDENCE contains alternative_brands, briefly leave the door open to those lower-activity alternatives. Never call an observed exit a confirmed sale/transaction and never equate current listing count alone with popularity.
+- DISCOVERY / vehicle_search: map the useful option set. For a broad budget + body-type request, show the useful active model families rather than naming a winner; usually 4-8, but do not force a fixed count. The deterministic model order already prioritises observed market activity (historical listing volume + observed market exits) before current supply. Respect that order. Explicitly make clear these are SOME of the more active matches, not the entire market. If VERIFIED_EVIDENCE contains alternative_models, briefly name those model-level lower-activity alternatives and offer an expanded list. Never call an observed exit a confirmed sale/transaction and never equate current listing count alone with popularity.
 - When a budget exists, model discovery is about WHAT THAT BUDGET BUYS. Prefer: MODEL — up to YEAR · YEAR from £PRICE · N options. Do not lead with an old model's overall minimum price.
 - When the user names brands (for example BMW or Mercedes), show the relevant models under those brands with newest affordable year + asking price at that year + option count. Do not introduce mileage yet unless the user asks for mileage or is filtering listings by mileage.
 - Do not append routine caveats such as "asking prices are not confirmed transaction prices" to ordinary discovery/comparison replies. Preserve that distinction internally and mention it only when it materially affects the decision.
 - When the filtered choice is thin (especially 1-2 cars at the newest viable year), do not pretend the market is broad. Say it is thin and guide the user toward choosing a model, relaxing the minimum year, widening brand scope, or another constraint that actually increases choice.
 - COMPARISON: make it scan-friendly. Stay on the SAME newest affordable year when quoting price statistics. Give one compact line per model using newest affordable year, the price/range at that year, number of listings at that year, and optionally the total number matching the user's active filters. NEVER pair a newest-year headline with a median calculated across older years. Do not compare mileage unless the user explicitly asks about mileage. Only recommend a winner if the user's latest message asks which to choose/buy/prefer or their stated preferences clearly support one.
-- SHOW_LISTINGS: the UI displays at most five information-rich clickable listing rows below the prose. Each row contains the exact year/brand/model/variant plus available price, KM, transmission, location and seller/gallery. The prose must be ONE short introductory sentence only; NEVER repeat/list any vehicle, price, seller, mileage or model in the prose. The structured clickable rows are the single listing presentation.
+- SHOW_LISTINGS: the UI displays up to ten information-rich clickable listing rows below the prose. Each row contains the exact year/brand/model/variant plus available price, KM, transmission, location and seller/gallery. The prose must be ONE short introductory sentence only; NEVER repeat/list any vehicle, price, seller, mileage or model in the prose. The structured clickable rows are the single listing presentation.
 - Ordinary response 35-130 words; simple answers may be shorter. Do not exceed 170 words unless essential.
 - Use short paragraphs and compact model-per-line formatting. Avoid long prose comparisons.
 - Mention only facts present in VERIFIED_EVIDENCE. Never invent prices, years, mileage, availability, counts, dealers or links. If a hard budget is active, do not mention above-budget alternatives unless the user explicitly asks what spending more would unlock.
@@ -1733,7 +1765,7 @@ def handle_v10_request(data: Mapping[str, Any], host: Mapping[str, Any]) -> Tupl
         # SHOW_LISTINGS uses the information-rich clickable action rows as the
         # single presentation. Sending the same listings through `results` as well
         # makes the frontend render a second set of cards.
-        "returned":min(5,len(listings)) if evidence.get("kind")=="listings" else len(listings),
+        "returned":min(10,len(listings)) if evidence.get("kind")=="listings" else len(listings),
         "results":[] if evidence.get("kind")=="listings" else listings[:20],
         "model_options":models[:8],
         "business_options":business_options[:12],"actions":actions,"suggestions":_suggestions_from_context(saved.state,evidence,language),
