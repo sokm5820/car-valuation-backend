@@ -23,7 +23,7 @@ from otodeger_v10_state import (
     apply_turn_plan, get_state_service, register_object,
 )
 
-V10_VERSION = "10.2-guided-market"
+V10_VERSION = "10.3-strict-fit-ui"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -440,6 +440,27 @@ def _authoritative_numeric_constraints(message: str, parsed: Mapping[str, Any], 
         v=parse_token(m.group(1).replace(" ",""))
         if v is not None and 0 <= v <= 2_000_000: delta["max_km"]=int(round(v))
 
+    # Deterministic interpretation of the exact contextual suggestion language.
+    # These are hard filters once clicked/typed; do not leave them to model drift.
+    m=re.search(r"\b(20\d{2}|19\d{2})\s*(?:or newer|and newer|ve sonrası|ve sonrasi|или новее)\b", low, re.I)
+    if m:
+        delta["min_year"] = int(m.group(1))
+    if re.search(r"\b(?:automatic only|otomatik(?: sadece)?|только автомат)\b", low, re.I):
+        delta["transmission"] = "Automatic"
+    if re.search(r"\b(?:gallery sellers? only|dealers? only|galleries? only|sadece galeriler?|galeri(?:ler)?|только дилер)\b", low, re.I):
+        delta["seller_type"] = "gallery"
+    elif re.search(r"\b(?:private sellers? only|individual sellers? only|sadece bireysel|bireysel satıcı|частн(?:ый|ые) продав)\b", low, re.I):
+        delta["seller_type"] = "private"
+
+    # Protect the most important physical-class terms as authoritative constraints.
+    # This works alongside the semantic parser rather than replacing it.
+    if re.search(r"\bSUVs?\b", str(message), re.I):
+        delta["vehicle_type"] = "SUV"
+    elif re.search(r"\b(?:crossover|crossovers)\b", low, re.I):
+        delta["vehicle_type"] = "crossover"
+    elif re.search(r"\b(?:pickup|pick-up|pickups|pick-ups)\b", low, re.I):
+        delta["vehicle_type"] = "pickup"
+
     out["constraints_delta"]=delta
     return out
 
@@ -502,13 +523,25 @@ def _search_all(state: Mapping[str, Any], host: Mapping[str, Any]) -> Dict[str, 
     if not callable(fn):
         return {"success": False, "error": "MARKET_SEARCH_UNAVAILABLE", "count": 0, "results": []}
     f = _legacy_filters(state)
-    return fn(
+    result = fn(
         budget=f.get("budget"), min_budget=f.get("min_budget"), brands=f.get("brands"),
         models=f.get("models"), categories=f.get("categories"), locations=f.get("locations"),
         companies=f.get("companies"), exclude_companies=f.get("exclude_companies"), transmissions=f.get("transmissions"),
         min_year=f.get("min_year"), max_year=f.get("max_year"), min_km=f.get("min_km"), max_km=f.get("max_km"),
         limit=5000, max_limit=5000, analysis_mode=True,
     )
+
+    # Vehicle type is a physical-class constraint, not a text preference. The
+    # legacy market_search does not own that taxonomy, so enforce it with the
+    # validated model-profile layer before V10 ranks or registers any result.
+    # This prevents a request for an SUV from ever drifting into Fit/Swift/etc.
+    strict = _host(host, "_apply_strict_vehicle_type_to_search_result")
+    if callable(strict) and (state.get("constraints") or {}).get("vehicle_type"):
+        try:
+            result = strict(result, _legacy_preferences(state))
+        except Exception:
+            pass
+    return result
 
 
 def _normal_vehicle_default_filter(results: Sequence[Mapping[str, Any]], state: Mapping[str, Any], host: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -1217,6 +1250,11 @@ def _actions_from_evidence(state: Mapping[str, Any], action: str, evidence: Mapp
                 details.append(f"{km:,} km")
             transmission=_text(row.get("transmission"),80)
             if transmission:
+                tcf=transmission.casefold()
+                if "otomatik" in tcf or "automatic" in tcf:
+                    transmission={"EN":"Automatic","TR":"Otomatik","RU":"Автомат"}[_lang(language)]
+                elif "manuel" in tcf or "manual" in tcf:
+                    transmission={"EN":"Manual","TR":"Manuel","RU":"Механика"}[_lang(language)]
                 details.append(transmission)
             location=_text(row.get("location"),100)
             if location:
@@ -1509,6 +1547,11 @@ def handle_v10_request(data: Mapping[str, Any], host: Mapping[str, Any]) -> Tupl
         updated_state["shortlist"]=evidence_shortlist[:30]
     if evidence_focus:
         updated_state["focus"]={"object_ids":evidence_focus[:20]}
+    elif action == Action.SEARCH_VEHICLES.value and evidence.get("kind") == "vehicle_search":
+        # Never let a failed/refined search leave old models as the active referent.
+        # Otherwise a subsequent "compare them" can compare stale, unrelated cars.
+        updated_state["focus"]={"object_ids":[]}
+        updated_state["shortlist"]=[]
 
     decision=_decision_policy(updated_state,action,evidence,message)
     actions,offered=_actions_from_evidence(updated_state,action,evidence,language)
@@ -1549,7 +1592,12 @@ def handle_v10_request(data: Mapping[str, Any], host: Mapping[str, Any]) -> Tupl
         "decision":decision.get("verdict"),"decision_mode":_compat_mode(action,saved.state.get("job")),
         "stage":"v10_decision_agent","filters":compat_filters,"preferences":compat_preferences,
         "count":int(evidence.get("count") or len(listings) or len(models) or len(business_options) or 0),
-        "returned":len(listings),"results":listings[:20],"model_options":models[:8],
+        # SHOW_LISTINGS uses the information-rich clickable action rows as the
+        # single presentation. Sending the same listings through `results` as well
+        # makes the frontend render a second set of cards.
+        "returned":min(5,len(listings)) if evidence.get("kind")=="listings" else len(listings),
+        "results":[] if evidence.get("kind")=="listings" else listings[:20],
+        "model_options":models[:8],
         "business_options":business_options[:12],"actions":actions,"suggestions":_suggestions_from_context(saved.state,evidence,language),
         "assistant_state":_public_state_summary(saved.state),
     },200
