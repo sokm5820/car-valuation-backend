@@ -28,7 +28,7 @@ from otodeger_v10_state import (
 )
 
 V10_VERSION = "11.0-conversation-contract"
-ASSISTANT_BUILD = "11.11-gold-release-candidate"
+ASSISTANT_BUILD = "11.12-gold-release-candidate"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -607,6 +607,162 @@ def _authoritative_message_evidence(message: str, host: Mapping[str, Any]) -> Di
     return evidence
 
 
+
+
+def _purchase_price_judgement_signal(message: str) -> Optional[float]:
+    """Return the concrete asking price for an unambiguous buyer price-judgement turn.
+
+    This intentionally does *not* resolve the vehicle.  The routing decision is
+    syntactic and therefore cannot wobble with market-resolution output or an LLM
+    planner. Seller/owner language is excluded so sale-offer/valuation flows keep
+    their own task.
+    """
+    text = str(message or "")
+    purchase_language = bool(re.search(
+        r"\b(?:good|fair|reasonable|competitive|cheap|expensive|overpriced|worth|good deal)\b|"
+        r"\bshould\s+i\s+(?:pay|buy)\b|\btoo\s+(?:much|high)\b",
+        text, re.I))
+    owner_sale_language = bool(re.search(
+        r"\b(?:my car|my vehicle|my auto|sell|selling|list(?:ing)? price|someone offered|been offered|offer on my)\b|"
+        r"\b(?:arabam|aracım|aracim).{0,20}(?:sat|teklif)|\b(?:продать|мо[яй] машин|мне предлож)\b",
+        text, re.I))
+    price_match = re.search(
+        r"(?:£\s*([0-9][0-9,.]*\s*[kK]?)|([0-9][0-9,.]*\s*[kK]?)\s*(?:GBP|gbp|pounds?|sterlin))",
+        text, re.I)
+    if not purchase_language or owner_sale_language or not price_match:
+        return None
+    raw_price = (price_match.group(1) or price_match.group(2) or "").replace(" ", "")
+    try:
+        price = float(parse_number(raw_price))
+    except Exception:
+        return None
+    return price if price > 0 else None
+
+
+def _fallback_explicit_brand_model(message: str, host: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Strict Brand+Model fallback used only for concrete purchase-price turns.
+
+    The normal host resolver remains authoritative.  This fallback protects the
+    task boundary if that resolver temporarily returns zero/multiple targets: it
+    scans the current market's explicit Brand+Model vocabulary and accepts only a
+    unique longest full-phrase match. It never guesses from generic model words.
+    """
+    frame = _host(host, "market_df")
+    if frame is None or getattr(frame, "empty", True):
+        return []
+
+    def norm(value: Any) -> str:
+        value = str(value or "").casefold()
+        value = re.sub(r"[^a-z0-9çğıöşüа-яё]+", " ", value, flags=re.I)
+        return re.sub(r"\s+", " ", value).strip()
+
+    msg = f" {norm(message)} "
+    hits: List[Tuple[int, str, str]] = []
+    try:
+        universe = frame[["Brand", "Model"]].fillna("").astype(str).drop_duplicates()
+        for row in universe.itertuples(index=False):
+            brand = str(getattr(row, "Brand", "") or "").strip()
+            model = str(getattr(row, "Model", "") or "").strip()
+            if not brand or not model:
+                continue
+            phrase = norm(f"{brand} {model}")
+            if phrase and f" {phrase} " in msg:
+                hits.append((len(phrase), brand, model))
+    except Exception:
+        return []
+    if not hits:
+        return []
+    hits.sort(reverse=True)
+    best_len = hits[0][0]
+    best = {(b, m) for n, b, m in hits if n == best_len}
+    if len(best) != 1:
+        return []
+    brand, model = next(iter(best))
+    return [{"brand": brand, "model": model, "category": None}]
+
+
+def _deterministic_purchase_price_plan(message: str, state: Mapping[str, Any], host: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Own the buyer price-evaluation task before semantic planning.
+
+    Once a Personal turn is recognisably a concrete purchase-price judgement, this
+    function either builds EVALUATE_PURCHASE or asks for the vehicle identity. It
+    never allows the turn to degrade into SEARCH_VEHICLES.
+    """
+    if state.get("audience") != Audience.PERSONAL.value:
+        return None
+    asking_price = _purchase_price_judgement_signal(message)
+    if asking_price is None:
+        return None
+
+    authoritative = _authoritative_message_evidence(message, host)
+    targets = list(authoritative.get("vehicle_targets") or [])
+    if len(targets) != 1:
+        fallback = _fallback_explicit_brand_model(message, host)
+        if len(fallback) == 1:
+            targets = fallback
+
+    if len(targets) != 1:
+        lang = _lang(state.get("language"))
+        q = {
+            "EN": "Which vehicle is the £{:,.0f} asking price for? Please give me the make, model and year.".format(asking_price),
+            "TR": "£{:,.0f} istenen fiyat hangi araç için? Lütfen marka, model ve yılı yazın.".format(asking_price),
+            "RU": "Для какого автомобиля указана цена £{:,.0f}? Укажите марку, модель и год.".format(asking_price),
+        }[lang]
+        return {
+            "transition": Transition.CONTINUE.value,
+            "action": Action.ASK_CLARIFICATION.value,
+            "job": Job.EVALUATE_PURCHASE.value,
+            "goal_summary": "Evaluate a specific vehicle asking price",
+            "constraints_delta": {"asking_price": asking_price},
+            "clear_constraints": [],
+            "preferences_delta": {},
+            "clear_preferences": [],
+            "objects": [],
+            "target_ids": [],
+            "shortlist_ids": [],
+            "awaiting": {"field": "purchase_vehicle", "question": q},
+        }
+
+    payload = dict(targets[0])
+    years = list(authoritative.get("explicit_years") or [])
+    if years and payload.get("year") in (None, ""):
+        payload["year"] = years[0]
+    if authoritative.get("engine_size") and not payload.get("category"):
+        payload["category"] = authoritative["engine_size"]
+    else:
+        # Common shorthand is "March 1.2" without an L suffix.  On an already
+        # resolved explicit vehicle, a standalone decimal is a safe engine hint.
+        engine_decimal = re.search(r"(?<![\d,.])(\d{1,2}[.,]\d)(?![\d,.])", str(message or ""))
+        if engine_decimal and not payload.get("category"):
+            payload["category"] = engine_decimal.group(1).replace(",", ".")
+    km_match = re.search(r"\b(\d[\d,.]*)\s*(?:km|kilomet(?:er|re)s?)\b", str(message or ""), re.I)
+    if km_match:
+        try:
+            payload["km"] = int(parse_number(km_match.group(1)))
+        except Exception:
+            pass
+    low_message = str(message or "").casefold()
+    if re.search(r"\b(?:automatic|auto|otomatik|автомат)\b", low_message):
+        payload["transmission"] = "Automatic"
+    elif re.search(r"\b(?:manual|manuel|düz|duz|механик)\b", low_message):
+        payload["transmission"] = "Manual"
+    payload["asking_price"] = asking_price
+    label = " ".join(str(x) for x in [payload.get("year"), payload.get("brand"), payload.get("model"), payload.get("category")] if x not in (None, ""))
+    return {
+        "transition": Transition.START_NEW_GOAL.value if not state.get("job") else Transition.SWITCH_SUBTASK.value,
+        "action": Action.EVALUATE_PURCHASE.value,
+        "job": Job.EVALUATE_PURCHASE.value,
+        "goal_summary": f"Evaluate whether the asking price is competitive for {label or 'the selected vehicle'}",
+        "constraints_delta": {"asking_price": asking_price},
+        "clear_constraints": [],
+        "preferences_delta": {},
+        "clear_preferences": [],
+        "objects": [{"type": ObjectType.LISTING.value, "alias": "purchase_candidate", "payload": payload}],
+        "target_ids": ["purchase_candidate"],
+        "shortlist_ids": [],
+        "awaiting": None,
+    }
+
 def _semantic_plan(message: str, language: str, state: Mapping[str, Any], host: Mapping[str, Any]) -> Dict[str, Any]:
     deterministic = _deterministic_followup_plan(message, state)
     if deterministic:
@@ -617,65 +773,9 @@ def _semantic_plan(message: str, language: str, state: Mapping[str, Any], host: 
 
     authoritative = _authoritative_message_evidence(message, host)
 
-    # A concrete purchase-price judgement is a deterministic task, not an LLM
-    # interpretation problem.  If we can authoritatively resolve one vehicle and
-    # the user supplied a price while asking whether that price is good/fair/too
-    # high/etc., route directly to EVALUATE_PURCHASE.  This prevents ordinary
-    # "Is £5,000 a good price for a 2007 Nissan March 1.2L?" turns from
-    # intermittently drifting into broad SEARCH_VEHICLES discovery.
-    if state.get("audience") == Audience.PERSONAL.value:
-        purchase_language = bool(re.search(
-            r"\b(?:good|fair|reasonable|competitive|cheap|expensive|overpriced|worth|good deal)\b|"
-            r"\bshould\s+i\s+(?:pay|buy)\b|\btoo\s+(?:much|high)\b",
-            str(message or ""), re.I))
-        owner_sale_language = bool(re.search(
-            r"\b(?:my car|my vehicle|my auto|sell|selling|list(?:ing)? price|someone offered|been offered|offer on my)\b|"
-            r"\b(?:arabam|aracım|aracim).{0,20}(?:sat|teklif)|\b(?:продать|мо[яй] машин|мне предлож)\b",
-            str(message or ""), re.I))
-        price_match = re.search(
-            r"(?:£\s*([0-9][0-9,.]*\s*[kK]?)|([0-9][0-9,.]*\s*[kK]?)\s*(?:GBP|gbp|pounds?|sterlin))",
-            str(message or ""), re.I)
-        targets = list(authoritative.get("vehicle_targets") or [])
-        if purchase_language and not owner_sale_language and price_match and len(targets) == 1:
-            raw_price = (price_match.group(1) or price_match.group(2) or "").replace(" ", "")
-            try:
-                asking_price = float(parse_number(raw_price))
-            except Exception:
-                asking_price = None
-            if asking_price is not None and asking_price > 0:
-                payload = dict(targets[0])
-                years = list(authoritative.get("explicit_years") or [])
-                if years and payload.get("year") in (None, ""):
-                    payload["year"] = years[0]
-                if authoritative.get("engine_size") and not payload.get("category"):
-                    payload["category"] = authoritative["engine_size"]
-                km_match = re.search(r"\b(\d[\d,.]*)\s*(?:km|kilomet(?:er|re)s?)\b", str(message or ""), re.I)
-                if km_match:
-                    try:
-                        payload["km"] = int(parse_number(km_match.group(1)))
-                    except Exception:
-                        pass
-                low_message = str(message or "").casefold()
-                if re.search(r"\b(?:automatic|auto|otomatik|автомат)\b", low_message):
-                    payload["transmission"] = "Automatic"
-                elif re.search(r"\b(?:manual|manuel|düz|duz|механик)\b", low_message):
-                    payload["transmission"] = "Manual"
-                payload["asking_price"] = asking_price
-                label = " ".join(str(x) for x in [payload.get("year"), payload.get("brand"), payload.get("model"), payload.get("category")] if x not in (None, ""))
-                return {
-                    "transition": Transition.START_NEW_GOAL.value if not state.get("job") else Transition.SWITCH_SUBTASK.value,
-                    "action": Action.EVALUATE_PURCHASE.value,
-                    "job": Job.EVALUATE_PURCHASE.value,
-                    "goal_summary": f"Evaluate whether the asking price is competitive for {label or 'the selected vehicle'}",
-                    "constraints_delta": {"asking_price": asking_price},
-                    "clear_constraints": [],
-                    "preferences_delta": {},
-                    "clear_preferences": [],
-                    "objects": [{"type": ObjectType.LISTING.value, "alias": "purchase_candidate", "payload": payload}],
-                    "target_ids": ["purchase_candidate"],
-                    "shortlist_ids": [],
-                    "awaiting": None,
-                }
+    purchase_plan = _deterministic_purchase_price_plan(message, state, host)
+    if purchase_plan:
+        return purchase_plan
 
     # Straightforward dealer trade-ins should not depend on an upstream planner
     # call merely to identify the task. If the vehicle family is authoritative,
@@ -3767,7 +3867,12 @@ def handle_v10_request(data: Mapping[str, Any], host: Mapping[str, Any]) -> Tupl
 
     semantic_started=time.perf_counter()
     try:
-        raw_plan=_semantic_plan(message,language,state,host)
+        # Request-boundary deterministic ownership for concrete buyer price
+        # judgements. This runs before semantic planning so an LLM/resolver wobble
+        # cannot turn EVALUATE_PURCHASE into SEARCH_VEHICLES.
+        raw_plan=_deterministic_purchase_price_plan(message,state,host)
+        if raw_plan is None:
+            raw_plan=_semantic_plan(message,language,state,host)
         planned_state,resolved_plan=apply_turn_plan(state,raw_plan)
     except (InvalidTurnPlan, ContractError) as exc:
         # Invalid/contradictory interpretation is not permission to execute an old plan.
