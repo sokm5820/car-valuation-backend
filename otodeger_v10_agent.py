@@ -28,7 +28,7 @@ from otodeger_v10_state import (
 )
 
 V10_VERSION = "11.0-conversation-contract"
-ASSISTANT_BUILD = "11.10-gold-release-candidate"
+ASSISTANT_BUILD = "11.11-gold-release-candidate"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -616,6 +616,66 @@ def _semantic_plan(message: str, language: str, state: Mapping[str, Any], host: 
     model = _host(host, "OPENAI_MODEL", "gpt-5.6-luna")
 
     authoritative = _authoritative_message_evidence(message, host)
+
+    # A concrete purchase-price judgement is a deterministic task, not an LLM
+    # interpretation problem.  If we can authoritatively resolve one vehicle and
+    # the user supplied a price while asking whether that price is good/fair/too
+    # high/etc., route directly to EVALUATE_PURCHASE.  This prevents ordinary
+    # "Is £5,000 a good price for a 2007 Nissan March 1.2L?" turns from
+    # intermittently drifting into broad SEARCH_VEHICLES discovery.
+    if state.get("audience") == Audience.PERSONAL.value:
+        purchase_language = bool(re.search(
+            r"\b(?:good|fair|reasonable|competitive|cheap|expensive|overpriced|worth|good deal)\b|"
+            r"\bshould\s+i\s+(?:pay|buy)\b|\btoo\s+(?:much|high)\b",
+            str(message or ""), re.I))
+        owner_sale_language = bool(re.search(
+            r"\b(?:my car|my vehicle|my auto|sell|selling|list(?:ing)? price|someone offered|been offered|offer on my)\b|"
+            r"\b(?:arabam|aracım|aracim).{0,20}(?:sat|teklif)|\b(?:продать|мо[яй] машин|мне предлож)\b",
+            str(message or ""), re.I))
+        price_match = re.search(
+            r"(?:£\s*([0-9][0-9,.]*\s*[kK]?)|([0-9][0-9,.]*\s*[kK]?)\s*(?:GBP|gbp|pounds?|sterlin))",
+            str(message or ""), re.I)
+        targets = list(authoritative.get("vehicle_targets") or [])
+        if purchase_language and not owner_sale_language and price_match and len(targets) == 1:
+            raw_price = (price_match.group(1) or price_match.group(2) or "").replace(" ", "")
+            try:
+                asking_price = float(parse_number(raw_price))
+            except Exception:
+                asking_price = None
+            if asking_price is not None and asking_price > 0:
+                payload = dict(targets[0])
+                years = list(authoritative.get("explicit_years") or [])
+                if years and payload.get("year") in (None, ""):
+                    payload["year"] = years[0]
+                if authoritative.get("engine_size") and not payload.get("category"):
+                    payload["category"] = authoritative["engine_size"]
+                km_match = re.search(r"\b(\d[\d,.]*)\s*(?:km|kilomet(?:er|re)s?)\b", str(message or ""), re.I)
+                if km_match:
+                    try:
+                        payload["km"] = int(parse_number(km_match.group(1)))
+                    except Exception:
+                        pass
+                low_message = str(message or "").casefold()
+                if re.search(r"\b(?:automatic|auto|otomatik|автомат)\b", low_message):
+                    payload["transmission"] = "Automatic"
+                elif re.search(r"\b(?:manual|manuel|düz|duz|механик)\b", low_message):
+                    payload["transmission"] = "Manual"
+                payload["asking_price"] = asking_price
+                label = " ".join(str(x) for x in [payload.get("year"), payload.get("brand"), payload.get("model"), payload.get("category")] if x not in (None, ""))
+                return {
+                    "transition": Transition.START_NEW_GOAL.value if not state.get("job") else Transition.SWITCH_SUBTASK.value,
+                    "action": Action.EVALUATE_PURCHASE.value,
+                    "job": Job.EVALUATE_PURCHASE.value,
+                    "goal_summary": f"Evaluate whether the asking price is competitive for {label or 'the selected vehicle'}",
+                    "constraints_delta": {"asking_price": asking_price},
+                    "clear_constraints": [],
+                    "preferences_delta": {},
+                    "clear_preferences": [],
+                    "objects": [{"type": ObjectType.LISTING.value, "alias": "purchase_candidate", "payload": payload}],
+                    "target_ids": ["purchase_candidate"],
+                    "shortlist_ids": [],
+                    "awaiting": None,
+                }
 
     # Straightforward dealer trade-ins should not depend on an upstream planner
     # call merely to identify the task. If the vehicle family is authoritative,
