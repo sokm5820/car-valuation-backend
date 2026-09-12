@@ -15,7 +15,7 @@ from collections import defaultdict, deque
 
 # OtoDeğer V10 decision-agent orchestration. The valuation engine remains
 # isolated below; V10 only replaces the conversational assistant route.
-from otodeger_v10_agent import V10_VERSION, handle_v10_request
+from otodeger_v10_agent import V10_VERSION, ASSISTANT_BUILD, handle_v10_request
 from otodeger_v10_state import get_state_service, StorageUnavailable
 
 # AI interpreter configuration
@@ -291,12 +291,32 @@ def _valuation_intent(message):
     if not low:
         return False
 
+    # A received offer is a conversational seller-evaluation task, even when the
+    # same sentence also asks what the vehicle is worth. Do not intercept it into
+    # the valuation handoff before the decision assistant can compare the offer.
+    received_offer_patterns = [
+        r"\b(?:someone|somebody|dealer|buyer).{0,20}offered\s+me\b",
+        r"\bi(?:'ve| have)?\s+been\s+offered\b",
+        r"\bi\s+(?:got|received|have)\s+(?:an?\s+)?offer\b",
+        r"\boffer\s+on\s+my\s+(?:car|vehicle)\b",
+        r"\bbana.{0,25}teklif\b", r"\bteklif\s+ald[ıi]m\b",
+        r"\b(?:aracım|aracim|arabam).{0,25}teklif\b",
+        r"\bмне\s+предложил", r"\bполучил[аи]?\s+предложение",
+    ]
+    if any(re.search(p, low, flags=re.IGNORECASE) for p in received_offer_patterns):
+        return False
+
     patterns = [
         r"\b(?:aracım|arabam|aracim|arabamın|arabamin)\b.{0,35}\b(?:değer|deger|eder|kaç para|kac para|fiyat)\b",
         r"\b(?:aracımın|aracimin|arabamın|arabamin)\s+(?:değeri|degeri)\b",
         r"\b(?:araç|arac|araba)\s+değerleme\b",
         r"\b(?:how much is|what is)\s+my\s+(?:car|vehicle)\s+worth\b",
+        r"\bhow much\s+(?:should|can|could)\s+i\s+(?:sell|list)\s+my\s+(?:car|vehicle)\s+for\b",
+        r"\bwhat\s+(?:should|could)\s+i\s+(?:sell|list)\s+my\s+(?:car|vehicle)\s+for\b",
+        r"\bwhat(?:'s| is)\s+a\s+good\s+(?:selling|listing)\s+price\s+for\s+my\s+(?:car|vehicle)\b",
         r"\bvalue\s+my\s+(?:car|vehicle)\b",
+        r"\b(?:aracımı|aracimi|arabamı|arabami)\s+kaça\s+(?:satmalıyım|satmaliyim|satayım|satayim)\b",
+        r"\b(?:aracımı|aracimi|arabamı|arabami)\s+ne\s+kadara\s+(?:satmalıyım|satmaliyim|satayım|satayim)\b",
         r"\bcar\s+valuation\b",
         r"\bvehicle\s+valuation\b",
         r"\bсколько\s+стоит\s+моя\s+машина\b",
@@ -815,7 +835,7 @@ def _prepare_business_frame(frame):
 
     text_cols = [
         "Link", "Company", "VehicleType", "Brand", "Model", "CategoryDetail",
-        "Location", "Transmission", "Color", "Image",
+        "Location", "Transmission", "Fuel", "Color", "Image",
         "PublicListingAgeDefinition", "BenchmarkSource",
         "ComparableEvidenceConfidence", "PricePositionBand",
         "StockAgeBand", "AttentionLevel", "AttentionReasons",
@@ -933,6 +953,18 @@ def load_business_intelligence():
             )
 
         business_stock_df = _prepare_business_frame(new_stock)
+        # Business v1.5 stock output predates fuel segmentation. The live market
+        # is already loaded before Business intelligence, so enrich by listing link
+        # without changing any historical/price semantics. Future builders may
+        # include Fuel directly; in that case we keep the existing value.
+        if "Fuel" not in business_stock_df.columns and market_df is not None and not market_df.empty and {"Link","Fuel"}.issubset(market_df.columns):
+            fuel_lookup=(market_df[["Link","Fuel"]].copy()
+                         .drop_duplicates("Link",keep="last"))
+            fuel_lookup["Link"]=fuel_lookup["Link"].fillna("").astype(str).str.strip()
+            fuel_lookup["Fuel"]=fuel_lookup["Fuel"].fillna("").astype(str).str.strip()
+            business_stock_df=business_stock_df.merge(fuel_lookup,on="Link",how="left")
+        elif "Fuel" in business_stock_df.columns:
+            business_stock_df["Fuel"]=business_stock_df["Fuel"].fillna("").astype(str).str.strip()
         business_company_df = _prepare_business_frame(new_company)
         business_market_df = _prepare_business_frame(new_market)
         BUSINESS_INTELLIGENCE_READY = True
@@ -1904,6 +1936,37 @@ def resolve_market_vehicle_mentions(message):
             target["_phrase_len"] += category_matches[0][0]
 
         candidates.append(target)
+
+    # Natural vehicle names do not always mirror the site's Brand -> Model ->
+    # Category hierarchy. For example, users say "BMW 118i" while the market
+    # stores BMW -> 1 Serisi -> 118i. When an explicitly mentioned brand plus a
+    # non-numeric category token maps to exactly one model family for that brand,
+    # resolve it deterministically to that canonical family.
+    brand_category_hits = {}
+    for family in families.values():
+        brand_n = family["brand_n"]
+        if not brand_n or f" {brand_n} " not in padded_message:
+            continue
+        for category_n, category in family["categories"].items():
+            if not re.search(r"[a-zçğıöşüа-яё]", category_n, flags=re.IGNORECASE):
+                continue
+            if f" {category_n} " not in padded_message:
+                continue
+            key = (brand_n, category_n)
+            brand_category_hits.setdefault(key, []).append((family, category))
+
+    for (_brand_n, category_n), hits in brand_category_hits.items():
+        model_keys = {(h[0]["brand_n"], h[0]["model_n"]) for h in hits}
+        if len(model_keys) != 1:
+            continue
+        family, category = hits[0]
+        candidates.append({
+            "brand": family["brand"],
+            "model": family["model"],
+            "category": category,
+            "_match_strength": 4,
+            "_phrase_len": len(family["brand_n"]) + len(category_n),
+        })
 
     # If a longer model phrase contains a shorter model phrase from the same brand,
     # keep the most specific family. This protects compound model names.
@@ -8370,6 +8433,8 @@ def api_ai_buying_assistant_legacy():
                 "actions": fallback["actions"],
                 "decision_mode": "FALLBACK",
                 "stage": "unsupported_input",
+                "assistant_build": ASSISTANT_BUILD,
+                "v10_version": V10_VERSION,
                 "access_tier": access_tier,
                 "business_capabilities": business_capabilities,
             })
@@ -8391,6 +8456,8 @@ def api_ai_buying_assistant_legacy():
                 "actions": fallback["actions"],
                 "decision_mode": "PROTECTED_DATA",
                 "stage": "protected_data",
+                "assistant_build": ASSISTANT_BUILD,
+                "v10_version": V10_VERSION,
                 "access_tier": access_tier,
                 "business_capabilities": business_capabilities,
             })
@@ -8411,6 +8478,8 @@ def api_ai_buying_assistant_legacy():
                 "actions": valuation["actions"],
                 "decision_mode": "VALUATION",
                 "stage": "valuation_handoff",
+                "assistant_build": ASSISTANT_BUILD,
+                "v10_version": V10_VERSION,
                 "access_tier": access_tier,
                 "business_capabilities": business_capabilities,
             })
@@ -9349,6 +9418,8 @@ def api_v10_decision_agent():
                 "state_revision": data.get("state_revision"),
                 "decision_mode": "PROTECTED_DATA",
                 "stage": "protected_data",
+                "assistant_build": ASSISTANT_BUILD,
+                "v10_version": V10_VERSION,
                 "filters": {}, "preferences": [], "results": [],
                 "model_options": [], "actions": [], "suggestions": [],
             })
@@ -9362,9 +9433,38 @@ def api_v10_decision_agent():
                 "state_revision": data.get("state_revision"),
                 "decision_mode": "FALLBACK",
                 "stage": "unsupported_input",
+                "assistant_build": ASSISTANT_BUILD,
+                "v10_version": V10_VERSION,
                 "filters": {}, "preferences": [], "results": [],
                 "model_options": [], "actions": fallback.get("actions") or [],
                 "suggestions": fallback.get("suggestions") or [],
+            })
+
+        # Audience/company context is a product boundary, not a semantic guess.
+        access_tier = _normalize_access_tier(data.get("access_tier") or data.get("tier"))
+        data["access_tier"] = access_tier
+        if access_tier == "BUSINESS":
+            resolved_company = _resolve_business_company_context(
+                message, requested_company=str(data.get("business_company") or "").strip() or None
+            )
+            if resolved_company:
+                data["business_company"] = resolved_company
+
+        # Personal own-car valuation intentionally hands off to the dedicated
+        # valuation product. Offer evaluation stays in chat.
+        if access_tier == "PERSONAL" and _valuation_intent(message):
+            valuation = _valuation_response(language)
+            return jsonify({
+                "success": True,
+                "answer": valuation["answer"],
+                "conversation_id": data.get("conversation_id"),
+                "state_revision": data.get("state_revision"),
+                "decision_mode": "VALUATION",
+                "stage": "valuation_handoff",
+                "assistant_build": ASSISTANT_BUILD,
+                "v10_version": V10_VERSION,
+                "filters": {}, "preferences": [], "results": [],
+                "model_options": [], "actions": valuation["actions"], "suggestions": [],
             })
 
         host = globals()
@@ -9682,7 +9782,9 @@ def health():
     return {
         "status": "ok" if DATA_READY else "loading",
         "ready": DATA_READY,
-        "rows": len(df)
+        "rows": len(df),
+        "assistant_build": ASSISTANT_BUILD,
+        "v10_version": V10_VERSION,
     }
 
 # =========================================================

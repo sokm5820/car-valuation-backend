@@ -131,7 +131,9 @@ class V10GoldTests(unittest.TestCase):
         self.assertIn(('Mercedes-Benz','GLA'),names)
         e=self.call('Okay, can I see the links?',rev=d['state_revision'])
         self.assertEqual(e['decision_mode'],'SHOP')
-        links={x['link'] for x in e['results']}
+        # V11 listing presentation is action-only to avoid duplicate frontend cards.
+        self.assertEqual(e['results'],[])
+        links={x.get('url') for x in e['actions'] if x.get('type')=='LISTING'}
         self.assertIn('https://x/x1-2019',links)
         self.assertIn('https://x/gla-2017a',links)
         self.assertNotIn('https://x/eco',links)

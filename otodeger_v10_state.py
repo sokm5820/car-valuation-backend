@@ -88,6 +88,8 @@ class Job(str, Enum):
     PRICE_STOCK = "PRICE_STOCK"
     MOVE_AGING_STOCK = "MOVE_AGING_STOCK"
     ANALYZE_BUSINESS = "ANALYZE_BUSINESS"
+    EVALUATE_TRADE_IN = "EVALUATE_TRADE_IN"
+    PROMOTE_STOCK = "PROMOTE_STOCK"
 
 
 PERSONAL_JOBS = {
@@ -102,6 +104,8 @@ BUSINESS_JOBS = {
     Job.PRICE_STOCK.value,
     Job.MOVE_AGING_STOCK.value,
     Job.ANALYZE_BUSINESS.value,
+    Job.EVALUATE_TRADE_IN.value,
+    Job.PROMOTE_STOCK.value,
     Job.UNDERSTAND_MARKET.value,
 }
 
@@ -127,6 +131,8 @@ class Action(str, Enum):
     ANALYZE_AGING_STOCK = "ANALYZE_AGING_STOCK"
     RECOMMEND_ACQUISITIONS = "RECOMMEND_ACQUISITIONS"
     ANALYZE_BUSINESS_PERIOD = "ANALYZE_BUSINESS_PERIOD"
+    EVALUATE_TRADE_IN = "EVALUATE_TRADE_IN"
+    RECOMMEND_AD_CANDIDATE = "RECOMMEND_AD_CANDIDATE"
     EXPLAIN_RESULT = "EXPLAIN_RESULT"
 
 
@@ -155,6 +161,7 @@ ALLOWED_CONSTRAINTS = {
     "fuel_type",
     "exclude_locations",
     "exclude_fuels",
+    "colors",
     "category",
     "company",
     "period_start",
@@ -163,6 +170,8 @@ ALLOWED_CONSTRAINTS = {
     "offer_price",
     "acquisition_price",
     "desired_sale_price",
+    "target_margin_pct",
+    "prep_allowance",
     "currency",
 }
 
@@ -250,9 +259,9 @@ def _normalize_constraints(raw: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     for key, value in raw.items():
         if key not in ALLOWED_CONSTRAINTS:
             continue
-        if key in {"brands", "models", "exclude_locations", "exclude_fuels"}:
+        if key in {"brands", "models", "exclude_locations", "exclude_fuels", "colors"}:
             out[key] = _unique_strings(value)
-        elif key in {"budget_min", "budget_max", "asking_price", "offer_price", "acquisition_price", "desired_sale_price"}:
+        elif key in {"budget_min", "budget_max", "asking_price", "offer_price", "acquisition_price", "desired_sale_price", "target_margin_pct", "prep_allowance"}:
             number = _safe_number(value)
             out[key] = None if number is None else round(number, 2)
         elif key in {"min_year", "max_year", "max_km", "min_km"}:
@@ -284,7 +293,9 @@ def _normalize_preferences(raw: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
 def _object_fingerprint(object_type: str, payload: Mapping[str, Any]) -> str:
     """Stable identity based only on immutable/canonical identity fields."""
     fields_by_type = {
-        ObjectType.MODEL.value: ("brand", "model"),
+        # A model family remains one object when year/category are absent, while
+        # explicit model-year/variant comparison targets remain distinct.
+        ObjectType.MODEL.value: ("brand", "model", "year", "category"),
         ObjectType.LISTING.value: ("link", "listing_id", "brand", "model", "year", "price", "km"),
         ObjectType.OWNED_VEHICLE.value: ("vehicle_id", "brand", "model", "year"),
         ObjectType.STOCK_ITEM.value: ("link", "listing_id", "company", "brand", "model", "year"),
