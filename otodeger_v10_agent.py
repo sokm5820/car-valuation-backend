@@ -28,7 +28,7 @@ from otodeger_v10_state import (
 )
 
 V10_VERSION = "11.0-conversation-contract"
-ASSISTANT_BUILD = "11.6-gold-release-candidate"
+ASSISTANT_BUILD = "11.7-gold-release-candidate"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -1065,6 +1065,40 @@ def _canonical_market_colors(values: Any) -> List[str]:
                 out.append(alias)
     return out
 
+
+def _canonical_market_categories(values: Any) -> List[str]:
+    """Normalize variant/category phrases before they reach market_search.
+
+    The semantic planner occasionally uses ``category`` for a broad buyer
+    concept such as "small family car". The source market Category column is a
+    trim/engine field, so treating that phrase as a literal hard category can
+    incorrectly zero an otherwise healthy search. Conversely, natural engine
+    phrases such as ``1.2L`` need to resolve to the source spelling ``1.2``.
+    """
+    if values in (None, "", [], {}):
+        return []
+    if not isinstance(values, list):
+        values = [values]
+    out: List[str] = []
+    broad_concepts = (
+        "family car", "small family car", "city car", "small car",
+        "compact car", "fuel-efficient family car", "fuel efficient family car",
+        "suv", "crossover", "pickup", "pick-up", "sedan", "hatchback", "mpv",
+    )
+    for raw in values:
+        text = _text(raw, 120).strip()
+        if not text:
+            continue
+        low = text.casefold().replace("‑", "-")
+        if any(term == low or term in low for term in broad_concepts):
+            continue
+        m = re.fullmatch(r"\s*(\d+(?:[\.,]\d+)?)\s*(?:l|litre|litres|liter|liters)?\s*", low, re.I)
+        if m:
+            text = m.group(1).replace(",", ".")
+        if text not in out:
+            out.append(text)
+    return out
+
 def _legacy_filters(state: Mapping[str, Any]) -> Dict[str, Any]:
     c = dict(state.get("constraints") or {})
     out: Dict[str, Any] = {}
@@ -1082,6 +1116,10 @@ def _legacy_filters(state: Mapping[str, Any]) -> Dict[str, Any]:
             val = [val]
         if dest == "colors":
             val = _canonical_market_colors(val)
+        elif dest == "categories":
+            val = _canonical_market_categories(val)
+            if not val:
+                continue
         out[dest] = val
 
     # Canonical V10 seller_type maps onto the legacy market's Company field.
@@ -1832,11 +1870,136 @@ def _business_aging_tool(state: Mapping[str, Any], host: Mapping[str, Any], targ
     return {"kind":"business_aging","company":company,"vehicles":records[:12],"status":"ok"}
 
 
+def _business_acquire_live_fallback(state: Mapping[str, Any], host: Mapping[str, Any], aggregate_df: Any) -> List[Dict[str, Any]]:
+    """Recover constrained stocking candidates from verified live listings.
+
+    The aggregate Business Intelligence table can lag the live market by a
+    snapshot or omit a model/year grain that is present today. Hard filters such
+    as "automatic under £15k" should not become a false no-evidence answer when
+    matching live cars are verifiably available. This fallback derives current
+    model/year candidates from live listings, then attaches the strongest
+    compatible Business evidence that exists.
+    """
+    search = _host(host, "market_search")
+    if not callable(search):
+        return []
+    c = state.get("constraints") or {}
+    prefs = state.get("preferences") or {}
+    kwargs = {
+        "budget": c.get("budget_max"), "min_budget": c.get("budget_min"),
+        "brands": c.get("brands"),
+        "transmissions": [c.get("transmission")] if c.get("transmission") else None,
+        "fuels": [c.get("fuel_type")] if c.get("fuel_type") else None,
+        "limit": 5000, "max_limit": 5000, "analysis_mode": True,
+    }
+    try:
+        live = _checked_search(search(**kwargs)).get("results") or []
+    except Exception:
+        return []
+    live = _normal_vehicle_default_filter(live, state, host)
+    if not live:
+        return []
+
+    profile_lookup = _host(host, "MODEL_PROFILE_LOOKUP", {}) or {}
+    size_pref = str(prefs.get("size") or "").strip().casefold()
+    evidence_rank={"HIGH":3,"MEDIUM":2,"LOW":1,"INSUFFICIENT":0,"":0}
+    signal_rank={"VERY_STRONG":4,"STRONG":3,"MODERATE":2,"WEAK":1,"CAUTION":0,"INSUFFICIENT_EVIDENCE":0,"":0}
+    benchmark_rank={"MODEL_YEAR":3,"CATEGORY_YEAR":3,"CATEGORY_NEAR_YEAR":2,"MODEL_ALL_YEARS":1,"CATEGORY_ALL_YEARS":1,"":0}
+
+    def size_rank(brand: str, model: str) -> int:
+        if not size_pref:
+            return 1
+        prof=profile_lookup.get((brand.casefold(),model.casefold())) or {}
+        size=str(prof.get("SizeClass") or "").upper()
+        if size_pref in {"small","küçük","kucuk","маленький","compact small"}:
+            return 3 if size in {"SMALL","MICRO"} else 2 if size=="COMPACT" else 0
+        if size_pref in {"compact","kompakt","компактный"}:
+            return 3 if size=="COMPACT" else 2 if size in {"SMALL","MICRO"} else 0
+        if size_pref in {"large","büyük","buyuk","большой"}:
+            return 3 if size=="LARGE" else 0
+        return 1
+
+    buckets: Dict[Tuple[str,str,int], List[Mapping[str, Any]]] = {}
+    for row in live:
+        brand=_text(row.get("brand"),100); model=_text(row.get("model"),120); year=_int(row.get("year"))
+        if not brand or not model or year is None:
+            continue
+        buckets.setdefault((brand,model,year),[]).append(row)
+
+    records: List[Dict[str, Any]] = []
+    for (brand,model,year), items in buckets.items():
+        prices=[_finite(x.get("price")) for x in items]
+        prices=[x for x in prices if x is not None]
+        if not prices:
+            continue
+        base: Dict[str, Any] = {}
+        try:
+            if aggregate_df is not None and not getattr(aggregate_df,"empty",True):
+                m=aggregate_df[(aggregate_df["Brand"].fillna("").astype(str).str.casefold()==brand.casefold()) & (aggregate_df["Model"].fillna("").astype(str).str.casefold()==model.casefold())]
+                exact=m[m["Year"].apply(_int)==year] if "Year" in m else m.iloc[0:0]
+                cand=exact if not exact.empty else m
+                if not cand.empty:
+                    rows=_df_records(cand,50)
+                    def agg_rank(r):
+                        source=min(
+                            benchmark_rank.get(str(r.get("HistoricalBenchmarkSourceLiquidity") or "").upper(),0),
+                            benchmark_rank.get(str(r.get("HistoricalBenchmarkSourcePricePressure") or "").upper(),0),
+                        )
+                        return (source,evidence_rank.get(str(r.get("EvidenceQuality") or "").upper(),0),signal_rank.get(str(r.get("AcquisitionSignal") or "").upper(),0),_finite(r.get("OpportunityPercentile")) or -1)
+                    rows.sort(key=agg_rank,reverse=True)
+                    base=dict(rows[0])
+        except Exception:
+            base={}
+        prof=profile_lookup.get((brand.casefold(),model.casefold())) or {}
+        base.update({
+            "Brand":brand,"Model":model,"Year":year,
+            "CurrentStartingPrice":min(prices),
+            "CurrentMedianPrice":statistics.median(prices),
+            "CurrentListings":len(items),
+            "verified_current_matches":len(items),
+            "profile_size_class":prof.get("SizeClass"),
+            "profile_vehicle_type":prof.get("VehicleType"),
+            "_live_size_rank":size_rank(brand,model),
+        })
+        if not base.get("EvidenceQuality"):
+            base["EvidenceQuality"]="LOW"
+        if not base.get("AcquisitionSignal"):
+            base["AcquisitionSignal"]="CAUTION"
+        records.append(base)
+
+    def rank(rec):
+        source=min(
+            benchmark_rank.get(str(rec.get("HistoricalBenchmarkSourceLiquidity") or "").upper(),0),
+            benchmark_rank.get(str(rec.get("HistoricalBenchmarkSourcePricePressure") or "").upper(),0),
+        )
+        return (
+            int(rec.get("_live_size_rank") or 0),
+            source,
+            evidence_rank.get(str(rec.get("EvidenceQuality") or "").upper(),0),
+            signal_rank.get(str(rec.get("AcquisitionSignal") or "").upper(),0),
+            min(int(rec.get("verified_current_matches") or 0),10),
+            _int(rec.get("Year")) or 0,
+        )
+    records.sort(key=rank,reverse=True)
+    deduped=[]; seen=set()
+    for rec in records:
+        key=(str(rec.get("Brand") or "").casefold(),str(rec.get("Model") or "").casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        rec=dict(rec); rec.pop("_live_size_rank",None)
+        deduped.append(rec)
+        if len(deduped)>=12:
+            break
+    return deduped
+
+
 def _business_acquire_tool(state: Mapping[str, Any], host: Mapping[str, Any], target_ids: Sequence[str] = ()) -> Dict[str, Any]:
     df=_host(host,"business_market_df")
     if df is None or getattr(df,"empty",True):
         return {"kind":"business_acquisition","options":[],"status":"unavailable"}
     work=df.copy()
+    aggregate_source=df.copy()
     c=state.get("constraints") or {}
     prefs=state.get("preferences") or {}
     objects=state.get("objects") or {}
@@ -1952,6 +2115,8 @@ def _business_acquire_tool(state: Mapping[str, Any], host: Mapping[str, Any], ta
         records.sort(key=market_rank,reverse=True)
     except Exception:
         records=[]
+    if not records and not (specific_brand and specific_model):
+        records=_business_acquire_live_fallback(state,host,aggregate_source)
     # Deduplicate model/year and avoid opaque scores in user-facing packet.
     out=[]; seen=set()
     for r in records:
@@ -3200,6 +3365,12 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
                 },
             }
             lead=labels[lang].get(diagnosis,labels[lang]["MIXED_OR_STABLE"])
+            if diagnosis=="MIXED_OR_STABLE" and own is not None and wider is not None and own>0 and wider<0:
+                lead={
+                    "EN":f"The evidence is mixed: the wider gallery market softened, while **{company}** showed stronger observed listing-exit activity than in its previous comparable period.",
+                    "TR":f"Tablo karışık: daha geniş galeri piyasası zayıflarken **{company}** önceki karşılaştırılabilir döneme göre daha güçlü gözlemlenen ilan çıkış aktivitesi gösterdi.",
+                    "RU":f"Картина смешанная: широкий рынок дилеров ослаб, а у **{company}** наблюдаемая активность исчезновения объявлений выросла относительно предыдущего сопоставимого периода.",
+                }[lang]
             changes=""
             if own is not None and wider is not None:
                 if lang=="TR":
@@ -3209,15 +3380,22 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
                     changes=f" Önceki döneme göre gözlemlenen ilan çıkış aktivitesi: {company} {_tr_signed_pct(own)}, daha geniş galeri piyasası {_tr_signed_pct(wider)}."
                 else:
                     changes={"EN":f" Relative to the previous period: {company} {own:+.1f}%, wider gallery market {wider:+.1f}% on this observed listing-exit activity rate.","RU":f" Относительно предыдущего периода: {company} {own:+.1f}%, широкий дилерский рынок {wider:+.1f}% по этой метрике активности."}[lang]
+            own_rate=_finite((context.get("company_activity") or {}).get("exit_activity_rate"))
+            wider_rate=_finite((context.get("wider_gallery_activity") or {}).get("exit_activity_rate"))
+            rate_note=""
+            if own_rate is not None and wider_rate is not None:
+                if lang=="EN": rate_note=f" Current observed exit-activity rate: **{company} {own_rate*100:.2f}% vs wider gallery {wider_rate*100:.2f}%**."
+                elif lang=="TR": rate_note=f" Güncel gözlemlenen çıkış-aktivite oranı: **{company} %{own_rate*100:.2f}, daha geniş galeri %{wider_rate*100:.2f}**.".replace(".",",")
+                else: rate_note=f" Текущая наблюдаемая интенсивность исчезновения объявлений: **{company} {own_rate*100:.2f}% против {wider_rate*100:.2f}% на широком дилерском рынке**."
             caveat={"EN":" This is advert/listing activity, not confirmed sales.","TR":" Bu, ilan aktivitesidir; doğrulanmış satış değildir.","RU":" Это активность объявлений, а не подтверждённые продажи."}[lang]
             pricing=context.get("repricing_candidates") or []; aging=context.get("aging_candidates") or []
             action=""
-            if diagnosis=="BUSINESS_SPECIFIC_WEAKNESS" and (pricing or aging):
+            if diagnosis in {"BUSINESS_SPECIFIC_WEAKNESS","MIXED_OR_STABLE"} and (pricing or aging):
                 candidate=(pricing or aging)[0]
                 name=" ".join(str(x) for x in [candidate.get("Year"),candidate.get("Brand"),candidate.get("Model")] if x not in (None,""))
                 if name:
-                    action={"EN":f" The first corrective item I would inspect is **{name}**, then review its price position and stock age before changing your acquisition strategy.","TR":f" İlk düzeltici olarak **{name}** aracını incelerdim; stok alım stratejisini değiştirmeden önce fiyat konumu ve stok yaşına bakın.","RU":f" Первым делом я бы проверил **{name}** — его ценовую позицию и возраст склада, прежде чем менять стратегию закупок."}[lang]
-            return lead+changes+caveat+action
+                    action={"EN":f" I would still inspect **{name}** first because current pricing/stock-age evidence suggests an internal issue worth correcting.","TR":f" Yine de güncel fiyat/stok yaşı kanıtı iç tarafta düzeltilmesi gereken bir sorun gösterdiği için önce **{name}** aracını incelerdim.","RU":f" При этом я бы первым проверил **{name}**: текущая ценовая позиция/возраст склада указывает на внутреннюю проблему, которую стоит исправить."}[lang]
+            return lead+changes+rate_note+caveat+action
         rows=evidence.get("rows") or []
         if not rows:
             return {"EN":"I can inspect current market options, but I don't have enough historical evidence here to make a reliable demand conclusion.","TR":"Güncel piyasa seçeneklerini inceleyebilirim ancak burada güvenilir bir talep sonucu çıkarmak için yeterli geçmiş veri yok.","RU":"Я могу оценить текущий рынок, но здесь недостаточно исторических данных для надёжного вывода о спросе."}[lang]
@@ -3241,6 +3419,13 @@ def _render_answer(message: str, language: str, state: Mapping[str, Any], action
     # Guided UI prompts are deterministic questions; do not let the renderer turn
     # them into a search result or invent a bound.
     if evidence.get("kind") == "clarification":
+        return fallback
+    # Dealer-vs-market trend wording is numerically sensitive. The evidence
+    # packet already contains a deterministic diagnosis and matched-period
+    # changes; do not let free-form rendering produce a narrative that
+    # contradicts those figures (for example calling the dealer slower while
+    # its observed exit activity actually increased).
+    if evidence.get("kind") == "market_understanding" and evidence.get("business_context"):
         return fallback
     if not callable(post): return fallback
     instructions=f"""
