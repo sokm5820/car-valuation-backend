@@ -28,7 +28,7 @@ from otodeger_v10_state import (
 )
 
 V10_VERSION = "11.0-conversation-contract"
-ASSISTANT_BUILD = "11.8-gold-release-candidate"
+ASSISTANT_BUILD = "11.9-gold-release-candidate"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -1516,6 +1516,14 @@ def _comparable_rows(state: Mapping[str, Any], target: Mapping[str, Any], host: 
         f = _legacy_filters(state)
         target_transmission = target.get("transmission") or (state.get("constraints") or {}).get("transmission")
         target_fuel = target.get("fuel_type") or target.get("fuel") or (state.get("constraints") or {}).get("fuel_type")
+        # A year/mileage attached to the vehicle being evaluated describes the
+        # SUBJECT, not a hard market-search bound.  Semantic planning may mirror
+        # those values into min/max constraints (for example 2007 ->
+        # min_year=max_year=2007).  Applying those constraints here would erase
+        # the nearby-year comparator pool before the comparator ladder below can
+        # use it.  Pull the model family first, then narrow around the subject.
+        subject_year = _int(target.get("year"))
+        subject_km = _int(target.get("km") or target.get("mileage"))
         kwargs={
             "budget":f.get("budget"), "min_budget":f.get("min_budget"),
             "brands":[brand], "models":[model],
@@ -1524,8 +1532,10 @@ def _comparable_rows(state: Mapping[str, Any], target: Mapping[str, Any], host: 
             "categories":None,
             "locations":f.get("locations"),
             "transmissions":[target_transmission] if target_transmission else f.get("transmissions"),
-            "min_year":f.get("min_year"), "max_year":f.get("max_year"),
-            "min_km":f.get("min_km"), "max_km":f.get("max_km"),
+            "min_year":None if subject_year is not None else f.get("min_year"),
+            "max_year":None if subject_year is not None else f.get("max_year"),
+            "min_km":None if subject_km is not None else f.get("min_km"),
+            "max_km":None if subject_km is not None else f.get("max_km"),
             "limit":5000, "max_limit":5000, "analysis_mode":True,
         }
         if target_fuel or f.get("fuels"):
