@@ -19,15 +19,46 @@ import calendar
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from otodeger_v11_contract import ContractError, NUMBER_RE, parse_number, clarification
 
 from otodeger_v10_state import (
     Action, Audience, Job, ObjectType, Transition,
-    InvalidTurnPlan, StateConflict, StorageUnavailable,
+    InvalidTurnPlan, StateConflict, StateNotFound, StorageUnavailable,
     apply_turn_plan, get_state_service, register_object,
 )
 
 V10_VERSION = "11.0-conversation-contract"
+ASSISTANT_BUILD = "11.1-boundary-audit"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
+
+
+class AssistantDataUnavailable(RuntimeError):
+    """Search did not establish a trustworthy result set."""
+
+
+def _checked_search(result):
+    if not isinstance(result, Mapping) or result.get('success') is False or result.get('error') or result.get('vehicle_type_filter_unavailable'):
+        raise AssistantDataUnavailable('Search unavailable')
+    rows = result.get('results')
+    if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
+        raise AssistantDataUnavailable('Search returned invalid rows')
+    return dict(result)
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {str(k):_json_safe(v) for k,v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(x) for x in value]
+    if hasattr(value, 'item'):
+        return _json_safe(value.item())
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise ContractError('Unsupported response value')
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +75,8 @@ def _text(value: Any, max_len: int = 500) -> str:
 
 
 def _finite(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
     try:
         x = float(value)
     except (TypeError, ValueError):
@@ -182,6 +215,91 @@ def _audience_from_access(access_tier: str) -> str:
     return Audience.BUSINESS.value if str(access_tier or "").upper() == "BUSINESS" else Audience.PERSONAL.value
 
 
+def _numeric_updates(message, state):
+    """Bind numeric spans to units/fields; never use a mileage token as money."""
+    low = message.casefold().replace('\u0307', '')
+    updates = {}
+    money_candidates = []
+    budget_words = r"budget|bütçe\w*|butce\w*|бюджет\w*"
+    for match in NUMBER_RE.finditer(low):
+        before, after = low[max(0,match.start()-55):match.start()], low[match.end():match.end()+45]
+        value = parse_number(match.group('number'))
+        field = None
+        if re.match(r"\s*(?:km\b|kilomet\w*|км\b)", after) or re.search(r"(?:mileage|пробег|kilometre|km)\s*(?:limit|sınırı|siniri|maximum|max|of|to|is|:)?\s*$", before):
+            field = 'min_km' if re.search(r"(?:over|above|at least|minimum)\s*$", before) else 'max_km'
+        elif 1900 <= value <= 2100 and (re.search(r"(?:from|since|min(?:imum)? year|newer than|не старше|en az)\s*$", before) or re.match(r"\s*(?:onwards|or newer|and newer|ve sonrası|ve sonrasi|или новее)", after)):
+            field = 'min_year'
+        elif 1900 <= value <= 2100 and re.search(r"(?:max(?:imum)? year|older than|up to year)\s*$", before):
+            field = 'max_year'
+        elif re.search(r"£\s*$", before) or re.match(r"\s*(?:gbp|pounds?\b|sterlin\w*|фунт\w*)", after) or re.search(rf"(?:{budget_words}|under|below|up to|ceiling|spend|afford|stretch to)\s*(?:is|of|to|at|by|:)?\s*$", before) or re.match(rf"\s*(?:to (?:the )?)?(?:{budget_words})", after):
+            money_candidates.append((match, value, before, after))
+        if field:
+            if not value.is_integer():
+                raise ContractError('Year and mileage must be whole numbers')
+            updates[field] = int(value)
+    for match, value, before, after in money_candidates:
+        # Choose the monetary role nearest this token. Unrelated numbers keep their own units.
+        if re.search(r"offer(?:ed)?|teklif|предлож", before):
+            field = 'offer_price'
+        elif re.search(r"asking|advertised|listed|for sale at|ilan fiyat|satış fiyat|satis fiyat|price is", before):
+            field = 'asking_price'
+        elif state.get('audience') == Audience.BUSINESS.value and re.search(r"buy in|bring in|acquir|stock|offered|tedarik|stok", before):
+            field = 'acquisition_price'
+        elif re.search(budget_words + r"|under|below|up to|ceiling|spend|afford|stretch|can i buy|what can i buy", low):
+            field = 'budget_max'
+        else:
+            continue
+        if field == 'budget_max':
+            current = _finite((state.get('constraints') or {}).get(field))
+            absolute = re.search(r"(?:increase|raise|reduce|decrease)\s+(?:the\s+)?budget\s+to\s*$", before)
+            relative_plus = re.search(r"\badd\b|(?:increase|raise).*\bby\b|ekle|artır|artir|добав|увелич.*\bна\b", low)
+            relative_minus = re.search(r"\bsubtract\b|(?:reduce|decrease).*\bby\b|azalt|уменьш.*\bна\b", low)
+            if (relative_plus or relative_minus) and not absolute:
+                if current is None:
+                    raise ContractError('An existing budget is needed for a relative edit')
+                if re.match(r"\s*%", after):
+                    value = current * value / 100
+                value = current + value if relative_plus else current - value
+        updates[field] = value
+    return updates
+
+
+def _numeric_followup_plan(message, state):
+    """Handle complete numeric replies without a model call; ambiguity asks once."""
+    low = message.casefold().strip().rstrip('!?')
+    awaiting = clarification(state.get('awaiting')) or {}
+    field = awaiting.get('field')
+    job = state.get('job')
+    values = _numeric_updates(message, state)
+    try:
+        bare_value = parse_number(low)
+    except ContractError:
+        bare_value = None
+    numeric_fields = {'budget_max','budget_min','max_km','min_km','min_year','max_year'}
+    if bare_value is not None:
+        if field in numeric_fields:
+            values = {field: bare_value}
+        elif job == Job.FIND_A_CAR.value and (state.get('constraints') or {}).get('budget_max') is not None and bare_value > 2100:
+            values = {'budget_max': bare_value}
+        else:
+            return {'transition':'CONTINUE','action':'ASK_CLARIFICATION','job':job,
+                    'awaiting':{'question':{'EN':'Does that number refer to your budget, model year, or mileage?',
+                    'TR':'Bu sayı bütçeniz, model yılı veya kilometre ile mi ilgili?',
+                    'RU':'Это число означает бюджет, год выпуска или пробег?'}[_lang(state.get('language'))]}}
+    # Consume only complete simple edits. Mixed requests still go through semantic planning.
+    remainder = NUMBER_RE.sub(' ', low)
+    remainder = re.sub(r"£|[,.:;!?]", ' ', remainder)
+    allowed_words = {'make','the','budget','set','to','add','increase','raise','reduce','decrease','subtract','by','from',
+                     'under','below','up','maximum','max','minimum','min','year','years','mileage','limit','km','kilometres','kilometers',
+                     'gbp','pound','pounds','sterlin','bütçe','bütçem','butce','butcem','olsun','ekle','artır','artir','azalt',
+                     'бюджет','до','на','увеличить','уменьшить','добавить','пробег','км'}
+    simple = all(word in allowed_words for word in remainder.split())
+    if values and simple and job in {Job.FIND_A_CAR.value, Job.COMPARE_CARS.value}:
+        return {'transition':'REFINE','action':'SEARCH_VEHICLES','job':Job.FIND_A_CAR.value,
+                'constraints_delta':values, 'awaiting':None}
+    return None
+
+
 def _deterministic_followup_plan(message: str, state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """Execute explicit offered actions and guided filter prompts deterministically."""
     raw = _text(message, 1200)
@@ -193,36 +311,17 @@ def _deterministic_followup_plan(message: str, state: Mapping[str, Any]) -> Opti
     lang = _lang(state.get("language") or "EN")
 
     # If the UI has asked the user for a bound, a bare numeric reply is enough.
-    awaiting = state.get("awaiting") or {}
+    awaiting = clarification(state.get("awaiting")) or {}
     awaiting_field = str(awaiting.get("field") or "") if isinstance(awaiting, Mapping) else ""
-    if awaiting_field in {"min_year", "max_km"}:
-        m = re.search(r"\b([\d.,]+\s*[kK]?)\b", raw)
-        if m:
-            token = m.group(1).replace(" ", "")
-            try:
-                if token.lower().endswith("k"):
-                    value = float(token[:-1].replace(",", ".")) * 1000
-                else:
-                    value = float(token.replace(",", ""))
-            except Exception:
-                value = None
-            if value is not None:
-                if awaiting_field == "min_year" and 1950 <= value <= 2100:
-                    return {
-                        "transition": Transition.REFINE.value,
-                        "action": Action.SEARCH_VEHICLES.value,
-                        "job": state.get("job") or Job.FIND_A_CAR.value,
-                        "constraints_delta": {"min_year": int(round(value))},
-                        "awaiting": None,
-                    }
-                if awaiting_field == "max_km" and 0 <= value <= 2_000_000:
-                    return {
-                        "transition": Transition.REFINE.value,
-                        "action": Action.SEARCH_VEHICLES.value,
-                        "job": state.get("job") or Job.FIND_A_CAR.value,
-                        "constraints_delta": {"max_km": int(round(value))},
-                        "awaiting": None,
-                    }
+    if awaiting_field == "category":
+        options = awaiting.get("options") or []
+        selected = next((x for x in options if str(x).casefold() == low), None)
+        if selected:
+            return {"transition":"REFINE", "action":_default_action_for_job(state.get("job")),
+                    "job":state.get("job"), "constraints_delta":{"category":selected}, "awaiting":None}
+    numeric = _numeric_followup_plan(raw, state)
+    if numeric:
+        return numeric
 
     # Generic UI controls intentionally ask for the user's own bound instead of
     # silently applying an arbitrary 2018/100k rule.
@@ -306,8 +405,11 @@ def _deterministic_followup_plan(message: str, state: Mapping[str, Any]) -> Opti
                 }
 
     acceptance = bool(re.fullmatch(r"\s*(?:yes|yeah|yep|sure|ok|okay|do it|go ahead|please|evet|tamam|olur|göster|goster|да|хорошо|давай)\s*[.!]?\s*", low, flags=re.I))
-    show_links = bool(re.search(r"\b(?:show|see|send|give|open).{0,20}\b(?:links?|listings?|ads?)\b|\b(?:links?|listings?)\b|\b(?:ilanları|ilanlari|linkleri|göster|goster)\b|\b(?:ссылк|объявлен)", low, re.I))
-    compare = bool(re.search(r"\bcompare\b|\bcomparison\b|\bcompare them\b|\bthose two\b|\bkarşılaştır|karsilastir|сравн", low, re.I))
+    # Only pure commands use this shortcut. A request that adds criteria or names
+    # new cars must reach semantic planning instead of silently reusing old state.
+    command = re.sub(r"^(?:yes|okay|ok|sure)[, ]+", "", low).strip(' .!?“”"')
+    show_links = bool(re.fullmatch(r"(?:(?:please |can you |can i )?(?:show|see|send|give|open)(?: me)? (?:the |current |these |those )?)?(?:links?|listings?|ads?)(?: please)?|(?:ilanları|ilanlari|linkleri)(?: göster| goster)?|(?:покажи|показать)(?: мне)? (?:объявления|ссылки)", command, re.I))
+    compare = bool(re.fullmatch(r"(?:please |can you )?compare(?: (?:them|these|those|the options|these options|the two|the cars))?|comparison|(?:bunları |bunlari |bu seçenekleri )?(?:karşılaştır|karsilastir)|(?:сравни|сравнить)(?: их| варианты)?", command, re.I))
 
     if acceptance and offered_type:
         return {
@@ -418,7 +520,7 @@ State rules:
 - For North Cyprus vehicle discovery, location normally does not block a useful first answer. If a new broad vehicle goal has a body type but no numeric budget, ask only for maximum budget rather than also asking for a preferred location.
 
 Hard constraints keys allowed: budget_min,budget_max,vehicle_type,brands,models,min_year,max_year,max_km,min_km,
-transmission,seller_type,location,fuel_type,exclude_locations,category,company,period_start,period_end,asking_price,offer_price,
+transmission,seller_type,location,fuel_type,exclude_locations,exclude_fuels,category,company,period_start,period_end,asking_price,offer_price,
 acquisition_price,desired_sale_price,currency.
 Preference keys: economy,reliability,performance,luxury,comfort,practicality,family,commute,size,resale,low_mileage,newer,avoid_fuel.
 Use avoid_fuel for negative fuel preferences such as "I hate diesels"; preserve it across turns until explicitly changed or cleared.
@@ -444,6 +546,8 @@ Required JSON shape:
  "awaiting":null
 }}
 Do not return offered_action/result; those are produced by the application after execution.
+Use exclude_fuels for an explicit prohibition such as "no diesel". A softer preference
+uses preferences_delta.avoid_fuel. Clear exclude_fuels when the user explicitly allows those fuels again.
 """.strip()
 
     try:
@@ -632,96 +736,42 @@ def _normalize_semantic_plan(parsed: Mapping[str, Any], message: str, state: Map
 
 
 def _authoritative_numeric_constraints(message: str, parsed: Mapping[str, Any], state: Mapping[str, Any], host: Mapping[str, Any]) -> Dict[str, Any]:
-    """Protect directly typed numbers from LLM scaling/format errors.
-
-    This is deliberately narrow: it only overrides a field when the surrounding
-    wording makes the number's semantic role clear. Meaning remains the model's
-    job; literal numeric values remain deterministic evidence.
-    """
+    """Apply the shared, unit-aware numeric interpretation to a semantic plan."""
     out = copy.deepcopy(dict(parsed))
-    delta = dict(out.get("constraints_delta") or {})
-    low = str(message or "").casefold()
-    parser = _host(host, "_parse_human_number")
-
-    def parse_token(token: str) -> Optional[float]:
-        if callable(parser):
-            try:
-                v = parser(token)
-                return _finite(v)
-            except Exception:
-                pass
-        t = str(token or "").strip().lower().replace(" ", "")
-        mult = 1000 if t.endswith("k") else 1
-        if mult == 1000: t = t[:-1]
-        if "," in t and "." in t: t = t.replace(",", "")
-        elif t.count(",") == 1:
-            a,b=t.split(","); t=a+b if len(b)==3 else a+"."+b
-        elif t.count(".") == 1:
-            a,b=t.split("."); t=a+b if len(b)==3 else a+"."+b
-        try: return float(t)*mult
-        except Exception: return None
-
-    money_tokens = re.findall(r"£\s*([\d.,]+\s*[kK]?)|\b([\d.,]+\s*[kK]?)\s*(?:GBP|pounds?|sterlin)\b", str(message), re.I)
-    flat=[]
-    for a,b in money_tokens:
-        tok=(a or b).replace(" ","")
-        v=parse_token(tok)
-        if v is not None and 100 <= v <= 1_000_000: flat.append(v)
-    # A bare 15k / 15.000 next to clear budget wording.
-    if not flat:
-        m=re.search(r"\b([\d.,]+\s*[kK]?)\b", str(message))
-        # Do not mistake mileage language such as "under 100,000 km" for a
-        # budget update merely because it contains the word "under". Budget
-        # inference from a bare number is only allowed when that number is not
-        # immediately qualified as kilometres/mileage.
-        number_is_mileage = False
-        if m:
-            after = low[m.end():m.end()+24]
-            number_is_mileage = bool(re.match(r"\s*(?:km|kilomet(?:er|re)s?)\b", after, re.I))
-        if m and not number_is_mileage and re.search(r"\b(?:budget|bütçe|butce|бюджет|under|below|up to|max(?:imum)?|ceiling|spend|afford)\b", low, re.I):
-            v=parse_token(m.group(1).replace(" ",""))
-            if v is not None and 100 <= v <= 1_000_000: flat.append(v)
-    if flat:
-        value=flat[0]
-        if re.search(r"\b(?:offer(?:ed)?|teklif|предлож)\b", low, re.I):
-            delta["offer_price"]=value
-        elif state.get("audience")==Audience.BUSINESS.value and re.search(r"\b(?:buy in|bring in|acquir|stock|offered|tedarik|stok)\b", low, re.I):
-            delta["acquisition_price"]=value
-        elif re.search(r"\b(?:asking|advertised|listed at|for sale at|ilan fiyat|satış fiyat|satis fiyat|price is)\b", low, re.I):
-            delta["asking_price"]=value
-        elif re.search(r"\b(?:budget|bütçe|butce|бюджет|under|below|up to|max(?:imum)?|ceiling|spend|afford|can i buy|what can i buy)\b", low, re.I):
-            delta["budget_max"]=value
-
-    # Explicit year floors/ceilings.
-    m=re.search(r"\b(?:newer than|from|minimum year|min year|en az|sonrası|sonrasi|не старше)\s*(20\d{2}|19\d{2})\b", low, re.I)
-    if m: delta["min_year"]=int(m.group(1))
-    m=re.search(r"\b(?:older than|max year|up to year|en fazla|до)\s*(20\d{2}|19\d{2})\b", low, re.I)
-    if m: delta["max_year"]=int(m.group(1))
-    # Explicit mileage cap.
-    m=re.search(r"\b(?:under|below|max(?:imum)?|less than|altında|altinda|en fazla|до)\s*([\d.,]+\s*[kK]?)\s*(?:km|kilomet)", low, re.I)
-    if m:
-        v=parse_token(m.group(1).replace(" ",""))
-        if v is not None and 0 <= v <= 2_000_000: delta["max_km"]=int(round(v))
+    raw_delta = out.get("constraints_delta")
+    if raw_delta is not None and not isinstance(raw_delta, Mapping):
+        raise InvalidTurnPlan("constraints_delta must be an object")
+    delta = dict(raw_delta or {})
+    delta.update(_numeric_updates(message, state))
+    low = message.casefold().replace("\u0307", "")
+    exclusions = []
+    for family, words in {'diesel':r'diesel|dizel|дизель\w*', 'petrol':r'petrol|gasoline|benzin|бензин\w*',
+                          'electric':r'electric|elektrikli|электрическ\w*', 'hybrid':r'hybrid|hibrit|гибрид\w*'}.items():
+        if re.search(rf"\b(?:no|not|without|exclude|без|не хочу)\s+(?:any\s+)?(?:{words})\b|\b(?:{words})\s+(?:istemiyorum|olmasın|olmasin)\b", low):
+            exclusions.append(family)
+    if exclusions:
+        delta['exclude_fuels'] = list(dict.fromkeys(list((state.get('constraints') or {}).get('exclude_fuels') or []) + exclusions))
 
     # Deterministic interpretation of the exact contextual suggestion language.
     # These are hard filters once clicked/typed; do not leave them to model drift.
     m=re.search(r"\b(20\d{2}|19\d{2})\s*(?:or newer|and newer|ve sonrası|ve sonrasi|или новее)\b", low, re.I)
     if m:
         delta["min_year"] = int(m.group(1))
-    if re.search(r"\b(?:automatic only|otomatik(?: sadece)?|только автомат)\b", low, re.I):
+    negated = bool(re.search(r"\b(?:no|not|without|don't|dont|istemiyorum|olmasın|olmasin|не|без)\b", low))
+    if not negated and re.search(r"\b(?:automatic only|only automatic|sadece otomatik|otomatik sadece|только автомат)\b", low, re.I):
         delta["transmission"] = "Automatic"
-    if re.search(r"\b(?:gallery sellers? only|dealers? only|galleries? only|sadece galeriler?|galeri(?:ler)?|только дилер)\b", low, re.I):
+    if not negated and re.search(r"\b(?:gallery sellers? only|dealers? only|galleries? only|sadece galeriler?|только дилер)\b", low, re.I):
         delta["seller_type"] = "gallery"
-    elif re.search(r"\b(?:private sellers? only|individual sellers? only|sadece bireysel|bireysel satıcı|частн(?:ый|ые) продав)\b", low, re.I):
+    elif not negated and re.search(r"\b(?:private sellers? only|individual sellers? only|sadece bireysel|частн(?:ый|ые) продав)\b", low, re.I):
         delta["seller_type"] = "private"
 
     # Protect the most important physical-class terms as authoritative constraints.
     # This works alongside the semantic parser rather than replacing it.
-    if re.search(r"\bSUVs?\b", str(message), re.I):
+    if not negated and re.search(r"\bSUVs?\b", str(message), re.I):
         delta["vehicle_type"] = "SUV"
-    elif re.search(r"\b(?:crossover|crossovers)\b", low, re.I):
+    elif not negated and re.search(r"\b(?:crossover|crossovers)\b", low, re.I):
         delta["vehicle_type"] = "crossover"
-    elif re.search(r"\b(?:pickup|pick-up|pickups|pick-ups)\b", low, re.I):
+    elif not negated and re.search(r"\b(?:pickup|pick-up|pickups|pick-ups)\b", low, re.I):
         delta["vehicle_type"] = "pickup"
 
     out["constraints_delta"]=delta
@@ -784,7 +834,7 @@ def _legacy_preferences(state: Mapping[str, Any]) -> List[str]:
 def _search_all(state: Mapping[str, Any], host: Mapping[str, Any]) -> Dict[str, Any]:
     fn = _host(host, "market_search")
     if not callable(fn):
-        return {"success": False, "error": "MARKET_SEARCH_UNAVAILABLE", "count": 0, "results": []}
+        raise AssistantDataUnavailable("Market search unavailable")
     f = _legacy_filters(state)
     search_kwargs = {
         "budget": f.get("budget"), "min_budget": f.get("min_budget"), "brands": f.get("brands"),
@@ -797,7 +847,18 @@ def _search_all(state: Mapping[str, Any], host: Mapping[str, Any]) -> Dict[str, 
     # keyword. Only send it when the user actually has a hard fuel constraint.
     if f.get("fuels") not in (None, "", [], {}):
         search_kwargs["fuels"] = f.get("fuels")
-    result = fn(**search_kwargs)
+    result = _checked_search(fn(**search_kwargs))
+    excluded = (state.get('constraints') or {}).get('exclude_fuels') or []
+    if excluded:
+        def fuel_family_text(row):
+            fuel = str(row.get('fuel') or '').casefold()
+            for source, target in [('dizel','diesel'),('дизель','diesel'),('benzin','petrol'),('бензин','petrol'),
+                                   ('gasoline','petrol'),('hibrit','hybrid'),('гибрид','hybrid'),('elektrik','electric'),('электр','electric')]:
+                fuel = fuel.replace(source, target)
+            return fuel
+        # An unknown fuel cannot be verified as meeting an explicit exclusion.
+        rows = [r for r in result['results'] if fuel_family_text(r) and not any(str(x).casefold() in fuel_family_text(r) for x in excluded)]
+        result = dict(result, results=rows, count=len(rows), returned=len(rows))
 
     # Negative fuel preference is soft: avoid it when alternatives exist, but do
     # not turn a preference into a silent hard zero-result constraint.
@@ -855,8 +916,9 @@ def _search_all(state: Mapping[str, Any], host: Mapping[str, Any]) -> Dict[str, 
     if callable(strict) and (state.get("constraints") or {}).get("vehicle_type"):
         try:
             result = strict(result, _legacy_preferences(state))
-        except Exception:
-            pass
+        except Exception as exc:
+            raise AssistantDataUnavailable("Vehicle classification failed") from exc
+        result = _checked_search(result)
     return result
 
 
@@ -1040,28 +1102,21 @@ def _search_vehicle_models(state: Mapping[str, Any], message: str, host: Mapping
     }
 
 def _target_listing_search(state: Mapping[str, Any], target_ids: Sequence[str], host: Mapping[str, Any]) -> Dict[str, Any]:
+    # Apply every active constraint/preference through the same search as discovery.
+    # Model selection must not bypass fuel exclusions, seller class or vehicle type.
     targets = _model_targets_from_objects(state, target_ids)
-    fn = _host(host, "_search_market_for_vehicle_targets")
-    if targets and callable(fn):
-        base = _legacy_filters(state)
-        # target search applies brand/model target-by-target; remove global brand/model cross product.
-        for k in ("brands", "models", "categories"):
-            base.pop(k, None)
-        try:
-            result = fn(base, targets)
-            rows = result.get("results") or []
-        except Exception:
-            rows = []
-    else:
-        rows = _search_all(state, host).get("results") or []
-
-    # Ranking is deliberate: not just cheapest. Favor current focus, newer year,
-    # sensible mileage, and price while preserving actual listing evidence.
+    rows = _search_all(state, host).get("results") or []
+    if targets:
+        def matches(row, target):
+            return (str(row.get("brand") or "").casefold() == str(target.get("brand") or "").casefold()
+                    and str(row.get("model") or "").casefold() == str(target.get("model") or "").casefold()
+                    and (not target.get("category") or str(row.get("category") or "").casefold() == str(target["category"]).casefold()))
+        rows = [row for row in rows if any(matches(row, target) for target in targets)]
     def rank(r):
         year = _int(r.get("year")) or 0
         km = _int(r.get("km"))
-        price = _finite(r.get("price")) or 1e18
-        return (-year, km if km is not None else 10**9, price)
+        price = _finite(r.get("price"))
+        return (-year, km if km is not None else 10**9, price if price is not None else 1e18)
     rows = sorted([dict(x) for x in rows], key=rank)
     return {"kind":"listings", "count":len(rows), "listings":rows[:12], "models":[]}
 
@@ -1077,7 +1132,7 @@ def _comparable_rows(state: Mapping[str, Any], target: Mapping[str, Any], host: 
         f = _legacy_filters(state)
         result = fn(
             budget=f.get("budget"), min_budget=f.get("min_budget"),
-            brands=[brand], models=[model], categories=f.get("categories"),
+            brands=[brand], models=[model], categories=[target.get("category")] if target.get("category") else f.get("categories"),
             locations=f.get("locations"), transmissions=f.get("transmissions"),
             min_year=f.get("min_year"), max_year=f.get("max_year"),
             min_km=f.get("min_km"), max_km=f.get("max_km"),
@@ -1089,8 +1144,10 @@ def _comparable_rows(state: Mapping[str, Any], target: Mapping[str, Any], host: 
     year = _int(target.get("year"))
     if year is not None:
         tight = [x for x in rows if _int(x.get("year")) is not None and abs((_int(x.get("year")) or 0)-year) <= year_window]
-        if len(tight) >= 3:
-            rows = tight
+        rows = tight
+    category = target.get("category") or (state.get("constraints") or {}).get("category")
+    if category:
+        rows = [x for x in rows if str(x.get("category") or "").strip().casefold() == str(category).strip().casefold()]
     return rows
 
 
@@ -1106,6 +1163,12 @@ def _evaluate_price_subject(state: Mapping[str, Any], target_ids: Sequence[str],
     offer = _finite(c.get("offer_price") or subject.get("offer_price"))
     price_to_evaluate = asking if mode == "purchase_evaluation" else (offer if offer is not None else asking)
     rows = _comparable_rows(state, subject, host)
+    categories = sorted({str(x.get("category") or "").strip() for x in rows if str(x.get("category") or "").strip()})
+    if not (subject.get("category") or c.get("category")) and len(categories) > 1:
+        question = {"EN":"Which version is your car? These variants have different values: ",
+                    "TR":"Aracınız hangi versiyon? Bu versiyonların değerleri farklı: ",
+                    "RU":"Какая у вас версия? Стоимость этих версий различается: "}[_lang(state.get("language"))]
+        return {"kind":"clarification", "awaiting":{"field":"category", "question":question + "; ".join(categories), "options":categories}}
     prices = [float(x["price"]) for x in rows if _finite(x.get("price")) is not None]
     if not prices:
         return {"kind":mode, "status":"insufficient", "subject":subject, "price":price_to_evaluate, "comparables":[]}
@@ -1634,6 +1697,11 @@ def _suggestions_from_context(state: Mapping[str, Any], evidence: Mapping[str, A
     kind=evidence.get("kind")
     c=state.get("constraints") or {}
     models=evidence.get("models") or evidence.get("vehicles") or []
+    if kind == "clarification":
+        return (clarification(evidence.get("awaiting")) or {}).get("options", [])[:6]
+    if (kind == "vehicle_search" and not models) or (kind == "listings" and not evidence.get("listings")) or (kind == "comparison" and len(models) < 2):
+        # The answer asks what to relax. Do not stack more restrictions onto an empty set.
+        return []
 
     base={
         "EN": {"year":"Set minimum year","km":"Set mileage limit","auto":"Automatic only","gallery":"Gallery sellers only",
@@ -1652,7 +1720,12 @@ def _suggestions_from_context(state: Mapping[str, Any], evidence: Mapping[str, A
         # Broad discovery should learn taste before stacking arbitrary hard filters.
         named = bool(c.get("brands") or c.get("models"))
         if not named:
-            out.extend([base["econlux"], base["year"], base["km"]])
+            if not any((state.get("preferences") or {}).get(k) for k in ("economy", "luxury", "reliability", "performance", "comfort", "practicality")):
+                out.append(base["econlux"])
+            if not c.get("min_year"):
+                out.append(base["year"])
+            if not c.get("max_km"):
+                out.append(base["km"])
         else:
             if len(models)>=2:
                 out.append(base["compare"])
@@ -1710,9 +1783,9 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
             label=f"{m.get('brand')} {m.get('model')}"
             year=m.get('newest_year'); price=_money(m.get('newest_year_starting_price'))
             count=int(m.get('count') or 0)
-            if lang=="TR": return f"**{label}** — {year or 'yıl bilgisi yok'} · {price or 'fiyat yok'}'dan · {count} seçenek"
-            if lang=="RU": return f"**{label}** — до {year or '—'} · {price or '—'} · {count} вариантов"
-            return f"**{label}** — up to {year or '—'} · {year or 'newest year'} from {price or '—'} · {count} options"
+            if lang=="TR": return f"**{label}** — eşleşen tüm yıllarda toplam {count} ilan · en yeni yıl: {year or '—'}, {price or '—'}'dan başlayan"
+            if lang=="RU": return f"**{label}** — всего {count} объявлений по подходящим годам · самый новый год: {year or '—'}, от {price or '—'}"
+            return f"**{label}** — {count} matching listings across all eligible years · newest: {year or '—'}, from {price or '—'}"
         alt=evidence.get("alternative_models") or []
         if lang=="TR":
             intro="Bunlar mevcut kriterleriniz içinde daha aktif görünen seçeneklerden bazıları; piyasanın tamamı değil."
@@ -1726,6 +1799,10 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
         return intro+"\n"+"\n".join(line(m) for m in shown)+tail
     if kind=="listings":
         n=min(10,len(evidence.get("listings") or []))
+        if not n:
+            return {"EN":"No current listings match all your criteria. Which restriction would you like to change?",
+                    "TR":"Tüm kriterlerinize uyan güncel ilan yok. Hangi kriteri değiştirmek istersiniz?",
+                    "RU":"Нет актуальных объявлений по всем вашим условиям. Какое ограничение вы хотите изменить?"}[lang]
         total=int(evidence.get("count") or n)
         if lang=="TR": return f"Aşağıda {n} güncel ilan gösteriyorum" + (f" ({total} eşleşme içinden)." if total>n else ".") + " Aşağıdaki her satır tıklanabilir ve temel ilan bilgilerini içerir; sonuçları yıl, kilometre veya satıcı tipine göre daha da daraltabiliriz."
         if lang=="RU": return f"Ниже показаны {n} актуальных объявлений" + (f" из {total} совпадений." if total>n else ".") + " Каждая строка ниже кликабельна и содержит основные данные объявления; затем можно сузить выбор по году, пробегу или типу продавца."
@@ -1752,7 +1829,7 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
         verdict=decision.get("verdict")
         return {"EN":f"My current view is **{str(verdict).replace('_',' ').lower()}** based on comparable asking prices. Asking prices are not confirmed sale prices, so I'd use this as a negotiation/decision signal rather than an exact valuation.","TR":f"Benim mevcut görüşüm, karşılaştırılabilir ilan fiyatlarına göre **{str(verdict).replace('_',' ').lower()}**. İlan fiyatları doğrulanmış satış fiyatları değildir; bunu kesin değer yerine karar/pazarlık sinyali olarak kullanmak daha doğru olur.","RU":f"По текущим сопоставимым ценам объявлений мой вывод: **{str(verdict).replace('_',' ').lower()}**. Цены объявлений не являются подтверждёнными ценами сделок, поэтому это ориентир для решения/торга, а не точная оценка."}[lang]
     if kind=="clarification":
-        awaiting=evidence.get("awaiting")
+        awaiting=clarification(evidence.get("awaiting"))
         if isinstance(awaiting, Mapping):
             q=_text(awaiting.get("question"),500)
         elif isinstance(awaiting, str):
@@ -1796,7 +1873,7 @@ V11 product contract:
 Rules:
 - Match the response depth to the stage of the decision. Do not force a recommendation before the buyer has supplied preferences that make one meaningful.
 - DISCOVERY / vehicle_search: map the useful option set. For a broad budget + body-type request, show the useful active model families rather than naming a winner; usually 4-8, but do not force a fixed count. The deterministic model order already prioritises observed market activity (historical listing volume + observed market exits) before current supply. Respect that order. Explicitly make clear these are SOME of the more active matches, not the entire market. If VERIFIED_EVIDENCE contains alternative_models, briefly name those model-level lower-activity alternatives and offer an expanded list. Never call an observed exit a confirmed sale/transaction and never equate current listing count alone with popularity.
-- When a budget exists, model discovery is about WHAT THAT BUDGET BUYS. Prefer: MODEL — up to YEAR · YEAR from £PRICE · N options. Do not lead with an old model's overall minimum price.
+- When a budget exists, model discovery is about WHAT THAT BUDGET BUYS. Say: MODEL — N matching listings across all eligible years · newest: YEAR, from £PRICE. N is NOT the number of cars from the newest year. Do not lead with an old model's overall minimum price.
 - When the user names brands (for example BMW or Mercedes), show the relevant models under those brands with newest affordable year + asking price at that year + option count. Do not introduce mileage yet unless the user asks for mileage or is filtering listings by mileage.
 - Do not append routine caveats such as "asking prices are not confirmed transaction prices" to ordinary discovery/comparison replies. Preserve that distinction internally and mention it only when it materially affects the decision.
 - When the filtered choice is thin (especially 1-2 cars at the newest viable year), do not pretend the market is broad. Say it is thin and guide the user toward choosing a model, relaxing the minimum year, widening brand scope, or another constraint that actually increases choice.
@@ -1871,7 +1948,7 @@ def _evidence_validate(answer: str, evidence: Mapping[str, Any], state: Optional
     # Counts attached to 'options/listings' in discovery/comparison must come
     # from deterministic evidence, not model improvisation.
     if evidence.get("kind") in {"vehicle_search", "comparison"}:
-        allowed_counts = {int(x.get("count") or 0) for x in ((evidence.get("models") or []) + (evidence.get("vehicles") or []))}
+        allowed_counts = {int(x.get(key) or 0) for x in ((evidence.get("models") or []) + (evidence.get("vehicles") or [])) for key in ('count', 'newest_year_count')}
         allowed_counts.add(int(evidence.get("count") or 0))
         for m in re.finditer(r"\b(\d{1,4})\s+(?:current\s+)?(?:options?|listings?|seçenek|ilan|вариант)", answer, re.I):
             if int(m.group(1)) not in allowed_counts:
@@ -1899,6 +1976,16 @@ def _public_state_summary(state: Mapping[str, Any]) -> Dict[str, Any]:
 
 def handle_v10_request(data: Mapping[str, Any], host: Mapping[str, Any]) -> Tuple[Dict[str, Any], int]:
     started=time.perf_counter()
+    if not isinstance(data, Mapping) or not isinstance(data.get('message'), str):
+        return {'success':False, 'error':'INVALID_REQUEST'}, 400
+    if len(data['message']) > int(_host(host,'ASSISTANT_MAX_MESSAGE_CHARS',1200)):
+        return {'success':False, 'error':'MESSAGE_TOO_LONG'}, 413
+    raw_id = data.get('conversation_id')
+    if raw_id is not None and (not isinstance(raw_id, str) or not raw_id.strip() or len(raw_id) > 200):
+        return {'success':False, 'error':'INVALID_CONVERSATION_ID'}, 400
+    revision = data.get('state_revision')
+    if revision is not None and (isinstance(revision, bool) or not isinstance(revision, int) or revision < 0):
+        return {'success':False, 'error':'INVALID_STATE_REVISION'}, 400
     message=_text(data.get("message"), int(_host(host,"ASSISTANT_MAX_MESSAGE_CHARS",1200)))
     language=_lang(data.get("language"))
     if not message:
@@ -1910,13 +1997,17 @@ def handle_v10_request(data: Mapping[str, Any], host: Mapping[str, Any]) -> Tupl
     client_revision=_int(data.get("state_revision"))
 
     service=get_state_service()
-    stored=service.get_or_create(conversation_id,audience=audience,language=language)
+    try:
+        stored=service.get_or_create(conversation_id,audience=audience,language=language)
+    except StateConflict:
+        return {'success':False,'error':'STATE_CONFLICT','conversation_id':conversation_id},409
     state=copy.deepcopy(stored.state)
     # Existing conversation audience is authoritative. Client cannot switch it mid-thread.
     language=_lang(language)
     state["language"]=language
+    state['awaiting'] = clarification(state.get('awaiting'))
 
-    if client_revision is not None and stored.revision>1 and client_revision != stored.revision:
+    if stored.revision > 1 and client_revision != stored.revision:
         return {"success":False,"error":"STATE_STALE","conversation_id":state.get("conversation_id"),"state_revision":stored.revision},409
 
     # Business company comes from current integration plumbing for now; state owns it once set.
@@ -1929,21 +2020,33 @@ def handle_v10_request(data: Mapping[str, Any], host: Mapping[str, Any]) -> Tupl
     try:
         raw_plan=_semantic_plan(message,language,state,host)
         planned_state,resolved_plan=apply_turn_plan(state,raw_plan)
-    except (InvalidTurnPlan, Exception) as exc:
-        # One bounded second semantic attempt with a validation hint is preferable to
-        # silently falling back into unrelated broad search.
-        print(f"V10_PLAN_DEGRADED: {exc}",flush=True)
-        fallback_action=_default_action_for_job(state.get("job"))
-        if not state.get("job"):
-            q={"EN":"What are you trying to decide — finding a car, checking a specific car, selling your car, or understanding the market?","TR":"Hangi kararı vermeye çalışıyorsunuz — araç bulmak, belirli bir aracı değerlendirmek, aracınızı satmak veya piyasayı anlamak mı?","RU":"Какое решение вы принимаете — подобрать машину, оценить конкретный автомобиль, продать свою машину или понять рынок?"}[language]
-            raw_plan={"transition":"CONTINUE","action":"ASK_CLARIFICATION","job":None,"awaiting":{"question":q}}
-        else:
-            raw_plan={"transition":"CONTINUE","action":fallback_action,"job":state.get("job")}
-        planned_state,resolved_plan=apply_turn_plan(state,raw_plan)
+    except (InvalidTurnPlan, ContractError) as exc:
+        # Invalid/contradictory interpretation is not permission to execute an old plan.
+        print(f"V11_PLAN_REJECTED: {type(exc).__name__}",flush=True)
+        return {'success':False,'error':'ASSISTANT_INTERPRETATION_FAILED','conversation_id':stored.state['conversation_id'],
+                'state_revision':stored.revision, 'retryable':True},422
+    except Exception as exc:
+        # Preserve both the previous criteria and revision on upstream failures.
+        if isinstance(exc, _host(host, 'AIUsageLimitExceeded', ())):
+            raise
+        print(f"V11_PLANNER_UNAVAILABLE: {type(exc).__name__}",flush=True)
+        return {'success':False,'error':'AI_ASSISTANT_TEMPORARILY_UNAVAILABLE','conversation_id':stored.state['conversation_id'],
+                'state_revision':stored.revision, 'retryable':True},503
     semantic_seconds=time.perf_counter()-semantic_started
 
     action=str(resolved_plan.get("action") or _default_action_for_job(planned_state.get("job"))).upper()
-    evidence=_execute_tool(action,planned_state,resolved_plan,message,host)
+    try:
+        evidence=_execute_tool(action,planned_state,resolved_plan,message,host)
+    except Exception as exc:
+        print(f"V11_TOOL_UNAVAILABLE: {type(exc).__name__}",flush=True)
+        return {'success':False,'error':'ASSISTANT_DATA_TEMPORARILY_UNAVAILABLE',
+                'conversation_id':stored.state['conversation_id'],'state_revision':stored.revision,'retryable':True},503
+    if not isinstance(evidence, Mapping):
+        return {'success':False,'error':'ASSISTANT_DATA_TEMPORARILY_UNAVAILABLE','retryable':True},503
+    if evidence.get("kind") == "clarification":
+        evidence = dict(evidence, awaiting=clarification(evidence.get('awaiting')))
+        action = Action.ASK_CLARIFICATION.value
+        resolved_plan = dict(resolved_plan, awaiting=evidence.get("awaiting"))
 
     # Evidence becomes durable objects before response generation so follow-ups bind
     # to data identities, never prose.
@@ -1963,7 +2066,7 @@ def handle_v10_request(data: Mapping[str, Any], host: Mapping[str, Any]) -> Tupl
     actions,offered=_actions_from_evidence(updated_state,action,evidence,language)
     if offered is not None:
         updated_state["offered_action"]=offered
-    elif action==Action.ASK_CLARIFICATION.value:
+    else:
         updated_state["offered_action"]=None
 
     result_targets=list(((updated_state.get("focus") or {}).get("object_ids") or []))
@@ -1981,37 +2084,37 @@ def handle_v10_request(data: Mapping[str, Any], host: Mapping[str, Any]) -> Tupl
         print(f"V10_RENDER_VALIDATION_FALLBACK: {reason}",flush=True)
         answer=_fallback_answer(language,updated_state,decision,evidence)
 
-    # Persist once, after semantic state + tool-derived focus/result/offered action are complete.
-    # We intentionally do not call service.apply_plan twice; one CAS write per user turn.
+    # Construct and serialize the complete response BEFORE committing the turn.
+    # A presentation failure must never consume a revision the client did not receive.
+    listings=evidence.get("listings") or []
+    models=evidence.get("models") or []
+    business_options=evidence.get("vehicles") or evidence.get("options") or evidence.get("rows") or []
+    payload = {
+        "success":True,"answer":answer,
+        "conversation_id":updated_state["conversation_id"],"state_revision":stored.revision + 1,
+        "v10_version":V10_VERSION,"assistant_build":ASSISTANT_BUILD,"job":updated_state.get("job"),"action":action,
+        "decision":decision.get("verdict"),"decision_mode":_compat_mode(action,updated_state.get("job")),
+        "stage":"v10_decision_agent","filters":_legacy_filters(updated_state),"preferences":_legacy_preferences(updated_state),
+        "count":int(evidence.get("count") or len(listings) or len(models) or len(business_options) or 0),
+        "returned":min(10,len(listings)) if evidence.get("kind")=="listings" else len(listings),
+        "results":[] if evidence.get("kind")=="listings" else listings[:20],
+        "model_options":models[:8],"business_options":business_options[:12],"actions":actions,
+        "suggestions":_suggestions_from_context(updated_state,evidence,language),
+        "assistant_state":_public_state_summary(updated_state),
+    }
+    payload = _json_safe(payload)
+    updated_state = _json_safe(updated_state)
+    json.dumps(payload, ensure_ascii=False, allow_nan=False)
     try:
         saved=service.store.save(updated_state,expected_revision=stored.revision)
     except StateConflict:
         return {"success":False,"error":"STATE_CONFLICT","conversation_id":state.get("conversation_id")},409
-
-    listings=evidence.get("listings") or []
-    models=evidence.get("models") or []
-    business_options=evidence.get("vehicles") or evidence.get("options") or evidence.get("rows") or []
-    compat_filters=_legacy_filters(saved.state)
-    compat_preferences=_legacy_preferences(saved.state)
+    except StateNotFound:
+        return {"success":False,"error":"STATE_EXPIRED","conversation_id":state.get("conversation_id")},409
+    payload["state_revision"] = saved.revision
     total=time.perf_counter()-started
     print(f"V10_TIMING action={action} semantic={semantic_seconds:.2f}s total={total:.2f}s",flush=True)
-
-    return {
-        "success":True,"answer":answer,
-        "conversation_id":saved.state.get("conversation_id"),"state_revision":saved.revision,
-        "v10_version":V10_VERSION,"job":saved.state.get("job"),"action":action,
-        "decision":decision.get("verdict"),"decision_mode":_compat_mode(action,saved.state.get("job")),
-        "stage":"v10_decision_agent","filters":compat_filters,"preferences":compat_preferences,
-        "count":int(evidence.get("count") or len(listings) or len(models) or len(business_options) or 0),
-        # SHOW_LISTINGS uses the information-rich clickable action rows as the
-        # single presentation. Sending the same listings through `results` as well
-        # makes the frontend render a second set of cards.
-        "returned":min(10,len(listings)) if evidence.get("kind")=="listings" else len(listings),
-        "results":[] if evidence.get("kind")=="listings" else listings[:20],
-        "model_options":models[:8],
-        "business_options":business_options[:12],"actions":actions,"suggestions":_suggestions_from_context(saved.state,evidence,language),
-        "assistant_state":_public_state_summary(saved.state),
-    },200
+    return payload,200
 
 
 __all__=["V10_VERSION","handle_v10_request"]

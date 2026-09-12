@@ -352,6 +352,10 @@ def _looks_like_gibberish_message(message):
     if not text:
         return True
 
+    # Numeric follow-ups need conversation context, including spaces and locale separators.
+    if re.fullmatch(r"[\d.,\s'’]+", text):
+        return False
+
     # Real market/search signals should always pass through.
     if re.search(r"£|\b\d{4}\b|\b\d+(?:[.,]\d+)?\s*(?:k|bin|gbp|pounds?|sterlin|km)\b", text, re.I):
         return False
@@ -3284,12 +3288,22 @@ def market_search(
     # -----------------------
 
     if transmissions:
-        wanted = set(normalize_list(transmissions))
+        def transmission_key(value):
+            value = normalize(value)
+            aliases = {
+                "automatic": "otomatik", "auto": "otomatik", "автомат": "otomatik",
+                "автоматическая": "otomatik", "manual": "düz", "manuel": "düz",
+                "duz": "düz", "механика": "düz", "механическая": "düz",
+                "semi automatic": "yarı otomatik", "semi-automatic": "yarı otomatik",
+                "yari otomatik": "yarı otomatik", "полуавтомат": "yarı otomatik",
+            }
+            return aliases.get(value, value)
+        wanted = {transmission_key(value) for value in normalize_list(transmissions)}
         filtered = filtered[
             filtered["Transmission"]
             .fillna("")
             .astype(str)
-            .map(normalize)
+            .map(transmission_key)
             .isin(wanted)
         ]
 
@@ -9298,9 +9312,13 @@ def api_v10_decision_agent():
     for rollback during deployment, but the frontend should use this route.
     """
     try:
-        data = request.json or {}
-        message = str(data.get("message") or "").strip()
-        language = str(data.get("language") or "EN").upper()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or not isinstance(data.get("message"), str):
+            return jsonify({"success":False,"error":"INVALID_REQUEST"}),400
+        message = data["message"].strip()
+        language = str(data.get("language") or "EN").strip().upper()
+        if language not in {"EN","TR","RU"}:
+            language = "EN"
 
         if not message:
             return jsonify({"success": False, "error": "MESSAGE_REQUIRED"}), 400

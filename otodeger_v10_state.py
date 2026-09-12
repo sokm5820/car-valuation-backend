@@ -31,6 +31,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -153,6 +154,7 @@ ALLOWED_CONSTRAINTS = {
     "location",
     "fuel_type",
     "exclude_locations",
+    "exclude_fuels",
     "category",
     "company",
     "period_start",
@@ -224,17 +226,20 @@ def _unique_strings(values: Any, max_items: int = 30) -> List[str]:
 
 
 def _safe_number(value: Any, *, integer: bool = False) -> Optional[float]:
+    from otodeger_v11_contract import ContractError, parse_number
     if value is None or value == "":
         return None
     if isinstance(value, bool):
         raise InvalidTurnPlan("Boolean is not a numeric constraint")
     try:
-        number = float(value)
-    except (TypeError, ValueError) as exc:
+        number = parse_number(value)
+    except (TypeError, ValueError, ContractError) as exc:
         raise InvalidTurnPlan(f"Invalid numeric value: {value!r}") from exc
     if number != number or number in (float("inf"), float("-inf")):
         raise InvalidTurnPlan("Numeric constraint must be finite")
-    return int(round(number)) if integer else number
+    if integer and not number.is_integer():
+        raise InvalidTurnPlan("Year and mileage constraints must be whole numbers")
+    return int(number) if integer else number
 
 
 def _normalize_constraints(raw: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -245,7 +250,7 @@ def _normalize_constraints(raw: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     for key, value in raw.items():
         if key not in ALLOWED_CONSTRAINTS:
             continue
-        if key in {"brands", "models", "exclude_locations"}:
+        if key in {"brands", "models", "exclude_locations", "exclude_fuels"}:
             out[key] = _unique_strings(value)
         elif key in {"budget_min", "budget_max", "asking_price", "offer_price", "acquisition_price", "desired_sale_price"}:
             number = _safe_number(value)
@@ -456,6 +461,7 @@ def _reset_goal_context(state: Dict[str, Any]) -> None:
 
 
 def validate_turn_plan(plan: Mapping[str, Any], state: Mapping[str, Any]) -> Dict[str, Any]:
+    from otodeger_v11_contract import ContractError, clarification
     if not isinstance(plan, Mapping):
         raise InvalidTurnPlan("Turn plan must be a JSON object")
     transition = str(plan.get("transition") or Transition.CONTINUE.value).upper()
@@ -514,6 +520,10 @@ def validate_turn_plan(plan: Mapping[str, Any], state: Mapping[str, Any]) -> Dic
     if any(k not in ALLOWED_PREFERENCES for k in clear_preferences):
         raise InvalidTurnPlan("Unsupported clear_preferences key")
 
+    try:
+        awaiting = clarification(plan.get("awaiting"))
+    except ContractError as exc:
+        raise InvalidTurnPlan(str(exc)) from exc
     return {
         "transition": transition,
         "action": action,
@@ -526,13 +536,21 @@ def validate_turn_plan(plan: Mapping[str, Any], state: Mapping[str, Any]) -> Dic
         "objects": normalized_objects,
         "target_ids": target_ids,
         "shortlist_ids": _unique_strings(plan.get("shortlist_ids") or [], max_items=MAX_SHORTLIST),
-        "awaiting": copy.deepcopy(plan.get("awaiting")),
+        "awaiting": awaiting,
         "offered_action": copy.deepcopy(plan.get("offered_action")),
         "result": copy.deepcopy(plan.get("result")),
     }
 
 
 def _validate_numeric_consistency(constraints: Mapping[str, Any]) -> None:
+    for key in ("budget_min", "budget_max", "asking_price", "offer_price", "acquisition_price", "desired_sale_price", "min_km", "max_km"):
+        value = constraints.get(key)
+        if value is not None and (not isinstance(value, (float, int)) or isinstance(value, bool) or not math.isfinite(value) or value < 0):
+            raise InvalidTurnPlan(f"{key} must be a finite nonnegative number")
+    for key in ("min_year", "max_year"):
+        value = constraints.get(key)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or not 1900 <= value <= 2100):
+            raise InvalidTurnPlan(f"{key} must be a model year between 1900 and 2100")
     bmin, bmax = constraints.get("budget_min"), constraints.get("budget_max")
     if bmin is not None and bmax is not None and float(bmin) > float(bmax):
         raise InvalidTurnPlan("budget_min cannot exceed budget_max")
