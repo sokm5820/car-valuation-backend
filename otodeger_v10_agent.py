@@ -28,7 +28,7 @@ from otodeger_v10_state import (
 )
 
 V10_VERSION = "11.0-conversation-contract"
-ASSISTANT_BUILD = "11.7-gold-release-candidate"
+ASSISTANT_BUILD = "11.8-gold-release-candidate"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -1537,7 +1537,9 @@ def _comparable_rows(state: Mapping[str, Any], target: Mapping[str, Any], host: 
     except Exception:
         return []
 
-    category = target.get("category") or (state.get("constraints") or {}).get("category")
+    raw_category = target.get("category") or (state.get("constraints") or {}).get("category")
+    canonical_categories = _canonical_market_categories(raw_category)
+    category = canonical_categories[0] if canonical_categories else None
     if category:
         exact_category=[x for x in rows if str(x.get("category") or "").strip().casefold()==str(category).strip().casefold()]
         if exact_category:
@@ -1994,7 +1996,7 @@ def _business_acquire_live_fallback(state: Mapping[str, Any], host: Mapping[str,
     return deduped
 
 
-def _business_acquire_tool(state: Mapping[str, Any], host: Mapping[str, Any], target_ids: Sequence[str] = ()) -> Dict[str, Any]:
+def _business_acquire_tool(state: Mapping[str, Any], host: Mapping[str, Any], target_ids: Sequence[str] = (), message: str = "") -> Dict[str, Any]:
     df=_host(host,"business_market_df")
     if df is None or getattr(df,"empty",True):
         return {"kind":"business_acquisition","options":[],"status":"unavailable"}
@@ -2004,6 +2006,34 @@ def _business_acquire_tool(state: Mapping[str, Any], host: Mapping[str, Any], ta
     prefs=state.get("preferences") or {}
     objects=state.get("objects") or {}
     target_obj=(objects.get(target_ids[0]) or {}) if target_ids else {}
+
+    # A broad acquisition refinement must not become a question about the first
+    # model from the previous recommendation list merely because that model is
+    # still in focus. This is especially important for turns such as
+    # "keep it under £15k and focus on small automatics". Preserve a specific
+    # target when the user names it (or when the conversation truly has only one
+    # selected candidate), but discard an inherited shortlist target for broad
+    # constraint edits so the live-market fallback can search the whole market.
+    message_low=_text(message,1200).casefold()
+    focus_ids=list(((state.get("focus") or {}).get("object_ids") or []))
+    shortlist_ids=list(state.get("shortlist") or [])
+    prior_candidate_ids=shortlist_ids or focus_ids
+    target_brand=_text(target_obj.get("brand"),100)
+    target_model=_text(target_obj.get("model"),120)
+    target_named=bool(
+        target_obj and (
+            (target_model and target_model.casefold() in message_low) or
+            (target_brand and target_brand.casefold() in message_low)
+        )
+    )
+    broad_refinement=bool(re.search(
+        r"\b(?:under|below|maximum|max|budget|ceiling|small|compact|automatic|automatics|manual|hybrid|petrol|diesel|electric|focus|either|hatchback|crossover|suv|price)\b",
+        message_low, re.I
+    ))
+    inherited_from_multi=bool(target_obj and len(prior_candidate_ids)>1 and str(target_ids[0]) in {str(x) for x in prior_candidate_ids})
+    if inherited_from_multi and broad_refinement and not target_named:
+        target_obj={}
+
     specific_brand=_text(target_obj.get("brand"),100)
     specific_model=_text(target_obj.get("model"),120)
     specific_year=_int(target_obj.get("year"))
@@ -2625,7 +2655,7 @@ def _execute_tool(action: str, state: Mapping[str, Any], resolved_plan: Mapping[
     if action == Action.ANALYZE_AGING_STOCK.value:
         return _business_aging_tool(state,host,targets)
     if action == Action.RECOMMEND_ACQUISITIONS.value:
-        return _business_acquire_tool(state,host,targets)
+        return _business_acquire_tool(state,host,targets,message)
     if action == Action.ANALYZE_BUSINESS_PERIOD.value:
         return _business_period_tool(state,host)
     if action == Action.EVALUATE_TRADE_IN.value:
