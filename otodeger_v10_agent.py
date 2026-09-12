@@ -28,7 +28,7 @@ from otodeger_v10_state import (
 )
 
 V10_VERSION = "11.0-conversation-contract"
-ASSISTANT_BUILD = "11.12-gold-release-candidate"
+ASSISTANT_BUILD = "11.13-gold-release-candidate"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -319,17 +319,36 @@ def _deterministic_followup_plan(message: str, state: Mapping[str, Any]) -> Opti
         if selected:
             return {"transition":"REFINE", "action":_default_action_for_job(state.get("job")),
                     "job":state.get("job"), "constraints_delta":{"category":selected}, "awaiting":None}
-    # Contextual engine/variant edits such as "1.0" or "1.2L" belong to the
-    # vehicle currently being evaluated; never reinterpret them as a budget/year.
-    engine_only = re.fullmatch(r"\s*(\d+(?:[.,]\d+)?)\s*(?:l|litre|liter)?\s*", raw, flags=re.I)
-    if engine_only and state.get("job") in {Job.EVALUATE_PURCHASE.value, Job.EVALUATE_SALE.value, Job.EVALUATE_TRADE_IN.value}:
+    # Contextual engine/variant edits belong to the vehicle currently being
+    # evaluated.  Accept natural wrappers ("what about 1.0?", "1.0 instead",
+    # "how about the 1.0L?") rather than only a bare numeric token.  This branch
+    # runs before semantic planning, so a normal variant refinement can never
+    # reopen model discovery or reinterpret 1.0 as a budget/year.
+    engine_refinement = None
+    if state.get("job") in {Job.EVALUATE_PURCHASE.value, Job.EVALUATE_SALE.value, Job.EVALUATE_TRADE_IN.value}:
+        engine_patterns = [
+            r"\s*(?P<engine>\d{1,2}(?:[.,]\d))\s*(?:l|litre|liter)?\s*[?!.]*\s*",
+            r"\s*(?:what|how)\s+about\s+(?:the\s+)?(?P<engine>\d{1,2}(?:[.,]\d))\s*(?:l|litre|liter)?\s*[?!.]*\s*",
+            r"\s*(?:and\s+)?(?:what|how)\s+about\s+(?:the\s+)?(?P<engine>\d{1,2}(?:[.,]\d))\s*(?:l|litre|liter)?\s*[?!.]*\s*",
+            r"\s*(?P<engine>\d{1,2}(?:[.,]\d))\s*(?:l|litre|liter)?\s+(?:instead|then)\s*[?!.]*\s*",
+            r"\s*(?:try|make it)\s+(?P<engine>\d{1,2}(?:[.,]\d))\s*(?:l|litre|liter)?\s*[?!.]*\s*",
+            r"\s*(?:peki|ya)\s+(?P<engine>\d{1,2}(?:[.,]\d))\s*(?:l|litre|liter)?\s*[?!.]*\s*",
+            r"\s*(?:а\s+как\s+насч[eё]т|как\s+насч[eё]т)\s+(?P<engine>\d{1,2}(?:[.,]\d))\s*(?:l|литр(?:а|ов)?)?\s*[?!.]*\s*",
+        ]
+        for pattern in engine_patterns:
+            match = re.fullmatch(pattern, raw, flags=re.I)
+            if match:
+                engine_refinement = match.group("engine").replace(",", ".")
+                break
+
+    if engine_refinement is not None:
         candidate_ids = focus_ids or list(state.get("shortlist") or [])
         if candidate_ids:
             current_id = candidate_ids[0]
             current = (state.get("objects") or {}).get(current_id) or {}
             if str(current.get("type") or "").upper() in {ObjectType.LISTING.value, ObjectType.OWNED_VEHICLE.value}:
                 payload = {k:v for k,v in current.items() if k not in {"id","type"}}
-                payload["category"] = engine_only.group(1).replace(",", ".")
+                payload["category"] = engine_refinement
                 alias = "variant_vehicle"
                 return {
                     "transition":Transition.REFINE.value,
@@ -340,6 +359,22 @@ def _deterministic_followup_plan(message: str, state: Mapping[str, Any]) -> Opti
                     "clear_constraints":["category"],
                     "awaiting":None,
                 }
+
+        # The intent is still a refinement of the active evaluation even if the
+        # subject object was unexpectedly lost.  Preserve the job boundary and ask
+        # for the vehicle instead of handing the turn to semantic discovery.
+        q = {
+            "EN": f"Which vehicle should I evaluate with the {engine_refinement} version?",
+            "TR": f"{engine_refinement} versiyonu için hangi aracı değerlendireyim?",
+            "RU": f"Какой автомобиль оценить в версии {engine_refinement}?",
+        }[lang]
+        return {
+            "transition":Transition.CONTINUE.value,
+            "action":Action.ASK_CLARIFICATION.value,
+            "job":state.get("job"),
+            "constraints_delta":{"category":engine_refinement},
+            "awaiting":{"field":"purchase_vehicle" if state.get("job") == Job.EVALUATE_PURCHASE.value else "vehicle", "question":q},
+        }
 
     # Comparing several years of the currently selected model is a first-class
     # operation. Model-year objects are intentionally distinct in V11.3.
