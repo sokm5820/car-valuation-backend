@@ -13,7 +13,7 @@ import sys
 import uuid
 from urllib import error, request
 
-EXPECTED_BUILD = "11.9-gold-release-candidate"
+EXPECTED_BUILD = "11.10-gold-release-candidate"
 DEFAULT_BASE_URL = "https://car-valuation-backend.onrender.com"
 
 

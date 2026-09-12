@@ -28,7 +28,7 @@ from otodeger_v10_state import (
 )
 
 V10_VERSION = "11.0-conversation-contract"
-ASSISTANT_BUILD = "11.9-gold-release-candidate"
+ASSISTANT_BUILD = "11.10-gold-release-candidate"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -386,6 +386,68 @@ def _deterministic_followup_plan(message: str, state: Mapping[str, Any]) -> Opti
     numeric = _numeric_followup_plan(raw, state)
     if numeric:
         return numeric
+
+    # Business acquisition refinements are high-frequency structured edits and
+    # must not depend on an LLM planner. A dealer saying e.g. "keep it under
+    # £15,000 and focus on small automatics" is only changing constraints on
+    # the existing ACQUIRE_STOCK job. Parse those edits deterministically so a
+    # transient/invalid semantic plan can never surface as an interpretation
+    # error for this ordinary workflow.
+    if state.get("audience") == Audience.BUSINESS.value and state.get("job") == Job.ACQUIRE_STOCK.value:
+        acquisition_delta = {}
+        acquisition_prefs = {}
+        try:
+            for key, value in (_numeric_updates(raw, state) or {}).items():
+                if key in {"budget_min", "budget_max", "min_year", "max_year", "min_km", "max_km"}:
+                    acquisition_delta[key] = value
+        except ContractError:
+            acquisition_delta = {}
+
+        negated = bool(re.search(r"\b(?:no|not|without|don't|dont|istemiyorum|olmasın|olmasin|не|без)\b", low, re.I))
+        if not negated and re.search(r"\b(?:automatic|automatics|auto|otomatik|автомат(?:ическ\w*)?)\b", low, re.I):
+            acquisition_delta["transmission"] = "Automatic"
+        elif not negated and re.search(r"\b(?:manual|manuel|механическ\w*)\b", low, re.I):
+            acquisition_delta["transmission"] = "Manual"
+
+        if not negated and re.search(r"\b(?:small|küçük|kucuk|маленьк\w*)\b", low, re.I):
+            acquisition_prefs["size"] = "small"
+        elif not negated and re.search(r"\b(?:compact|kompakt|компактн\w*)\b", low, re.I):
+            acquisition_prefs["size"] = "compact"
+        elif not negated and re.search(r"\b(?:large|büyük|buyuk|больш\w*)\b", low, re.I):
+            acquisition_prefs["size"] = "large"
+
+        fuel_patterns = {
+            "hybrid": r"\b(?:hybrid|hibrit|гибрид\w*)\b",
+            "petrol": r"\b(?:petrol|gasoline|benzin|бензин\w*)\b",
+            "diesel": r"\b(?:diesel|dizel|дизель\w*)\b",
+            "electric": r"\b(?:electric|ev|elektrikli|электрическ\w*)\b",
+        }
+        if not negated:
+            for fuel, pattern in fuel_patterns.items():
+                if re.search(pattern, low, re.I):
+                    acquisition_delta["fuel_type"] = fuel
+                    break
+
+        if not negated:
+            if re.search(r"\bSUVs?\b", raw, re.I):
+                acquisition_delta["vehicle_type"] = "SUV"
+            elif re.search(r"\b(?:crossover|crossovers)\b", low, re.I):
+                acquisition_delta["vehicle_type"] = "crossover"
+            elif re.search(r"\b(?:pickup|pick-up|pickups|pick-ups)\b", low, re.I):
+                acquisition_delta["vehicle_type"] = "pickup"
+
+        # Require at least one actual structured refinement so generic questions
+        # such as "why?" still reach the normal explanation/planning path.
+        if acquisition_delta or acquisition_prefs:
+            return {
+                "transition": Transition.REFINE.value,
+                "action": Action.RECOMMEND_ACQUISITIONS.value,
+                "job": Job.ACQUIRE_STOCK.value,
+                "constraints_delta": acquisition_delta,
+                "preferences_delta": acquisition_prefs,
+                "target_ids": [],
+                "awaiting": None,
+            }
 
     # Generic UI controls intentionally ask for the user's own bound instead of
     # silently applying an arbitrary 2018/100k rule.
