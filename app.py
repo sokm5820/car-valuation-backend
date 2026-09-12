@@ -312,7 +312,13 @@ def _valuation_intent(message):
         r"\b(?:araç|arac|araba)\s+değerleme\b",
         r"\b(?:how much is|what is)\s+my\s+(?:car|vehicle)\s+worth\b",
         r"\bhow much\s+(?:should|can|could)\s+i\s+(?:sell|list)\s+my\s+(?:car|vehicle)\s+for\b",
+        # Natural owners usually name the vehicle instead of saying the word
+        # "car": "How much should I sell my 2017 BMW 118i Sport for?".
+        # Received-offer language has already been excluded above, so this is a
+        # safe own-valuation handoff rather than an offer-evaluation intercept.
+        r"\bhow much\s+(?:should|can|could)\s+i\s+(?:sell|list)\s+my\s+.{2,100}?\s+for\b",
         r"\bwhat\s+(?:should|could)\s+i\s+(?:sell|list)\s+my\s+(?:car|vehicle)\s+for\b",
+        r"\bwhat\s+(?:should|could)\s+i\s+(?:sell|list)\s+my\s+.{2,100}?\s+for\b",
         r"\bwhat(?:'s| is)\s+a\s+good\s+(?:selling|listing)\s+price\s+for\s+my\s+(?:car|vehicle)\b",
         r"\bvalue\s+my\s+(?:car|vehicle)\b",
         r"\b(?:aracımı|aracimi|arabamı|arabami)\s+kaça\s+(?:satmalıyım|satmaliyim|satayım|satayim)\b",

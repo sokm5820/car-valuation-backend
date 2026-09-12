@@ -28,7 +28,7 @@ from otodeger_v10_state import (
 )
 
 V10_VERSION = "11.0-conversation-contract"
-ASSISTANT_BUILD = "11.5-gold-release-candidate"
+ASSISTANT_BUILD = "11.6-gold-release-candidate"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -289,7 +289,7 @@ def _numeric_followup_plan(message, state):
     # Consume only complete simple edits. Mixed requests still go through semantic planning.
     remainder = NUMBER_RE.sub(' ', low)
     remainder = re.sub(r"£|[,.:;!?]", ' ', remainder)
-    allowed_words = {'make','the','budget','set','to','add','increase','raise','reduce','decrease','subtract','by','from',
+    allowed_words = {'make','the','my','budget','is','now','actually','set','to','add','increase','raise','reduce','decrease','subtract','by','from',
                      'under','below','up','maximum','max','minimum','min','year','years','mileage','limit','km','kilometres','kilometers',
                      'gbp','pound','pounds','sterlin','bütçe','bütçem','butce','butcem','olsun','ekle','artır','artir','azalt',
                      'бюджет','до','на','увеличить','уменьшить','добавить','пробег','км'}
@@ -552,10 +552,62 @@ def _semantic_plan(message: str, language: str, state: Mapping[str, Any], host: 
 
     post = _host(host, "_openai_post")
     model = _host(host, "OPENAI_MODEL", "gpt-5.6-luna")
+
+    authoritative = _authoritative_message_evidence(message, host)
+
+    # Straightforward dealer trade-ins should not depend on an upstream planner
+    # call merely to identify the task. If the vehicle family is authoritative,
+    # build the trade-in subject deterministically and let Python own valuation.
+    # This also provides graceful continuity during a transient AI planning outage.
+    if state.get("audience") == Audience.BUSINESS.value and re.search(
+        r"\btrade[ -]?in\b|\bpart exchange\b|\btakas\b|\bобмен\b",
+        str(message or ""), re.I):
+        targets = list(authoritative.get("vehicle_targets") or [])
+        if targets:
+            payload = dict(targets[0])
+            years = list(authoritative.get("explicit_years") or [])
+            if years and payload.get("year") in (None, ""):
+                payload["year"] = years[0]
+            if authoritative.get("engine_size") and not payload.get("category"):
+                payload["category"] = authoritative["engine_size"]
+            elif not payload.get("category"):
+                # In normal dealer speech engine size is often written as
+                # "Yaris 1.5 automatic" without an L suffix. A standalone
+                # decimal in a resolved trade-in vehicle description is therefore
+                # a safe category/engine hint; prices and mileage are handled by
+                # their own units below.
+                engine_decimal = re.search(r"(?<![\d,.])(\d{1,2}[.,]\d)(?![\d,.])", str(message or ""))
+                if engine_decimal:
+                    payload["category"] = engine_decimal.group(1).replace(",", ".")
+            km_match = re.search(r"\b(\d[\d,.]*)\s*(?:km|kilomet(?:er|re)s?)\b", str(message or ""), re.I)
+            if km_match:
+                try:
+                    payload["km"] = int(parse_number(km_match.group(1)))
+                except Exception:
+                    pass
+            low_message = str(message or "").casefold()
+            if re.search(r"\b(?:automatic|auto|otomatik|автомат)\b", low_message):
+                payload["transmission"] = "Automatic"
+            elif re.search(r"\b(?:manual|manuel|düz|duz|механик)\b", low_message):
+                payload["transmission"] = "Manual"
+            return {
+                "transition": Transition.START_NEW_GOAL.value if not state.get("job") else Transition.SWITCH_SUBTASK.value,
+                "action": Action.EVALUATE_TRADE_IN.value,
+                "job": Job.EVALUATE_TRADE_IN.value,
+                "goal_summary": "Evaluate an incoming trade-in",
+                "constraints_delta": {},
+                "clear_constraints": [],
+                "preferences_delta": {},
+                "clear_preferences": [],
+                "objects": [{"type": ObjectType.OWNED_VEHICLE.value, "alias": "trade_in_vehicle", "payload": payload}],
+                "target_ids": ["trade_in_vehicle"],
+                "shortlist_ids": [],
+                "awaiting": None,
+            }
+
     if not callable(post):
         raise RuntimeError("V10_OPENAI_POST_UNAVAILABLE")
 
-    authoritative = _authoritative_message_evidence(message, host)
     state_context = {
         "audience": state.get("audience"),
         "job": state.get("job"),
@@ -656,20 +708,33 @@ uses preferences_delta.avoid_fuel. Clear exclude_fuels when the user explicitly 
         "authoritative_message_evidence": authoritative,
         "current_state": state_context,
     }
-    response = post(
-        payload={
-            "model": model,
-            "reasoning": {"effort": "low"},
-            "max_output_tokens": 1000,
-            "instructions": instructions,
-            "input": json.dumps(payload, ensure_ascii=False, default=str),
-        },
-        timeout=(2.0, 10.0),
-    )
-    response.raise_for_status()
-    parsed = _json_from_text(_response_text(response.json()))
+    parsed = None
+    last_planner_error = None
+    for attempt in range(2):
+        try:
+            response = post(
+                payload={
+                    "model": model,
+                    "reasoning": {"effort": "low"},
+                    "max_output_tokens": 1000,
+                    "instructions": instructions,
+                    "input": json.dumps(payload, ensure_ascii=False, default=str),
+                },
+                timeout=(2.0, 10.0),
+            )
+            response.raise_for_status()
+            parsed = _json_from_text(_response_text(response.json()))
+            if not parsed:
+                raise RuntimeError("V10_SEMANTIC_PLAN_INVALID")
+            break
+        except Exception as exc:
+            last_planner_error = exc
+            if attempt == 0:
+                time.sleep(0.25)
+                continue
+            raise
     if not parsed:
-        raise RuntimeError("V10_SEMANTIC_PLAN_INVALID")
+        raise last_planner_error or RuntimeError("V10_SEMANTIC_PLAN_INVALID")
 
     # Canonical explicit market evidence is authoritative. If the model omitted a
     # directly named vehicle, add it deterministically rather than repairing prose later.
@@ -846,6 +911,18 @@ def _normalize_semantic_plan(parsed: Mapping[str, Any], message: str, state: Map
             out["transition"] = Transition.SWITCH_SUBTASK.value if current_job and current_job != Job.EVALUATE_SALE.value else Transition.CONTINUE.value
             out["awaiting"] = None
 
+        # Explicit requests for ads/listings are a presentation intent, not merely
+        # another discovery search. Keep the evidence retrieval in SHOW_LISTINGS so
+        # users receive clickable rows rather than being bounced back to model cards.
+        explicit_listing_request = bool(re.search(
+            r"\b(?:show|see|send|give|find)\b.{0,100}\b(?:listings?|ads?)\b|"
+            r"\b(?:listings?|ads?)\b.{0,100}\b(?:show|see|send|give|find)\b|"
+            r"\b(?:ilanları|ilanlari|ilanlar|linkleri)\b|\b(?:объявления|ссылки)\b",
+            low, re.I))
+        if explicit_listing_request and str(out.get("action") or "").upper() in {Action.SEARCH_VEHICLES.value, Action.SHOW_LISTINGS.value, ""}:
+            out["action"] = Action.SHOW_LISTINGS.value
+            out["job"] = Job.FIND_A_CAR.value
+
         # A model explicitly chosen earlier is a durable subject. If the latest turn
         # only changes filters (year/km/fuel/colour/transmission/seller/location/
         # budget/variant), do not allow a semantic-plan wobble to reopen the market.
@@ -889,6 +966,13 @@ def _normalize_semantic_plan(parsed: Mapping[str, Any], message: str, state: Map
                         delta["brands"] = selected_brands
                     out["constraints_delta"] = delta
                     out["job"] = Job.FIND_A_CAR.value
+                    # Once the user is looking at actual listings, filter-only
+                    # refinements should keep returning actual listings. Do not
+                    # regress to model discovery just because the planner chose
+                    # SEARCH_VEHICLES for the refinement turn.
+                    last_type = str(((state.get("last_result") or {}).get("type") or "")).upper()
+                    if last_type == "LISTINGS":
+                        out["action"] = Action.SHOW_LISTINGS.value
 
     return out
 

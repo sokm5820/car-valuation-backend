@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deployment smoke checks for OtoDeğer AI 11.5 Gold RC.
+"""Deployment smoke checks for OtoDeğer AI 11.6 Gold RC.
 
 Uses only the Python standard library so it can run from any machine with Python 3.
 Default checks are deterministic and do not require an OpenAI call. Pass --ai to
@@ -13,7 +13,7 @@ import sys
 import uuid
 from urllib import error, request
 
-EXPECTED_BUILD = "11.5-gold-release-candidate"
+EXPECTED_BUILD = "11.6-gold-release-candidate"
 DEFAULT_BASE_URL = "https://car-valuation-backend.onrender.com"
 
 
