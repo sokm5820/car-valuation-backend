@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g, has_request_context
 from flask_cors import CORS
 import pandas as pd
 import os
@@ -17,16 +17,47 @@ from collections import defaultdict, deque
 # isolated below; V10 only replaces the conversational assistant route.
 from otodeger_v10_agent import V10_VERSION, ASSISTANT_BUILD, handle_v10_request
 from otodeger_v10_state import get_state_service, StorageUnavailable
+from otodeger_access_control import (
+    AccessControlError,
+    AuthenticationRequired,
+    BusinessAccessRequired,
+    ConcurrentRequestLimitReached,
+    DeviceSeatLimitReached,
+    SecurityConfigurationError,
+    UsageLimitReached,
+    get_access_manager,
+)
+from otodeger_fx import FXUnavailable, normalize_message_currency, conversion_note
 
 # AI interpreter configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
+COMMERCIAL_SHELL_VERSION = "12.1-clerk-auth-foundation"
 
 import gspread
 from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
-CORS(app)
+
+# Restrict browser origins and explicitly allow credentials/device identity.
+# CORS is not an authentication boundary, but a wildcard origin is unnecessary
+# exposure once paid account sessions exist.
+_ALLOWED_ORIGINS = [
+    value.strip()
+    for value in str(
+        os.environ.get(
+            "ALLOWED_WEB_ORIGINS",
+            "https://otodeger.online,https://www.otodeger.online,http://localhost:5173",
+        )
+    ).split(",")
+    if value.strip()
+]
+CORS(
+    app,
+    origins=_ALLOWED_ORIGINS,
+    supports_credentials=True,
+    allow_headers=["Content-Type", "Authorization", "X-Otodeger-Device"],
+)
 
 # Public API hardening. 128 KB is far above normal assistant requests while
 # preventing oversized request bodies from consuming unnecessary resources.
@@ -204,6 +235,21 @@ def _reserve_openai_call():
             f"OPENAI_GLOBAL_DAILY_LIMIT:{retry}"
         )
 
+    # Shared commercial circuit breakers protect all Render workers and paid
+    # accounts.  The legacy in-process ceilings above remain as an additional
+    # emergency brake during migration.
+    try:
+        manager = get_access_manager()
+        context = getattr(g, "otodeger_access_context", None) if has_request_context() else None
+        if context is not None:
+            manager.consume_ai_call_budget(context, client_ip=ip)
+    except UsageLimitReached as exc:
+        raise AIUsageLimitExceeded(
+            f"COMMERCIAL_AI_LIMIT:{exc.retry_after}"
+        ) from exc
+    except SecurityConfigurationError as exc:
+        raise AIUsageLimitExceeded("COMMERCIAL_SECURITY_UNAVAILABLE") from exc
+
 
 def _openai_post(payload, timeout):
     """
@@ -278,6 +324,15 @@ def _data_protection_answer(language):
             "исходную базу. Спросите о конкретном автомобиле, бюджете, модели, сравнении "
             "или рыночном решении — и я помогу на основе доступных данных."
         ),
+    }
+    return answers.get(language, answers["TR"])
+
+
+def _fx_unavailable_answer(language):
+    answers = {
+        "TR": "Bütçenizi güncel kurla GBP'ye çevirmek için döviz verisine şu anda ulaşamıyorum. Eski bir kur kullanmak yerine biraz sonra tekrar denemenizi öneririm.",
+        "EN": "I can't reach the current exchange-rate data needed to convert your budget to GBP right now. Rather than use a stale rate, please try again shortly.",
+        "RU": "Сейчас не удаётся получить актуальный курс для пересчёта вашего бюджета в GBP. Я не буду использовать устаревший курс — попробуйте ещё раз немного позже.",
     }
     return answers.get(language, answers["TR"])
 
@@ -547,6 +602,10 @@ def _security_response_headers(response):
         response.headers["Cache-Control"] = "no-store, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
     return response
 
 
@@ -593,7 +652,22 @@ initialize_lead_sheet()
 # -----------------------
 # LOAD DATA (GITHUB CSV SOURCE - SAFE VERSION)
 # -----------------------
-CSV_URL = "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/ads_base.csv"
+_LEGACY_PUBLIC_DATA_BASE = "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
+_DATA_SECURITY_ENFORCED = str(os.environ.get("COMMERCIAL_SECURITY_MODE", "legacy")).strip().casefold() == "enforced"
+
+def _configured_data_url(env_name, legacy_filename):
+    configured = str(os.environ.get(env_name) or "").strip()
+    if configured:
+        return configured
+    # Paid launch must not silently publish/rely on the proprietary raw GitHub
+    # source.  Legacy owner testing keeps the existing fallback until private
+    # object storage/repo-local deployment is configured.
+    if _DATA_SECURITY_ENFORCED:
+        return ""
+    return _LEGACY_PUBLIC_DATA_BASE + legacy_filename
+
+
+CSV_URL = _configured_data_url("VALUATION_CSV_URL", "ads_base.csv")
 
 df = pd.DataFrame()  # safe default
 
@@ -603,9 +677,19 @@ DATA_READY = False
 def load_data():
     global df, DATA_READY
     try:
-        r = requests.get(CSV_URL, timeout=15)
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text))
+        local_candidates = [
+            str(os.environ.get("VALUATION_CSV_PATH") or "").strip(),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "ads_base.csv"),
+        ]
+        local_path = next((path for path in local_candidates if path and os.path.exists(path)), None)
+        if local_path:
+            df = pd.read_csv(local_path)
+        else:
+            if not str(CSV_URL or "").strip():
+                raise RuntimeError("PRIVATE_DATA_SOURCE_REQUIRED:ads_base.csv")
+            r = requests.get(CSV_URL, timeout=15)
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
         DATA_READY = True
         print("CSV loaded successfully")
     except Exception as e:
@@ -650,7 +734,7 @@ safe_prepare_dataframe()
 # AI BUYING ASSISTANT - CURRENT MARKET DATA
 # =========================================================
 
-MARKET_CSV_URL = "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/market_base.csv"
+MARKET_CSV_URL = _configured_data_url("MARKET_CSV_URL", "market_base.csv")
 
 market_df = pd.DataFrame()
 MARKET_READY = False
@@ -658,14 +742,8 @@ MARKET_READY = False
 # =========================================================
 # AI BUYING ASSISTANT - BUYER INTELLIGENCE v1
 # =========================================================
-BUYER_MODEL_CSV_URL = (
-    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
-    "buyer_model_intelligence.csv"
-)
-BUYER_CATEGORY_CSV_URL = (
-    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
-    "buyer_category_intelligence.csv"
-)
+BUYER_MODEL_CSV_URL = _configured_data_url("BUYER_MODEL_CSV_URL", "buyer_model_intelligence.csv")
+BUYER_CATEGORY_CSV_URL = _configured_data_url("BUYER_CATEGORY_CSV_URL", "buyer_category_intelligence.csv")
 
 buyer_model_df = pd.DataFrame()
 buyer_category_df = pd.DataFrame()
@@ -674,10 +752,7 @@ BUYER_INTELLIGENCE_READY = False
 # Stable model-level buyer profiles keep DISCOVER deterministic and fast.
 # These are generated offline by build_buyer_model_profiles_v1.py and committed
 # beside the other production intelligence CSVs.
-BUYER_MODEL_PROFILE_CSV_URL = (
-    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
-    "buyer_model_profiles.csv"
-)
+BUYER_MODEL_PROFILE_CSV_URL = _configured_data_url("BUYER_MODEL_PROFILE_CSV_URL", "buyer_model_profiles.csv")
 model_profile_df = pd.DataFrame()
 MODEL_PROFILE_READY = False
 MODEL_PROFILE_LOOKUP = {}
@@ -689,22 +764,10 @@ ASSISTANT_PROFILE_VERSION = "1.0"
 # =========================================================
 # These files are generated offline by build_business_intelligence_v1.py
 # and committed beside the other production intelligence CSVs.
-BUSINESS_STOCK_CSV_URL = (
-    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
-    "business_stock_intelligence.csv"
-)
-BUSINESS_COMPANY_CSV_URL = (
-    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
-    "business_company_intelligence.csv"
-)
-BUSINESS_MARKET_CSV_URL = (
-    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
-    "business_market_intelligence.csv"
-)
-BUSINESS_ACTIVITY_CSV_URL = (
-    "https://raw.githubusercontent.com/sokm5820/car-valuation-backend/main/"
-    "business_company_activity_daily.csv"
-)
+BUSINESS_STOCK_CSV_URL = _configured_data_url("BUSINESS_STOCK_CSV_URL", "business_stock_intelligence.csv")
+BUSINESS_COMPANY_CSV_URL = _configured_data_url("BUSINESS_COMPANY_CSV_URL", "business_company_intelligence.csv")
+BUSINESS_MARKET_CSV_URL = _configured_data_url("BUSINESS_MARKET_CSV_URL", "business_market_intelligence.csv")
+BUSINESS_ACTIVITY_CSV_URL = _configured_data_url("BUSINESS_ACTIVITY_CSV_URL", "business_company_activity_daily.csv")
 
 business_stock_df = pd.DataFrame()
 business_company_df = pd.DataFrame()
@@ -725,6 +788,8 @@ def _load_assistant_csv_local_first(filename, url, timeout=25):
     local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
     if os.path.exists(local_path):
         return pd.read_csv(local_path, low_memory=False)
+    if not str(url or "").strip():
+        raise RuntimeError(f"PRIVATE_DATA_SOURCE_REQUIRED:{filename}")
     response = requests.get(url, timeout=timeout)
     response.raise_for_status()
     return pd.read_csv(io.StringIO(response.text), low_memory=False)
@@ -9377,23 +9442,121 @@ def api_ai_buying_assistant_legacy():
 # =========================================================
 # OTODEĞER V10 DECISION AGENT
 # =========================================================
+def _access_control_error_response(exc):
+    payload = {
+        "success": False,
+        "error": getattr(exc, "code", "ACCESS_DENIED"),
+    }
+    retry_after = int(getattr(exc, "retry_after", 0) or 0)
+    metadata = getattr(exc, "metadata", None)
+    if retry_after:
+        payload["retry_after_seconds"] = retry_after
+    if isinstance(metadata, dict):
+        payload.update({k: v for k, v in metadata.items() if k not in payload})
+    response = jsonify(payload)
+    response.status_code = int(getattr(exc, "status_code", 403) or 403)
+    if retry_after:
+        response.headers["Retry-After"] = str(retry_after)
+    return response
+
+
+def _request_access_context(data=None):
+    data = data if isinstance(data, dict) else {}
+    manager = get_access_manager()
+    return manager.resolve_context(
+        request,
+        client_tier=data.get("access_tier") or data.get("tier"),
+        client_company=data.get("business_company"),
+        client_ip=_client_ip(),
+    )
+
+
+@app.route("/api/access/status", methods=["GET"])
+def api_access_status():
+    """Safe account/entitlement snapshot for the frontend.
+
+    No secret/session token is ever returned by this endpoint. Clerk session JWTs
+    are verified from the request Authorization header, and Business access is
+    derived only from server-owned entitlements.
+    """
+    try:
+        manager = get_access_manager()
+        context = _request_access_context({})
+        return jsonify({"success": True, **manager.status_payload(context)})
+    except AccessControlError as exc:
+        return _access_control_error_response(exc)
+    except Exception as exc:
+        print("ACCESS STATUS FAILED:", repr(exc), flush=True)
+        return jsonify({"success": False, "error": "ACCESS_STATUS_UNAVAILABLE"}), 503
+
+
+@app.route("/api/access/business/activate", methods=["POST"])
+def api_activate_business_access():
+    """Register/use the current device as one Business seat.
+
+    In paid-launch enforcement mode the company and seat allowance come only
+    from the signed session.  The browser cannot choose another gallery.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        manager = get_access_manager()
+        context = _request_access_context(data)
+        if manager.enforcement_enabled and not context.business_entitled:
+            raise BusinessAccessRequired("An authorised Business account is required")
+        if context.business_entitled:
+            seat = manager.activate_business_device(context)
+        else:
+            # Legacy owner-testing compatibility only.
+            seat = {"seat_limit": 0, "seats_used": 0, "device_registered": False}
+        return jsonify({"success": True, **manager.status_payload(context), **seat})
+    except AccessControlError as exc:
+        return _access_control_error_response(exc)
+    except Exception as exc:
+        print("BUSINESS ACTIVATE FAILED:", repr(exc), flush=True)
+        return jsonify({"success": False, "error": "BUSINESS_ACCESS_UNAVAILABLE"}), 503
+
+
+@app.route("/api/access/devices", methods=["GET", "DELETE"])
+def api_business_devices():
+    """Organisation-admin device seat management."""
+    try:
+        manager = get_access_manager()
+        context = _request_access_context({})
+        if request.method == "GET":
+            result = manager.list_business_devices(context)
+        else:
+            data = request.get_json(silent=True) or {}
+            result = manager.deactivate_business_device(context, data.get("device_id"))
+        return jsonify({"success": True, **result})
+    except AccessControlError as exc:
+        return _access_control_error_response(exc)
+    except Exception as exc:
+        print("BUSINESS DEVICES FAILED:", repr(exc), flush=True)
+        return jsonify({"success": False, "error": "BUSINESS_DEVICES_UNAVAILABLE"}), 503
+
+
 @app.route("/api/assistant", methods=["POST"])
 def api_v10_decision_agent():
-    """Production conversational endpoint for OtoDeğer V10.
+    """Production conversational endpoint with commercial access controls.
 
-    V10 owns conversational state server-side and delegates all market facts to
-    deterministic functions/dataframes already loaded by this application.
-    The legacy V9.5 route remains temporarily available at /api/assistant_legacy
-    for rollback during deployment, but the frontend should use this route.
+    The 11.14 Gold decision engine remains unchanged.  This route owns the
+    security boundary around it: account entitlement, Business organisation,
+    device seats, usage quota, concurrency, language and data-extraction guards.
     """
+    lease = None
+    manager = None
     try:
         data = request.get_json(silent=True)
         if not isinstance(data, dict) or not isinstance(data.get("message"), str):
             return jsonify({"success":False,"error":"INVALID_REQUEST"}),400
         message = data["message"].strip()
-        language = str(data.get("language") or "EN").strip().upper()
-        if language not in {"EN","TR","RU"}:
-            language = "EN"
+        requested_language = str(data.get("language") or "TR").strip().upper()
+        if requested_language not in {"EN","TR","RU"}:
+            requested_language = "TR"
+        # Follow the language the user is actually writing when detectable;
+        # browser preference remains the fallback for short/ambiguous turns.
+        language = detect_conversation_language(message, requested_language, None)
+        data["language"] = language
 
         if not message:
             return jsonify({"success": False, "error": "MESSAGE_REQUIRED"}), 400
@@ -9404,6 +9567,38 @@ def api_v10_decision_agent():
                 "max_chars": ASSISTANT_MAX_MESSAGE_CHARS,
             }), 413
 
+        manager = get_access_manager()
+        access_context = _request_access_context(data)
+        g.otodeger_access_context = access_context
+        requested_mode = _normalize_access_tier(data.get("access_tier") or data.get("tier"))
+        requested_business = requested_mode == "BUSINESS"
+
+        # Paid-launch invariant: Business is an entitlement, not a client mode
+        # string.  Company identity comes from the verified session and cannot be
+        # switched by editing JSON/localStorage.
+        if manager.enforcement_enabled and requested_business:
+            if not access_context.business_entitled:
+                raise BusinessAccessRequired("An authorised Business account is required")
+            manager.activate_business_device(access_context)
+            data["access_tier"] = "BUSINESS"
+            data["business_company"] = access_context.org_name
+        elif access_context.business_entitled and requested_business:
+            # Signed sessions take precedence even during migration/shadow mode.
+            data["access_tier"] = "BUSINESS"
+            data["business_company"] = access_context.org_name
+        else:
+            # Personal+ is a billing entitlement, not a third assistant mode.
+            data["access_tier"] = requested_mode if not manager.enforcement_enabled else "PERSONAL"
+            if data["access_tier"] != "BUSINESS":
+                data.pop("business_company", None)
+
+        # Shared paid-tier quotas and concurrency are enforced before any OpenAI
+        # or market-analysis work.  In legacy/shadow mode these are no-ops.
+        usage = manager.consume_assistant_quota(access_context, client_ip=_client_ip())
+        lease = manager.acquire_concurrency(access_context, client_ip=_client_ip())
+
+        # Keep a coarse IP limiter as an additional abuse shield.  Paid launch
+        # should configure these values above any legitimate per-account tier.
         allowed, retry_after = _assistant_request_allowed()
         if not allowed:
             response = jsonify({
@@ -9426,6 +9621,9 @@ def api_v10_decision_agent():
                 "stage": "protected_data",
                 "assistant_build": ASSISTANT_BUILD,
                 "v10_version": V10_VERSION,
+                "language": language,
+                "access": manager.status_payload(access_context),
+                "usage": usage,
                 "filters": {}, "preferences": [], "results": [],
                 "model_options": [], "actions": [], "suggestions": [],
             })
@@ -9441,15 +9639,33 @@ def api_v10_decision_agent():
                 "stage": "unsupported_input",
                 "assistant_build": ASSISTANT_BUILD,
                 "v10_version": V10_VERSION,
+                "language": language,
+                "access": manager.status_payload(access_context),
+                "usage": usage,
                 "filters": {}, "preferences": [], "results": [],
                 "model_options": [], "actions": fallback.get("actions") or [],
                 "suggestions": fallback.get("suggestions") or [],
             })
 
-        # Audience/company context is a product boundary, not a semantic guess.
-        access_tier = _normalize_access_tier(data.get("access_tier") or data.get("tier"))
-        data["access_tier"] = access_tier
-        if access_tier == "BUSINESS":
+        original_message = message
+        fx_conversions = []
+        try:
+            message, fx_conversions = normalize_message_currency(message)
+            data["message"] = message
+        except FXUnavailable:
+            return jsonify({
+                "success": False,
+                "error": "FX_RATE_TEMPORARILY_UNAVAILABLE",
+                "answer": _fx_unavailable_answer(language),
+                "language": language,
+                "access": manager.status_payload(access_context),
+                "usage": usage,
+            }), 503
+
+        # Legacy/shadow compatibility: owner testing can still provide a gallery
+        # until external authentication is wired.  Enforced mode never enters
+        # this branch with a client-selected company.
+        if data.get("access_tier") == "BUSINESS" and not manager.enforcement_enabled:
             resolved_company = _resolve_business_company_context(
                 message, requested_company=str(data.get("business_company") or "").strip() or None
             )
@@ -9458,7 +9674,7 @@ def api_v10_decision_agent():
 
         # Personal own-car valuation intentionally hands off to the dedicated
         # valuation product. Offer evaluation stays in chat.
-        if access_tier == "PERSONAL" and _valuation_intent(message):
+        if data.get("access_tier") != "BUSINESS" and _valuation_intent(message):
             valuation = _valuation_response(language)
             return jsonify({
                 "success": True,
@@ -9469,14 +9685,30 @@ def api_v10_decision_agent():
                 "stage": "valuation_handoff",
                 "assistant_build": ASSISTANT_BUILD,
                 "v10_version": V10_VERSION,
+                "language": language,
+                "access": manager.status_payload(access_context),
+                "usage": usage,
                 "filters": {}, "preferences": [], "results": [],
                 "model_options": [], "actions": valuation["actions"], "suggestions": [],
+                "fx_conversions": [item.public_payload() for item in fx_conversions],
             })
 
         host = globals()
         payload, status = handle_v10_request(data, host)
+        if isinstance(payload, dict):
+            payload.setdefault("language", language)
+            payload.setdefault("access", manager.status_payload(access_context))
+            payload.setdefault("usage", usage)
+            if fx_conversions:
+                note = conversion_note(fx_conversions, language)
+                if payload.get("success") and payload.get("answer") and note:
+                    payload["answer"] = f"{note}\n\n{payload['answer']}"
+                payload["fx_conversions"] = [item.public_payload() for item in fx_conversions]
         return jsonify(payload), status
 
+    except AccessControlError as exc:
+        print("COMMERCIAL ACCESS BLOCK:", getattr(exc, "code", type(exc).__name__), flush=True)
+        return _access_control_error_response(exc)
     except StorageUnavailable as exc:
         print("V10 STATE STORAGE UNAVAILABLE:", exc, flush=True)
         return jsonify({
@@ -9494,6 +9726,10 @@ def api_v10_decision_agent():
         print("V10 ASSISTANT FAILED:", repr(exc), flush=True)
         traceback.print_exc()
         return jsonify({"success": False, "error": "AI_ASSISTANT_FAILED"}), 500
+    finally:
+        if manager is not None:
+            manager.release_concurrency(lease)
+
 
 # =========================================================
 # AI BUYING ASSISTANT - MARKET SEARCH API
@@ -9503,6 +9739,13 @@ def api_v10_decision_agent():
 def api_market_search():
 
     try:
+        # The Gold assistant does not need a public arbitrary-search endpoint.
+        # Disable it by default once commercial security is enforced so it cannot
+        # be used to reconstruct the proprietary dataset query-by-query.
+        manager = get_access_manager()
+        public_search_enabled = str(os.environ.get("ENABLE_PUBLIC_SEARCH_API", "false")).strip().casefold() in {"1", "true", "yes", "on"}
+        if manager.enforcement_enabled and not public_search_enabled:
+            return jsonify({"success": False, "error": "ENDPOINT_NOT_AVAILABLE"}), 404
         allowed, retry_after = _search_request_allowed()
         if not allowed:
             response = jsonify({
@@ -9785,12 +10028,27 @@ def home():
 
 @app.route("/api/health")
 def health():
+    security_mode = str(os.environ.get("COMMERCIAL_SECURITY_MODE", "legacy")).strip().casefold()
+    security_ready = True
+    clerk_auth_ready = False
+    try:
+        manager = get_access_manager()
+        security_mode = manager.mode
+        clerk_auth_ready = bool(manager.clerk_configured)
+    except Exception:
+        security_ready = False
+    ready = bool(DATA_READY and security_ready)
     return {
-        "status": "ok" if DATA_READY else "loading",
-        "ready": DATA_READY,
+        "status": "ok" if ready else "loading",
+        "ready": ready,
         "rows": len(df),
         "assistant_build": ASSISTANT_BUILD,
         "v10_version": V10_VERSION,
+        "commercial_shell_version": COMMERCIAL_SHELL_VERSION,
+        "commercial_security_mode": security_mode,
+        "commercial_security_ready": security_ready,
+        "clerk_auth_ready": clerk_auth_ready,
+        "private_data_required": security_mode == "enforced",
     }
 
 # =========================================================
