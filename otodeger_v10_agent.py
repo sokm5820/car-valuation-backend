@@ -28,7 +28,7 @@ from otodeger_v10_state import (
 )
 
 V10_VERSION = "11.0-conversation-contract"
-ASSISTANT_BUILD = "11.13-gold-release-candidate"
+ASSISTANT_BUILD = "11.14-gold-release-candidate"
 SUPPORTED_LANGUAGES = {"TR", "EN", "RU"}
 
 
@@ -2592,7 +2592,22 @@ def _segment_dimensions(record: Mapping[str, Any], host: Mapping[str, Any]) -> D
     return dims
 
 
-def _business_segment_analysis(state: Mapping[str, Any], host: Mapping[str, Any], company_events: Mapping[str,List[Mapping[str,Any]]], period_start: str, period_end: str) -> List[Dict[str,Any]]:
+def _requested_business_segment_dimensions(message: str) -> List[str]:
+    """Return explicit Business segment dimensions requested in natural language.
+
+    This is intentionally deterministic so a price-band/fuel drill-down cannot
+    depend on renderer interpretation.
+    """
+    low=_text(message,1000).casefold()
+    dims=[]
+    if re.search(r"\bprice\s*(?:band|bands|range|ranges|bracket|brackets|tier|tiers)\b|fiyat\s*(?:band|bant|aral)|ценов\w*\s*(?:диапаз|сегмент)",low,re.I):
+        dims.append("PRICE_BAND")
+    if re.search(r"\bfuel\b|\bfuels\b|yak[ıi]t|топлив",low,re.I):
+        dims.append("FUEL")
+    return dims
+
+
+def _business_segment_analysis(state: Mapping[str, Any], host: Mapping[str, Any], company_events: Mapping[str,List[Mapping[str,Any]]], period_start: str, period_end: str, requested_dimensions: Optional[Sequence[str]]=None) -> List[Dict[str,Any]]:
     company=_text((state.get("constraints") or {}).get("company"),160)
     if not company:
         return []
@@ -2689,12 +2704,33 @@ def _business_segment_analysis(state: Mapping[str, Any], host: Mapping[str, Any]
         priority={"FAVORABLE":0,"NEUTRAL":1,"REVIEW":2}
         perf={"STRONG_RELATIVE_ACTIVITY":0,"BALANCED_RELATIVE_ACTIVITY":1,"LIMITED_EVIDENCE":2,"WEAK_RELATIVE_ACTIVITY":3}
         out.sort(key=lambda r:(priority.get(r["bet_signal"],9),perf.get(r["performance_signal"],9),-(r.get("evidence_events") or 0),-(r.get("company_current_stock") or 0)))
+        requested=[str(x).upper() for x in (requested_dimensions or []) if str(x).upper() in {"PRICE_BAND","FUEL","BODY_STYLE","SIZE_CLASS","MODEL","COMBO"}]
+        if requested:
+            # Do not let a global top-N ranking erase an explicitly requested
+            # dimension. This was the B6 Gold gap: MODEL rows crowded FUEL /
+            # PRICE_BAND evidence out of the 15-row packet. Preserve every
+            # requested segment (these dimensions are naturally small), then
+            # add a bounded amount of broader context.
+            selected=[]
+            seen=set()
+            for dim in requested:
+                for row in out:
+                    if row.get("dimension") != dim: continue
+                    key=(row.get("dimension"),row.get("segment"))
+                    if key not in seen:
+                        seen.add(key); selected.append(row)
+            for row in out:
+                if len(selected)>=24: break
+                key=(row.get("dimension"),row.get("segment"))
+                if key in seen: continue
+                seen.add(key); selected.append(row)
+            return selected[:24]
         return out[:15]
     except Exception:
         return []
 
 
-def _business_period_tool(state: Mapping[str, Any], host: Mapping[str, Any]) -> Dict[str, Any]:
+def _business_period_tool(state: Mapping[str, Any], host: Mapping[str, Any], message: str="") -> Dict[str, Any]:
     company=_text((state.get("constraints") or {}).get("company"),160)
     c=state.get("constraints") or {}
     activity=_host(host,"business_activity_df")
@@ -2741,12 +2777,14 @@ def _business_period_tool(state: Mapping[str, Any], host: Mapping[str, Any]) -> 
                 }
             else:
                 summary = {}
+            requested_segment_dimensions=_requested_business_segment_dimensions(message)
             segment_analysis=_business_segment_analysis(
                 state,host,events,
                 summary.get("period_start") or str(daily_records[0].get("Date")),
                 summary.get("period_end") or str(daily_records[-1].get("Date")),
+                requested_segment_dimensions,
             ) if daily_records else []
-            return {"kind":"business_period","company":company,"status":"ok","summary":summary,"events":events,"daily":daily_records,"segments":segment_analysis}
+            return {"kind":"business_period","company":company,"status":"ok","summary":summary,"events":events,"daily":daily_records,"segments":segment_analysis,"requested_segment_dimensions":requested_segment_dimensions}
         except Exception:
             pass
     # Current snapshot fallback is useful, but explicitly not a historical recap.
@@ -2924,7 +2962,7 @@ def _execute_tool(action: str, state: Mapping[str, Any], resolved_plan: Mapping[
     if action == Action.RECOMMEND_ACQUISITIONS.value:
         return _business_acquire_tool(state,host,targets,message)
     if action == Action.ANALYZE_BUSINESS_PERIOD.value:
-        return _business_period_tool(state,host)
+        return _business_period_tool(state,host,message)
     if action == Action.EVALUATE_TRADE_IN.value:
         return _business_trade_in_tool(state,host,targets)
     if action == Action.RECOMMEND_AD_CANDIDATE.value:
@@ -3374,9 +3412,67 @@ def _suggestions_from_context(state: Mapping[str, Any], evidence: Mapping[str, A
 def _compact_evidence(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     e=copy.deepcopy(dict(evidence))
     # Keep model context rich but bounded.
-    for key, limit in (("models",8),("listings",10),("vehicles",8),("options",8),("comparables",8),("rows",12),("daily",35)):
+    for key, limit in (("models",8),("listings",10),("vehicles",8),("options",8),("comparables",8),("rows",12),("daily",35),("segments",24)):
         if isinstance(e.get(key),list): e[key]=e[key][:limit]
     return e
+
+
+def _business_segment_breakdown_answer(language: str, evidence: Mapping[str, Any]) -> str:
+    lang=_lang(language)
+    segments=list(evidence.get("segments") or [])
+    requested=[str(x).upper() for x in (evidence.get("requested_segment_dimensions") or [])]
+    labels={
+        "UNDER_15K":{"EN":"Under £15k","TR":"£15 bin altı","RU":"До £15 тыс."},
+        "15K_25K":{"EN":"£15k–£25k","TR":"£15–25 bin","RU":"£15–25 тыс."},
+        "25K_40K":{"EN":"£25k–£40k","TR":"£25–40 bin","RU":"£25–40 тыс."},
+        "40K_PLUS":{"EN":"£40k+","TR":"£40 bin+","RU":"£40 тыс.+"},
+    }
+    evidence_labels={
+        "STRONG":{"EN":"strong evidence","TR":"güçlü veri","RU":"сильные данные"},
+        "USABLE":{"EN":"usable evidence","TR":"kullanılabilir veri","RU":"достаточные данные"},
+        "EARLY":{"EN":"early evidence","TR":"erken sinyal","RU":"ранний сигнал"},
+    }
+    perf_labels={
+        "STRONG_RELATIVE_ACTIVITY":{"EN":"strong relative activity","TR":"güçlü göreceli aktivite","RU":"сильная относительная активность"},
+        "BALANCED_RELATIVE_ACTIVITY":{"EN":"balanced relative activity","TR":"dengeli göreceli aktivite","RU":"сбалансированная относительная активность"},
+        "WEAK_RELATIVE_ACTIVITY":{"EN":"weak relative activity","TR":"zayıf göreceli aktivite","RU":"слабая относительная активность"},
+        "LIMITED_EVIDENCE":{"EN":"limited evidence","TR":"sınırlı veri","RU":"ограниченные данные"},
+    }
+    def relevant(dim):
+        rows=[r for r in segments if str(r.get("dimension") or "").upper()==dim and ((r.get("company_current_stock") or 0)>0 or (r.get("company_activity_events") or 0)>0)]
+        rows.sort(key=lambda r:(-(float(r.get("relative_activity_index")) if r.get("relative_activity_index") is not None else -1.0),-int(r.get("company_activity_events") or 0),-int(r.get("company_current_stock") or 0)))
+        return rows
+    def line(row,dim):
+        raw=str(row.get("segment") or "—")
+        name=(labels.get(raw,{}).get(lang) if dim=="PRICE_BAND" else None) or raw.replace("_"," ")
+        rel=_finite(row.get("relative_activity_index")); stock=_int(row.get("company_current_stock")) or 0; new=_int(row.get("company_newly_observed")) or 0; exits=_int(row.get("company_observed_exits")) or 0
+        perf=perf_labels.get(str(row.get("performance_signal") or ""),{}).get(lang) or str(row.get("performance_signal") or "").replace("_"," ").lower()
+        qual=evidence_labels.get(str(row.get("dealer_evidence") or ""),{}).get(lang) or str(row.get("dealer_evidence") or "").lower()
+        reltxt=f"{rel:.2f}" if rel is not None else "—"
+        if lang=="TR": return f"- **{name}** — göreceli aktivite endeksi **{reltxt}**; {stock} güncel stok, {new} yeni gözlem, {exits} gözlemlenen çıkış · {perf}, {qual}."
+        if lang=="RU": return f"- **{name}** — индекс относительной активности **{reltxt}**; текущий склад {stock}, новых объявлений {new}, наблюдаемых выходов {exits} · {perf}, {qual}."
+        return f"- **{name}** — relative activity index **{reltxt}**; {stock} current stock, {new} newly observed, {exits} observed exits · {perf}, {qual}."
+    sections=[]
+    for dim in requested:
+        rows=relevant(dim)
+        if not rows: continue
+        title={
+            "PRICE_BAND":{"EN":"**By price band**","TR":"**Fiyat bandına göre**","RU":"**По ценовому диапазону**"},
+            "FUEL":{"EN":"**By fuel**","TR":"**Yakıt türüne göre**","RU":"**По типу топлива**"},
+        }.get(dim,{}).get(lang)
+        if title:
+            sections.append(title+"\n"+"\n".join(line(r,dim) for r in rows[:6]))
+    period=(evidence.get("summary") or {}).get("period_start")
+    if lang=="TR":
+        intro="Seçili dönem için doğrulanmış segment kırılımı şöyle:"
+        caveat="**Özet:** Endeks 1,00'ın üzerindeyse gözlemlenen ilan çıkış payı stok payına göre daha yüksek; ancak çıkışlar doğrulanmış satış değildir. Küçük örnekleri yalnızca yön gösteren sinyal olarak kullanın."
+    elif lang=="RU":
+        intro="Проверенная разбивка по сегментам за выбранный период:"
+        caveat="**Итог:** индекс выше 1,00 означает, что доля наблюдаемых выходов объявлений выше доли склада; это не подтверждённые продажи. Малые выборки следует считать только ориентиром."
+    else:
+        intro="For the selected period, the verified segment breakdown is:"
+        caveat="**Takeaway:** an index above 1.00 means the segment's share of observed listing exits is higher than its share of stock; these exits are **not confirmed sales**. Treat small samples as directional only."
+    return intro+"\n\n"+"\n\n".join(sections)+"\n\n"+caveat if sections else ""
 
 
 def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[str, Any], evidence: Mapping[str, Any]) -> str:
@@ -3601,6 +3697,10 @@ def _fallback_answer(language: str, state: Mapping[str, Any], decision: Mapping[
 
     if kind=="business_period":
         if evidence.get("status")=="ok":
+            if evidence.get("requested_segment_dimensions"):
+                breakdown=_business_segment_breakdown_answer(language,evidence)
+                if breakdown:
+                    return breakdown
             s=evidence.get("summary") or {}; company=evidence.get("company") or {"EN":"your business","TR":"işletmeniz","RU":"ваш бизнес"}[lang]
             if lang=="EN": base=f"For **{company}** in the selected period: observed advertised stock moved from **{s.get('opening_observed_stock','—')}** to **{s.get('closing_observed_stock','—')}**; **{s.get('newly_observed_listings','—')}** listings appeared, **{s.get('observed_market_exits','—')}** left the observed market, and there were **{s.get('asking_price_reductions','—')}** asking-price reductions. These exits are listing removals, not confirmed sales."
             elif lang=="TR": base=f"Seçili dönemde **{company}** için gözlemlenen ilan stoğu **{s.get('opening_observed_stock','—')}**'dan **{s.get('closing_observed_stock','—')}**'a geldi; **{s.get('newly_observed_listings','—')}** yeni ilan görüldü, **{s.get('observed_market_exits','—')}** ilan gözlemlenen piyasadan çıktı ve **{s.get('asking_price_reductions','—')}** fiyat indirimi oldu. Çıkışlar doğrulanmış satış değildir."
@@ -3723,6 +3823,8 @@ def _render_answer(message: str, language: str, state: Mapping[str, Any], action
     # contradicts those figures (for example calling the dealer slower while
     # its observed exit activity actually increased).
     if evidence.get("kind") == "market_understanding" and evidence.get("business_context"):
+        return fallback
+    if evidence.get("kind") == "business_period" and evidence.get("requested_segment_dimensions"):
         return fallback
     if not callable(post): return fallback
     instructions=f"""
