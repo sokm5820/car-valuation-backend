@@ -32,7 +32,7 @@ from otodeger_fx import FXUnavailable, normalize_message_currency, conversion_no
 # AI interpreter configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
-COMMERCIAL_SHELL_VERSION = "13.0.3-guided-gold-ui"
+COMMERCIAL_SHELL_VERSION = "13.0.4-guided-gold-experience"
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -9778,6 +9778,26 @@ def _guided_type_matches(row, requested_types):
         elif vt in {"PICKUP", "MOTORCYCLE", "SCOOTER", "ATV", "UTV"}:
             matches.add("MOTORCYCLE" if vt == "SCOOTER" else vt)
 
+    # The guided selector must remain usable even if the optional buyer-intelligence
+    # snapshot is temporarily unavailable. market_base rows can still be classified
+    # from the validated model profile and, as a last resort, clear listing signals.
+    if not matches:
+        haystack = " ".join([
+            str(row.get("Brand") or ""), str(row.get("Model") or ""),
+            str(row.get("Category") or ""), str(row.get("CategoryDetail") or ""),
+            str(row.get("Link") or ""),
+        ]).casefold()
+        if re.search(r"\b(?:motosiklet|motorcycle|scooter|vespa)\b", haystack):
+            matches.add("MOTORCYCLE")
+        elif re.search(r"\b(?:atv|utv|quad)\b", haystack):
+            matches.add("ATV")
+        elif re.search(r"\b(?:pick[- ]?up|pickup)\b", haystack):
+            matches.add("PICKUP")
+        elif re.search(r"\b(?:suv|crossover)\b", haystack):
+            matches.add("SUV")
+        elif haystack.strip():
+            matches.add("CAR")
+
     return bool(matches & requested)
 
 
@@ -9795,6 +9815,34 @@ def _guided_filter_discovery_frame(frame, *, min_year=None, vehicle_types=None, 
     return work
 
 
+def _guided_discovery_sources():
+    """Return resilient model/category frames for finite guided selectors.
+
+    Buyer intelligence is preferred because it already carries VehicleType and
+    category detail. If that optional snapshot is unavailable, current market
+    data remains sufficient for valid Brand -> Model -> Category choices.
+    """
+    if BUYER_INTELLIGENCE_READY and buyer_model_df is not None and not buyer_model_df.empty:
+        model_source = buyer_model_df.copy()
+        category_source = buyer_category_df.copy() if buyer_category_df is not None else pd.DataFrame()
+        return model_source, category_source
+
+    if not MARKET_READY or market_df is None or market_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    model_source = market_df.copy()
+    if "VehicleType" not in model_source.columns:
+        model_source["VehicleType"] = ""
+
+    category_source = market_df.copy()
+    if "VehicleType" not in category_source.columns:
+        category_source["VehicleType"] = ""
+    if "CategoryDetail" not in category_source.columns:
+        category_source["CategoryDetail"] = category_source.get("Category", "")
+
+    return model_source, category_source
+
+
 @app.route("/api/guided/discovery/options", methods=["GET"])
 def api_guided_discovery_options():
     """Return only valid guided-choice options for the current discovery state.
@@ -9802,8 +9850,9 @@ def api_guided_discovery_options():
     This endpoint performs no LLM work. It is intentionally deterministic so the
     frontend can offer finite, validated Brand -> Model -> Category pathways.
     """
-    if not BUYER_INTELLIGENCE_READY or buyer_model_df is None or buyer_model_df.empty:
-        return jsonify({"success": False, "error": "BUYER_INTELLIGENCE_NOT_READY"}), 503
+    model_source, category_source = _guided_discovery_sources()
+    if model_source is None or model_source.empty:
+        return jsonify({"success": False, "error": "GUIDED_OPTIONS_NOT_READY"}), 503
 
     try:
         requested_types = _guided_list_arg("vehicle_type")
@@ -9822,12 +9871,12 @@ def api_guided_discovery_options():
         if import_only:
             min_year = max(min_year or import_floor, import_floor)
 
-        all_years = pd.to_numeric(buyer_model_df["Year"], errors="coerce").dropna().astype(int)
+        all_years = pd.to_numeric(model_source["Year"], errors="coerce").dropna().astype(int)
         min_available = int(all_years.min()) if not all_years.empty else None
         max_available = int(all_years.max()) if not all_years.empty else None
 
         base = _guided_filter_discovery_frame(
-            buyer_model_df,
+            model_source,
             min_year=min_year,
             vehicle_types=requested_types,
         )
@@ -9836,7 +9885,7 @@ def api_guided_discovery_options():
         )
 
         model_frame = _guided_filter_discovery_frame(
-            buyer_model_df,
+            model_source,
             min_year=min_year,
             vehicle_types=requested_types,
             brands=selected_brands,
@@ -9857,9 +9906,9 @@ def api_guided_discovery_options():
             models.append({"key": key, "brand": brand, "model": model, "label": f"{brand} {model}"})
 
         categories_by_model = {}
-        if selected_model_keys and buyer_category_df is not None and not buyer_category_df.empty:
+        if selected_model_keys and category_source is not None and not category_source.empty:
             category_base = _guided_filter_discovery_frame(
-                buyer_category_df,
+                category_source,
                 min_year=min_year,
                 vehicle_types=requested_types,
                 brands=selected_brands,
