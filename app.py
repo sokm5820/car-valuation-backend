@@ -32,7 +32,7 @@ from otodeger_fx import FXUnavailable, normalize_message_currency, conversion_no
 # AI interpreter configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
-COMMERCIAL_SHELL_VERSION = "13.0.5-cinematic-gold"
+COMMERCIAL_SHELL_VERSION = "13.0.5-premium-motion"
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -1513,45 +1513,6 @@ threading.Thread(
 ).start()
 
 # =========================================================
-# GUIDED PRODUCT SCOPE FILTER
-# =========================================================
-
-_GUIDED_MARINE_PATTERN = re.compile(
-    r"(?:bal[ıi]k[cç][ıi]\s*teknesi|\btekne\b|\bboat\b|\byacht\b|\bmarine\b|"
-    r"jet\s*ski|jetski|sea[-\s]?doo|watercraft|deniz\s*ara[cç][ıi]|deniz\s*arac[ıi])",
-    re.IGNORECASE,
-)
-
-def _guided_filter_supported_vehicle_rows(frame):
-    """Exclude marine/non-supported inventory from the guided product only.
-
-    The legacy free valuation routes keep their existing dataset behaviour unless
-    the caller explicitly supplies guided=1. The guided assistant currently
-    supports Car, SUV, Pick-up, Motorcycle and ATV; boats/watercraft must never
-    leak into those finite pathways.
-    """
-    if frame is None or frame.empty:
-        return frame
-
-    work = frame.copy()
-    candidate_columns = [
-        col for col in ("VehicleType", "Brand", "Model", "Category", "CategoryDetail", "Link")
-        if col in work.columns
-    ]
-    if not candidate_columns:
-        return work
-
-    combined = pd.Series("", index=work.index, dtype="object")
-    for col in candidate_columns:
-        combined = combined + " " + work[col].fillna("").astype(str)
-
-    marine_mask = combined.str.contains(_GUIDED_MARINE_PATTERN, regex=True, na=False)
-    return work[~marine_mask].copy()
-
-def _guided_request_scope_enabled():
-    return str(request.args.get("guided") or "").strip().casefold() in {"1", "true", "yes", "on"}
-
-# =========================================================
 # YEARS
 # =========================================================
 @app.route("/years", methods=["GET"])
@@ -1571,8 +1532,6 @@ def get_brands():
 
     year = request.args.get("year")
     filtered = df.copy()
-    if _guided_request_scope_enabled():
-        filtered = _guided_filter_supported_vehicle_rows(filtered)
 
     if year not in [None, "", "null"]:
         try:
@@ -1595,8 +1554,6 @@ def get_models():
     brand = request.args.get("brand")
 
     filtered = df.copy()
-    if _guided_request_scope_enabled():
-        filtered = _guided_filter_supported_vehicle_rows(filtered)
 
     if year not in [None, "", "null"]:
         try:
@@ -1626,8 +1583,6 @@ def get_categories():
     model = request.args.get("model")
 
     filtered = df.copy()
-    if _guided_request_scope_enabled():
-        filtered = _guided_filter_supported_vehicle_rows(filtered)
 
     if year not in [None, "", "null"]:
         try:
@@ -9793,9 +9748,6 @@ def _guided_list_arg(name):
 
 def _guided_type_matches(row, requested_types):
     """Match the finite 13.0 vehicle-type taxonomy against buyer profile data."""
-    marine_haystack = " ".join([str(row.get(key) or "") for key in ("VehicleType", "Brand", "Model", "Category", "CategoryDetail", "Link")])
-    if _GUIDED_MARINE_PATTERN.search(marine_haystack):
-        return False
     if not requested_types or "ALL" in {str(v).upper() for v in requested_types}:
         return True
 
@@ -9805,6 +9757,7 @@ def _guided_type_matches(row, requested_types):
 
     vt = str(profile.get("VehicleType") or row.get("VehicleType") or "").strip().upper()
     body = str(profile.get("BodyStyle") or "").strip().upper()
+    raw_vt = str(row.get("VehicleType") or "").strip().casefold()
     requested = {str(v).strip().upper().replace("-", "_") for v in requested_types}
 
     matches = set()
@@ -9816,8 +9769,30 @@ def _guided_type_matches(row, requested_types):
         matches.add("PICKUP")
     if vt in {"MOTORCYCLE", "SCOOTER"} or body in {"MOTORCYCLE", "SCOOTER"}:
         matches.add("MOTORCYCLE")
-    if vt in {"ATV", "UTV", "ATV/UTV", "QUAD"} or body in {"ATV", "UTV", "QUAD"}:
+    if vt in {"ATV", "UTV", "ATV/UTV", "ATV_UTV", "QUAD"} or body in {"ATV", "UTV", "ATV_UTV", "QUAD"}:
         matches.add("ATV")
+
+    # The buyer-intelligence snapshots retain the source site's Turkish vehicle
+    # taxonomy. Model profiles normally provide the precise CAR/SUV/PICKUP split,
+    # but these fallbacks keep the selector resilient if the profile snapshot is
+    # unavailable during a refresh.
+    if not matches:
+        if raw_vt == "otomobil":
+            matches.add("CAR")
+        elif "motosiklet" in raw_vt:
+            matches.add("MOTORCYCLE")
+        elif "atv" in raw_vt or "utv" in raw_vt:
+            matches.add("ATV")
+        elif "arazi" in raw_vt or "suv" in raw_vt or "pick-up" in raw_vt or "pickup" in raw_vt:
+            if body == "PICKUP":
+                matches.add("PICKUP")
+            elif body in {"SUV", "CROSSOVER"}:
+                matches.add("SUV")
+            else:
+                # The source groups SUVs and pick-ups together. When a precise body
+                # profile is temporarily unavailable, include the row in both guided
+                # branches rather than returning an empty brand list.
+                matches.update({"SUV", "PICKUP"})
 
     # Conservative fallback for profiles that do not yet have a body classification.
     if not matches and vt:
@@ -9850,7 +9825,7 @@ def _guided_type_matches(row, requested_types):
 
 
 def _guided_filter_discovery_frame(frame, *, min_year=None, vehicle_types=None, brands=None):
-    work = _guided_filter_supported_vehicle_rows(frame)
+    work = frame.copy()
     if "Year" in work.columns and min_year is not None:
         years = pd.to_numeric(work["Year"], errors="coerce")
         work = work[years >= int(min_year)]
