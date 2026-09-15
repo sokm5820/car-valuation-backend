@@ -32,7 +32,7 @@ from otodeger_fx import FXUnavailable, normalize_message_currency, conversion_no
 # AI interpreter configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
-COMMERCIAL_SHELL_VERSION = "12.1-clerk-auth-foundation"
+COMMERCIAL_SHELL_VERSION = "13.0.3-guided-gold-ui"
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -9729,6 +9729,170 @@ def api_v10_decision_agent():
     finally:
         if manager is not None:
             manager.release_concurrency(lease)
+
+
+# =========================================================
+# GUIDED DECISION ENGINE - DISCOVERY OPTIONS (13.0 FOUNDATION)
+# =========================================================
+
+IMPORT_MAX_AGE_YEARS = int(os.environ.get("IMPORT_MAX_AGE_YEARS", "5"))
+
+
+def _guided_list_arg(name):
+    """Read repeated query args while tolerating comma-separated fallback."""
+    values = []
+    for raw in request.args.getlist(name):
+        values.extend(str(raw or "").split(","))
+    return [value.strip() for value in values if value and value.strip()]
+
+
+def _guided_type_matches(row, requested_types):
+    """Match the finite 13.0 vehicle-type taxonomy against buyer profile data."""
+    if not requested_types or "ALL" in {str(v).upper() for v in requested_types}:
+        return True
+
+    brand = str(row.get("Brand") or "").strip()
+    model = str(row.get("Model") or "").strip()
+    profile = MODEL_PROFILE_LOOKUP.get((brand.casefold(), model.casefold()), {})
+
+    vt = str(profile.get("VehicleType") or row.get("VehicleType") or "").strip().upper()
+    body = str(profile.get("BodyStyle") or "").strip().upper()
+    requested = {str(v).strip().upper().replace("-", "_") for v in requested_types}
+
+    matches = set()
+    if vt == "CAR" and body not in {"SUV", "CROSSOVER", "PICKUP"}:
+        matches.add("CAR")
+    if vt == "CAR" and body in {"SUV", "CROSSOVER"}:
+        matches.add("SUV")
+    if vt == "PICKUP" or body == "PICKUP":
+        matches.add("PICKUP")
+    if vt in {"MOTORCYCLE", "SCOOTER"} or body in {"MOTORCYCLE", "SCOOTER"}:
+        matches.add("MOTORCYCLE")
+    if vt in {"ATV", "UTV", "ATV/UTV", "QUAD"} or body in {"ATV", "UTV", "QUAD"}:
+        matches.add("ATV")
+
+    # Conservative fallback for profiles that do not yet have a body classification.
+    if not matches and vt:
+        if vt == "CAR":
+            matches.add("CAR")
+        elif vt in {"PICKUP", "MOTORCYCLE", "SCOOTER", "ATV", "UTV"}:
+            matches.add("MOTORCYCLE" if vt == "SCOOTER" else vt)
+
+    return bool(matches & requested)
+
+
+def _guided_filter_discovery_frame(frame, *, min_year=None, vehicle_types=None, brands=None):
+    work = frame.copy()
+    if "Year" in work.columns and min_year is not None:
+        years = pd.to_numeric(work["Year"], errors="coerce")
+        work = work[years >= int(min_year)]
+    if brands and "Brand" in work.columns:
+        wanted = {str(value).casefold() for value in brands}
+        work = work[work["Brand"].fillna("").astype(str).str.casefold().isin(wanted)]
+    if vehicle_types:
+        mask = work.apply(lambda row: _guided_type_matches(row, vehicle_types), axis=1)
+        work = work[mask]
+    return work
+
+
+@app.route("/api/guided/discovery/options", methods=["GET"])
+def api_guided_discovery_options():
+    """Return only valid guided-choice options for the current discovery state.
+
+    This endpoint performs no LLM work. It is intentionally deterministic so the
+    frontend can offer finite, validated Brand -> Model -> Category pathways.
+    """
+    if not BUYER_INTELLIGENCE_READY or buyer_model_df is None or buyer_model_df.empty:
+        return jsonify({"success": False, "error": "BUYER_INTELLIGENCE_NOT_READY"}), 503
+
+    try:
+        requested_types = _guided_list_arg("vehicle_type")
+        selected_brands = _guided_list_arg("brand")
+        selected_model_keys = set(_guided_list_arg("model_key"))
+
+        min_year_raw = str(request.args.get("min_year") or "").strip()
+        min_year = None
+        if min_year_raw and min_year_raw.upper() != "ALL":
+            min_year = int(float(min_year_raw))
+
+        import_only = str(request.args.get("import_only") or "false").strip().casefold() in {
+            "1", "true", "yes", "on"
+        }
+        import_floor = datetime.now(timezone.utc).year - max(0, IMPORT_MAX_AGE_YEARS)
+        if import_only:
+            min_year = max(min_year or import_floor, import_floor)
+
+        all_years = pd.to_numeric(buyer_model_df["Year"], errors="coerce").dropna().astype(int)
+        min_available = int(all_years.min()) if not all_years.empty else None
+        max_available = int(all_years.max()) if not all_years.empty else None
+
+        base = _guided_filter_discovery_frame(
+            buyer_model_df,
+            min_year=min_year,
+            vehicle_types=requested_types,
+        )
+        brands = sorted(
+            base["Brand"].dropna().astype(str).str.strip().loc[lambda s: s != ""].unique().tolist()
+        )
+
+        model_frame = _guided_filter_discovery_frame(
+            buyer_model_df,
+            min_year=min_year,
+            vehicle_types=requested_types,
+            brands=selected_brands,
+        )
+        model_rows = (
+            model_frame[["Brand", "Model"]]
+            .dropna()
+            .drop_duplicates()
+            .sort_values(["Brand", "Model"])
+        )
+        models = []
+        for row in model_rows.to_dict("records"):
+            brand = str(row.get("Brand") or "").strip()
+            model = str(row.get("Model") or "").strip()
+            if not brand or not model:
+                continue
+            key = f"{brand}||{model}"
+            models.append({"key": key, "brand": brand, "model": model, "label": f"{brand} {model}"})
+
+        categories_by_model = {}
+        if selected_model_keys and buyer_category_df is not None and not buyer_category_df.empty:
+            category_base = _guided_filter_discovery_frame(
+                buyer_category_df,
+                min_year=min_year,
+                vehicle_types=requested_types,
+                brands=selected_brands,
+            )
+            for model_key in sorted(selected_model_keys):
+                if "||" not in model_key:
+                    continue
+                brand, model = model_key.split("||", 1)
+                rows = category_base[
+                    (category_base["Brand"].fillna("").astype(str).str.casefold() == brand.casefold())
+                    & (category_base["Model"].fillna("").astype(str).str.casefold() == model.casefold())
+                ]
+                values = sorted(
+                    rows["CategoryDetail"].dropna().astype(str).str.strip().loc[lambda s: s != ""].unique().tolist()
+                )
+                categories_by_model[model_key] = values
+
+        return jsonify({
+            "success": True,
+            "min_year": min_available,
+            "max_year": max_available,
+            "effective_min_year": min_year,
+            "import_only": import_only,
+            "import_max_age_years": IMPORT_MAX_AGE_YEARS,
+            "brands": brands,
+            "models": models,
+            "categories_by_model": categories_by_model,
+        })
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "INVALID_GUIDED_OPTIONS"}), 400
+    except Exception as exc:
+        print("GUIDED DISCOVERY OPTIONS FAILED:", repr(exc), flush=True)
+        return jsonify({"success": False, "error": "GUIDED_OPTIONS_UNAVAILABLE"}), 503
 
 
 # =========================================================
