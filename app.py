@@ -9765,6 +9765,15 @@ def _guided_type_matches(row, requested_types):
     vt = str(profile.get("VehicleType") or row.get("VehicleType") or "").strip().upper()
     body = str(profile.get("BodyStyle") or "").strip().upper()
     raw_vt = str(row.get("VehicleType") or "").strip().casefold()
+    raw_type_key = (
+        raw_vt.replace("i̇", "i")
+        .replace("ı", "i").replace("ş", "s").replace("ç", "c")
+        .replace("ğ", "g").replace("ü", "u").replace("ö", "o")
+    )
+    raw_type_key = re.sub(r"[^a-z0-9]+", "", raw_type_key)
+    if raw_type_key in {"gezi", "is", "cekici", "surat"}:
+        return False
+
     requested = {str(v).strip().upper().replace("-", "_") for v in requested_types}
 
     matches = set()
@@ -9813,8 +9822,7 @@ def _guided_type_matches(row, requested_types):
     # to the generic CAR heuristic below. Keep correctly profiled SUVs/pick-ups etc.
     # because those have already populated `matches` above.
     if not matches:
-        raw_type_key = re.sub(r"[^a-z0-9çğıöşü]+", " ", raw_vt).strip()
-        if raw_type_key in {"gezi", "is", "iş", "cekici", "çekici"}:
+        if raw_type_key in {"gezi", "is", "cekici", "surat"}:
             return False
 
     # The guided selector must remain usable even if the optional buyer-intelligence
@@ -9842,14 +9850,15 @@ def _guided_type_matches(row, requested_types):
 
 
 
-_GUIDED_EXCLUDED_BRAND_KEYS = {"is", "cekici", "surat"}
+_GUIDED_EXCLUDED_BRAND_KEYS = {"is", "cekici", "surat", "gezi"}
 
 def _guided_brand_key(value):
-    return (
-        str(value or "").strip().casefold()
+    key = (
+        str(value or "").strip().casefold().replace("i̇", "i")
         .replace("ı", "i").replace("ş", "s").replace("ç", "c")
         .replace("ğ", "g").replace("ü", "u").replace("ö", "o")
     )
+    return re.sub(r"[^a-z0-9]+", "", key)
 
 def _guided_brand_allowed(value):
     return _guided_brand_key(value) not in _GUIDED_EXCLUDED_BRAND_KEYS
