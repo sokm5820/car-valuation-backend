@@ -1579,31 +1579,42 @@ def get_categories():
         return jsonify([])
 
     year = request.args.get("year")
-    brand = request.args.get("brand")
-    model = request.args.get("model")
+    brand = str(request.args.get("brand") or "").strip()
+    model = str(request.args.get("model") or "").strip()
 
-    filtered = df.copy()
+    # Model/category selection is latency-sensitive in the guided UI. Filter the
+    # shared frame in place (no full-frame copy) and narrow by brand/model before
+    # doing numeric year conversion. This is especially noticeable for models
+    # that have no category value, where the UI should be able to skip that step.
+    filtered = df
+
+    if brand and brand.lower() != "null":
+        brand_series = filtered["Brand"].fillna("").astype(str).str.strip().str.casefold()
+        filtered = filtered[brand_series == brand.casefold()]
+
+    if model and model.lower() != "null":
+        model_series = filtered["Model"].fillna("").astype(str).str.strip().str.casefold()
+        filtered = filtered[model_series == model.casefold()]
 
     if year not in [None, "", "null"]:
         try:
-            year = int(float(year))
-            filtered = filtered[pd.to_numeric(filtered["Year"], errors="coerce") == year]
-        except:
+            year_value = int(float(year))
+            years = pd.to_numeric(filtered["Year"], errors="coerce")
+            filtered = filtered[years == year_value]
+        except (TypeError, ValueError):
             pass
 
-    if brand not in [None, "", "null"]:
-        filtered = filtered[
-            filtered["Brand"].astype(str).str.strip().str.lower()
-            == str(brand).strip().lower()
-        ]
+    if filtered.empty or "Category" not in filtered.columns:
+        return jsonify([])
 
-    if model not in [None, "", "null"]:
-        filtered = filtered[
-            filtered["Model"].astype(str).str.strip().str.lower()
-            == str(model).strip().lower()
-        ]
-
-    return jsonify(sorted(filtered["Category"].dropna().unique().tolist()))
+    values = (
+        filtered["Category"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
+    values = values[(values != "") & (values.str.casefold() != "nan") & (values != "-")]
+    return jsonify(sorted(values.unique().tolist()))
 
 # =========================================================
 # VALUATION ENGINE
@@ -9881,6 +9892,9 @@ def api_guided_discovery_options():
         requested_types = _guided_list_arg("vehicle_type")
         selected_brands = _guided_list_arg("brand")
         selected_model_keys = set(_guided_list_arg("model_key"))
+        categories_only = str(request.args.get("categories_only") or "false").strip().casefold() in {
+            "1", "true", "yes", "on"
+        }
 
         min_year_raw = str(request.args.get("min_year") or "").strip()
         min_year = None
@@ -9893,6 +9907,52 @@ def api_guided_discovery_options():
         import_floor = datetime.now(timezone.utc).year - max(0, IMPORT_MAX_AGE_YEARS)
         if import_only:
             min_year = max(min_year or import_floor, import_floor)
+
+        # The model-selection step only needs category choices. Avoid rebuilding
+        # the entire brand/model option universe while the user waits to continue.
+        # Filtering brand+model first also makes "no category" models return fast.
+        if categories_only:
+            categories_by_model = {}
+            if category_source is not None and not category_source.empty:
+                category_column = "CategoryDetail" if "CategoryDetail" in category_source.columns else "Category"
+                for model_key in sorted(selected_model_keys):
+                    if "||" not in model_key:
+                        continue
+                    brand, model = model_key.split("||", 1)
+                    rows = category_source
+
+                    brand_mask = rows["Brand"].fillna("").astype(str).str.strip().str.casefold() == brand.strip().casefold()
+                    model_mask = rows["Model"].fillna("").astype(str).str.strip().str.casefold() == model.strip().casefold()
+                    rows = rows[brand_mask & model_mask]
+
+                    if min_year is not None and not rows.empty and "Year" in rows.columns:
+                        years = pd.to_numeric(rows["Year"], errors="coerce")
+                        rows = rows[years >= int(min_year)]
+
+                    if requested_types and not rows.empty:
+                        type_mask = rows.apply(lambda row: _guided_type_matches(row, requested_types), axis=1)
+                        rows = rows[type_mask]
+
+                    if rows.empty or category_column not in rows.columns:
+                        categories_by_model[model_key] = []
+                        continue
+
+                    values = (
+                        rows[category_column]
+                        .dropna()
+                        .astype(str)
+                        .str.strip()
+                    )
+                    values = values[(values != "") & (values.str.casefold() != "nan") & (values != "-")]
+                    categories_by_model[model_key] = sorted(values.unique().tolist())
+
+            return jsonify({
+                "success": True,
+                "effective_min_year": min_year,
+                "import_only": import_only,
+                "import_max_age_years": IMPORT_MAX_AGE_YEARS,
+                "categories_by_model": categories_by_model,
+            })
 
         all_years = pd.to_numeric(model_source["Year"], errors="coerce").dropna().astype(int)
         min_available = int(all_years.min()) if not all_years.empty else None
