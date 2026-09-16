@@ -9840,8 +9840,27 @@ def _guided_type_matches(row, requested_types):
     return bool(matches & requested)
 
 
+
+
+_GUIDED_EXCLUDED_BRAND_KEYS = {"is", "cekici", "surat"}
+
+def _guided_brand_key(value):
+    return (
+        str(value or "").strip().casefold()
+        .replace("ı", "i").replace("ş", "s").replace("ç", "c")
+        .replace("ğ", "g").replace("ü", "u").replace("ö", "o")
+    )
+
+def _guided_brand_allowed(value):
+    return _guided_brand_key(value) not in _GUIDED_EXCLUDED_BRAND_KEYS
+
 def _guided_filter_discovery_frame(frame, *, min_year=None, vehicle_types=None, brands=None):
     work = frame.copy()
+    # AI-assistant-only hygiene: source taxonomy labels occasionally leak into
+    # Brand. Remove them here without changing the shared valuation dataframe/routes.
+    if "Brand" in work.columns:
+        brand_mask = work["Brand"].fillna("").astype(str).apply(_guided_brand_allowed)
+        work = work[brand_mask]
     if "Year" in work.columns and min_year is not None:
         years = pd.to_numeric(work["Year"], errors="coerce")
         work = work[years >= int(min_year)]
@@ -9900,6 +9919,9 @@ def api_guided_discovery_options():
         categories_only = str(request.args.get("categories_only") or "false").strip().casefold() in {
             "1", "true", "yes", "on"
         }
+        all_models = str(request.args.get("all_models") or "false").strip().casefold() in {
+            "1", "true", "yes", "on"
+        }
 
         min_year_raw = str(request.args.get("min_year") or "").strip()
         min_year = None
@@ -9918,9 +9940,23 @@ def api_guided_discovery_options():
         # Filtering brand+model first also makes "no category" models return fast.
         if categories_only:
             categories_by_model = {}
+            effective_model_keys = set(selected_model_keys)
+            if all_models:
+                model_base = _guided_filter_discovery_frame(
+                    model_source,
+                    min_year=min_year,
+                    vehicle_types=requested_types,
+                    brands=selected_brands,
+                )
+                if {"Brand", "Model"}.issubset(model_base.columns):
+                    for row in model_base[["Brand", "Model"]].dropna().drop_duplicates().to_dict("records"):
+                        brand = str(row.get("Brand") or "").strip()
+                        model = str(row.get("Model") or "").strip()
+                        if brand and model:
+                            effective_model_keys.add(f"{brand}||{model}")
             if category_source is not None and not category_source.empty:
                 category_column = "CategoryDetail" if "CategoryDetail" in category_source.columns else "Category"
-                for model_key in sorted(selected_model_keys):
+                for model_key in sorted(effective_model_keys):
                     if "||" not in model_key:
                         continue
                     brand, model = model_key.split("||", 1)
