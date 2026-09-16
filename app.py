@@ -9808,6 +9808,15 @@ def _guided_type_matches(row, requested_types):
         elif vt in {"PICKUP", "MOTORCYCLE", "SCOOTER", "ATV", "UTV"}:
             matches.add("MOTORCYCLE" if vt == "SCOOTER" else vt)
 
+    # AI-assistant-only guard: source taxonomy values such as Gezi / Is / Cekici
+    # are not supported guided vehicle classes. They were previously falling through
+    # to the generic CAR heuristic below. Keep correctly profiled SUVs/pick-ups etc.
+    # because those have already populated `matches` above.
+    if not matches:
+        raw_type_key = re.sub(r"[^a-z0-9çğıöşü]+", " ", raw_vt).strip()
+        if raw_type_key in {"gezi", "is", "iş", "cekici", "çekici"}:
+            return False
+
     # The guided selector must remain usable even if the optional buyer-intelligence
     # snapshot is temporarily unavailable. market_base rows can still be classified
     # from the validated model profile and, as a last resort, clear listing signals.
