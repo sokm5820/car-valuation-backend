@@ -9870,6 +9870,9 @@ def _guided_filter_discovery_frame(frame, *, min_year=None, vehicle_types=None, 
     if "Brand" in work.columns:
         brand_mask = work["Brand"].fillna("").astype(str).apply(_guided_brand_allowed)
         work = work[brand_mask]
+    if "CurrentListings" in work.columns:
+        current_counts = pd.to_numeric(work["CurrentListings"], errors="coerce")
+        work = work[current_counts.fillna(0) > 0]
     if "Year" in work.columns and min_year is not None:
         years = pd.to_numeric(work["Year"], errors="coerce")
         work = work[years >= int(min_year)]
@@ -9901,31 +9904,37 @@ def _guided_filter_discovery_frame(frame, *, min_year=None, vehicle_types=None, 
 
 
 def _guided_discovery_sources():
-    """Return resilient model/category frames for finite guided selectors.
+    """Return current-market frames for finite AI-assistant selectors.
 
-    Buyer intelligence is preferred because it already carries VehicleType and
-    category detail. If that optional snapshot is unavailable, current market
-    data remains sufficient for valid Brand -> Model -> Category choices.
+    The guided UI promises that every chip still has at least one viable path to
+    a current listing after all hard constraints selected so far.  Therefore the
+    live market listing frame is the source of truth for *option availability*.
+    Buyer-intelligence aggregates remain useful for downstream ranking/evidence,
+    but using them to populate chips can expose a model-year whose aggregate row
+    exists even when no current listing survives the exact filters.
+
+    This helper is used only by /api/guided/discovery/options and does not alter
+    the standalone OtoDeğer valuation dataframe or any valuation route.
     """
+    if MARKET_READY and market_df is not None and not market_df.empty:
+        model_source = market_df.copy()
+        if "VehicleType" not in model_source.columns:
+            model_source["VehicleType"] = ""
+
+        category_source = market_df.copy()
+        if "VehicleType" not in category_source.columns:
+            category_source["VehicleType"] = ""
+        if "CategoryDetail" not in category_source.columns:
+            category_source["CategoryDetail"] = category_source.get("Category", "")
+        return model_source, category_source
+
+    # Resilient fallback only when the live market snapshot is unavailable.
     if BUYER_INTELLIGENCE_READY and buyer_model_df is not None and not buyer_model_df.empty:
         model_source = buyer_model_df.copy()
         category_source = buyer_category_df.copy() if buyer_category_df is not None else pd.DataFrame()
         return model_source, category_source
 
-    if not MARKET_READY or market_df is None or market_df.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    model_source = market_df.copy()
-    if "VehicleType" not in model_source.columns:
-        model_source["VehicleType"] = ""
-
-    category_source = market_df.copy()
-    if "VehicleType" not in category_source.columns:
-        category_source["VehicleType"] = ""
-    if "CategoryDetail" not in category_source.columns:
-        category_source["CategoryDetail"] = category_source.get("Category", "")
-
-    return model_source, category_source
+    return pd.DataFrame(), pd.DataFrame()
 
 
 @app.route("/api/guided/discovery/options", methods=["GET"])
@@ -10034,6 +10043,19 @@ def api_guided_discovery_options():
                 "categories_by_model": categories_by_model,
             })
 
+        supported_vehicle_types = ["CAR", "SUV", "PICKUP", "MOTORCYCLE", "ATV"]
+        available_vehicle_types = []
+        for vehicle_type in supported_vehicle_types:
+            candidate = _guided_filter_discovery_frame(
+                model_source,
+                min_year=min_year,
+                vehicle_types=[vehicle_type],
+                brands=selected_brands,
+                max_budget=max_budget,
+            )
+            if not candidate.empty:
+                available_vehicle_types.append(vehicle_type)
+
         all_years = pd.to_numeric(model_source["Year"], errors="coerce").dropna().astype(int)
         min_available = int(all_years.min()) if not all_years.empty else None
         max_available = int(all_years.max()) if not all_years.empty else None
@@ -10044,6 +10066,13 @@ def api_guided_discovery_options():
             vehicle_types=requested_types,
             max_budget=max_budget,
         )
+        viable_years = []
+        if "Year" in base.columns:
+            viable_years = sorted(
+                pd.to_numeric(base["Year"], errors="coerce").dropna().astype(int).unique().tolist(),
+                reverse=True,
+            )
+
         brands = sorted(
             base["Brand"].dropna().astype(str).str.strip().loc[lambda s: s != ""].unique().tolist()
         )
@@ -10100,6 +10129,8 @@ def api_guided_discovery_options():
             "effective_max_budget": max_budget,
             "import_only": import_only,
             "import_max_age_years": IMPORT_MAX_AGE_YEARS,
+            "vehicle_types": available_vehicle_types,
+            "years": viable_years,
             "brands": brands,
             "models": models,
             "categories_by_model": categories_by_model,
