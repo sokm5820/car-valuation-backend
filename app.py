@@ -9863,7 +9863,7 @@ def _guided_brand_key(value):
 def _guided_brand_allowed(value):
     return _guided_brand_key(value) not in _GUIDED_EXCLUDED_BRAND_KEYS
 
-def _guided_filter_discovery_frame(frame, *, min_year=None, vehicle_types=None, brands=None):
+def _guided_filter_discovery_frame(frame, *, min_year=None, vehicle_types=None, brands=None, max_budget=None):
     work = frame.copy()
     # AI-assistant-only hygiene: source taxonomy labels occasionally leak into
     # Brand. Remove them here without changing the shared valuation dataframe/routes.
@@ -9879,6 +9879,24 @@ def _guided_filter_discovery_frame(frame, *, min_year=None, vehicle_types=None, 
     if vehicle_types:
         mask = work.apply(lambda row: _guided_type_matches(row, vehicle_types), axis=1)
         work = work[mask]
+
+    # Guided AI discovery should never offer a Brand / Model / Category that has
+    # no current market evidence within the user's stated maximum budget. The
+    # buyer-intelligence snapshots expose CurrentStartingPrice; the resilient
+    # market fallback uses Price. This is deliberately scoped to this guided
+    # assistant helper and does not modify the standalone valuation data/routes.
+    if max_budget is not None and not work.empty:
+        price_series = None
+        for price_column in ("CurrentStartingPrice", "CurrentAskingPrice", "Price"):
+            if price_column not in work.columns:
+                continue
+            candidate = pd.to_numeric(work[price_column], errors="coerce")
+            if candidate.notna().any():
+                price_series = candidate
+                break
+        if price_series is not None:
+            work = work[price_series.notna() & (price_series <= float(max_budget))]
+
     return work
 
 
@@ -9937,6 +9955,13 @@ def api_guided_discovery_options():
         if min_year_raw and min_year_raw.upper() != "ALL":
             min_year = int(float(min_year_raw))
 
+        max_budget_raw = str(request.args.get("max_budget") or "").strip()
+        max_budget = None
+        if max_budget_raw:
+            max_budget = float(max_budget_raw)
+            if not math.isfinite(max_budget) or max_budget <= 0:
+                raise ValueError("INVALID_MAX_BUDGET")
+
         import_only = str(request.args.get("import_only") or "false").strip().casefold() in {
             "1", "true", "yes", "on"
         }
@@ -9956,6 +9981,7 @@ def api_guided_discovery_options():
                     min_year=min_year,
                     vehicle_types=requested_types,
                     brands=selected_brands,
+                    max_budget=max_budget,
                 )
                 if {"Brand", "Model"}.issubset(model_base.columns):
                     for row in model_base[["Brand", "Model"]].dropna().drop_duplicates().to_dict("records"):
@@ -9983,6 +10009,9 @@ def api_guided_discovery_options():
                         type_mask = rows.apply(lambda row: _guided_type_matches(row, requested_types), axis=1)
                         rows = rows[type_mask]
 
+                    if max_budget is not None and not rows.empty:
+                        rows = _guided_filter_discovery_frame(rows, max_budget=max_budget)
+
                     if rows.empty or category_column not in rows.columns:
                         categories_by_model[model_key] = []
                         continue
@@ -9999,6 +10028,7 @@ def api_guided_discovery_options():
             return jsonify({
                 "success": True,
                 "effective_min_year": min_year,
+                "effective_max_budget": max_budget,
                 "import_only": import_only,
                 "import_max_age_years": IMPORT_MAX_AGE_YEARS,
                 "categories_by_model": categories_by_model,
@@ -10012,6 +10042,7 @@ def api_guided_discovery_options():
             model_source,
             min_year=min_year,
             vehicle_types=requested_types,
+            max_budget=max_budget,
         )
         brands = sorted(
             base["Brand"].dropna().astype(str).str.strip().loc[lambda s: s != ""].unique().tolist()
@@ -10022,6 +10053,7 @@ def api_guided_discovery_options():
             min_year=min_year,
             vehicle_types=requested_types,
             brands=selected_brands,
+            max_budget=max_budget,
         )
         model_rows = (
             model_frame[["Brand", "Model"]]
@@ -10045,6 +10077,7 @@ def api_guided_discovery_options():
                 min_year=min_year,
                 vehicle_types=requested_types,
                 brands=selected_brands,
+                max_budget=max_budget,
             )
             for model_key in sorted(selected_model_keys):
                 if "||" not in model_key:
@@ -10064,6 +10097,7 @@ def api_guided_discovery_options():
             "min_year": min_available,
             "max_year": max_available,
             "effective_min_year": min_year,
+            "effective_max_budget": max_budget,
             "import_only": import_only,
             "import_max_age_years": IMPORT_MAX_AGE_YEARS,
             "brands": brands,
