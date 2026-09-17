@@ -10422,6 +10422,45 @@ def api_guided_discovery_recommendations():
             "EXPERIENCE": "premium feel and driving enjoyment",
         }
 
+        # The writing model should never expose the internal "exit rate" metric.
+        # Convert it into a buyer-facing resale implication first, then remove the
+        # raw percentage from the model payload. Ranking still uses the original
+        # deterministic statistics upstream.
+        mature_exit_rates = [
+            float(item["exit_60_rate"])
+            for item in candidates
+            if item.get("exit_60_rate") is not None and int(item.get("exit_60_eligible") or 0) >= 10
+        ]
+        shortlist_exit_median = float(pd.Series(mature_exit_rates).median()) if mature_exit_rates else None
+
+        writer_candidates = []
+        for item in candidates:
+            writer_item = dict(item)
+            rate = writer_item.pop("exit_60_rate", None)
+            eligible = int(writer_item.pop("exit_60_eligible", 0) or 0)
+            resale_context = None
+            if rate is not None and shortlist_exit_median is not None and eligible >= 10:
+                delta = float(rate) - shortlist_exit_median
+                if abs(delta) <= 0.04:
+                    resale_context = "Its likelihood of still being advertised after about two months is broadly typical for this shortlist."
+                elif delta >= 0.12:
+                    resale_context = "Historically, similar listings are noticeably less likely than a typical shortlisted option to still be advertised after about two months, a stronger signal for easier resale."
+                elif delta >= 0.05:
+                    resale_context = "Historically, similar listings are somewhat less likely than a typical shortlisted option to still be advertised after about two months, a positive resale signal."
+                elif delta <= -0.12:
+                    resale_context = "Historically, similar listings are noticeably more likely than a typical shortlisted option to remain advertised after about two months, so resale liquidity is a relative weakness."
+                else:
+                    resale_context = "Historically, similar listings are somewhat more likely than a typical shortlisted option to remain advertised after about two months, so resale may take more patience."
+            elif int(writer_item.get("historical_listings") or 0) >= 10:
+                resale_context = "There is market history for this model, but not enough mature two-month evidence for a confident resale-speed comparison."
+
+            if resale_context:
+                writer_item["resale_context"] = resale_context
+            writer_item["resale_evidence_depth"] = (
+                "deep" if eligible >= 100 else "moderate" if eligible >= 30 else "limited" if eligible >= 10 else None
+            )
+            writer_candidates.append(writer_item)
+
         language_name = {"EN": "English", "TR": "Turkish", "RU": "Russian"}[language]
         instructions = f"""
 You are an experienced, commercially aware car adviser writing the paid shortlist for one buyer.
@@ -10435,8 +10474,8 @@ Gold-standard writing rules:
 - Write 55-90 words per candidate, usually 2-4 sentences. Minimalist, useful and conversational.
 - Start with a natural description of the actual vehicle: what kind of choice it is and, only when supplied, its powertrain/engine information.
 - Tie the advice directly to the buyer's stated priorities. Do not simply repeat the priority labels.
-- Compare candidates RELATIVELY. A 2021 car is not "new" if 2024 alternatives exist. A 32% exit rate is not "strong" if the shortlist is around 58%.
-- Translate resale statistics into buyer language. Prefer wording such as "more/less likely to still be advertised after 60 days than the typical shortlisted option". Mention sample size only when it changes confidence.
+- Compare candidates RELATIVELY. A 2021 car is not "new" if 2024 alternatives exist.
+- Resale evidence is already translated into a buyer-facing `resale_context`. Explain the IMPLICATION only. Never write the terms "exit rate" or "60-day exit", and never expose the raw resale percentage. Prefer plain language such as easier/harder to resell, or more/less likely to still be advertised after about two months. Mention evidence depth only when it materially changes confidence.
 - Use current listing count to explain choice/scarcity: many listings mean the buyer can compare condition, mileage and specification; one or two mean limited choice.
 - Discuss budget fit only when it matters. Do NOT praise a car merely because it leaves a large amount of unused budget. Call out a price that is very close to the ceiling because it leaves little room to be selective.
 - Use general, widely established positioning (for example premium vs mainstream) cautiously. Do not invent precise MPG, maintenance costs, reliability claims, engine displacement or mechanical facts not present in the candidate facts.
@@ -10455,7 +10494,7 @@ Gold-standard writing rules:
                 "minimum_year": min_year,
                 "priorities": [goal_labels[g] for g in goals],
             },
-            "shortlist": candidates,
+            "shortlist": writer_candidates,
         }
 
         response = _openai_post(
