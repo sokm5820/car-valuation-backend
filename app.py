@@ -10206,8 +10206,38 @@ def api_guided_discovery_result():
                 "median_km": float(row["median_km"]) if pd.notna(row.get("median_km")) else None,
             })
 
+        year_grouped = (
+            rows.groupby(["Brand", "Model", "CategoryDetail", "Year"], dropna=False)
+            .agg(
+                listing_count=("Price", "size"),
+                min_price=("Price", "min"),
+                median_price=("Price", "median"),
+                max_price=("Price", "max"),
+                median_km=("KM", "median") if "KM" in rows.columns else ("Price", "size"),
+            )
+            .reset_index()
+            .sort_values(["Brand", "Model", "CategoryDetail", "Year"], ascending=[True, True, True, True])
+            .head(120)
+        )
+        year_options = []
+        for row in year_grouped.to_dict("records"):
+            year_options.append({
+                "brand": str(row.get("Brand") or ""),
+                "model": str(row.get("Model") or ""),
+                "category": str(row.get("CategoryDetail") or ""),
+                "year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
+                "listing_count": int(row.get("listing_count") or 0),
+                "min_price": float(row["min_price"]) if pd.notna(row.get("min_price")) else None,
+                "median_price": float(row["median_price"]) if pd.notna(row.get("median_price")) else None,
+                "max_price": float(row["max_price"]) if pd.notna(row.get("max_price")) else None,
+                "median_km": float(row["median_km"]) if pd.notna(row.get("median_km")) else None,
+            })
+
         result_cols = [c for c in ("Brand", "Model", "CategoryDetail", "Year", "Price", "KM", "Company", "Location", "Image", "Link") if c in rows.columns]
-        result_rows = rows.sort_values(["Price", "Year"], ascending=[True, False])[result_cols].head(12)
+        posted_rows = rows
+        if "Link" in posted_rows.columns:
+            posted_rows = posted_rows[posted_rows["Link"].fillna("").astype(str).str.strip().ne("")]
+        result_rows = posted_rows.sort_values(["Year", "Price"], ascending=[False, True])[result_cols].head(20)
         results = []
         for row in result_rows.to_dict("records"):
             results.append({
@@ -10223,7 +10253,7 @@ def api_guided_discovery_result():
                 "link": str(row.get("Link") or ""),
             })
 
-        return jsonify({"success": True, "count": int(len(rows)), "groups": groups, "results": results})
+        return jsonify({"success": True, "count": int(len(rows)), "groups": groups, "year_options": year_options, "results": results})
     except (TypeError, ValueError):
         return jsonify({"success": False, "error": "INVALID_GUIDED_RESULT"}), 400
     except Exception as exc:
