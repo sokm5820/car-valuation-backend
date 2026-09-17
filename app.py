@@ -10270,11 +10270,11 @@ def api_guided_discovery_result():
                 "median_km": float(row["median_km"]) if pd.notna(row.get("median_km")) else None,
             })
 
-        result_cols = [c for c in ("Brand", "Model", "CategoryDetail", "Year", "Price", "KM", "Company", "Location", "Image", "Link") if c in rows.columns]
+        result_cols = [c for c in ("Brand", "Model", "CategoryDetail", "Year", "Price", "KM", "Company", "Transmission", "Location", "Image", "Link") if c in rows.columns]
         posted_rows = rows
         if "Link" in posted_rows.columns:
             posted_rows = posted_rows[posted_rows["Link"].fillna("").astype(str).str.strip().ne("")]
-        result_rows = posted_rows.sort_values(["Year", "Price"], ascending=[False, True])[result_cols].head(20)
+        result_rows = posted_rows.sort_values(["Year", "Price"], ascending=[False, True])[result_cols].head(30)
         results = []
         for row in result_rows.to_dict("records"):
             results.append({
@@ -10285,6 +10285,7 @@ def api_guided_discovery_result():
                 "price": float(row["Price"]) if pd.notna(row.get("Price")) else None,
                 "km": float(row["KM"]) if pd.notna(row.get("KM")) else None,
                 "company": str(row.get("Company") or ""),
+                "transmission": str(row.get("Transmission") or ""),
                 "location": str(row.get("Location") or ""),
                 "image": str(row.get("Image") or ""),
                 "link": str(row.get("Link") or ""),
