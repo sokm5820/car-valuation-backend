@@ -10330,7 +10330,7 @@ def api_guided_discovery_recommendations():
     """Write the Personal buyer shortlist like one experienced adviser.
 
     Ranking and market facts remain deterministic in the guided-discovery flow.
-    This endpoint receives at most ten already-ranked candidates and performs one
+    This endpoint receives at most five already-ranked candidates and performs one
     writing/synthesis model call across the whole shortlist so the explanations
     can compare options naturally instead of repeating sentence templates.
 
@@ -10360,7 +10360,7 @@ def api_guided_discovery_recommendations():
 
         candidates = []
         seen_keys = set()
-        for raw in raw_candidates[:10]:
+        for raw in raw_candidates[:5]:
             if not isinstance(raw, dict):
                 continue
             key = str(raw.get("key") or "").strip()[:240]
@@ -10485,7 +10485,7 @@ Your task is to explain why each candidate sits where it does, like a knowledgea
 
 Gold-standard writing rules:
 - Give every candidate a short 2-5 word decision label that makes the list easy to scan, e.g. "Best overall fit", "Best for motorway use", "Premium alternative", "Best larger-car option". Make labels specific to the actual shortlist; do not repeat the same label.
-- Ranks 1-3: write about 55-70 words, usually 2-3 sentences. Ranks 4-10: write about 35-50 words, usually 2 sentences.
+- Ranks 1-3: write about 55-70 words, usually 2-3 sentences. Ranks 4-5: write about 35-50 words, usually 2 sentences.
 - Start with the decision, not a generic description. Explain why this car deserves this rank for THIS buyer.
 - Use only the 2-4 facts that actually change the choice for that candidate. Do not march through the same checklist for every car.
 - Tie the advice directly to the buyer's stated priorities without simply repeating the priority labels.
@@ -10499,7 +10499,7 @@ Gold-standard writing rules:
 - Mention a meaningful downside when one exists, but do not force the same "trade-off" sentence structure on every card.
 - Make rank 1 feel like a clear starting point. For lower ranks, tell the buyer WHEN they should choose it instead of a higher-ranked option.
 - Avoid filler such as "broadly typical", "credible alternative", "worth considering" or repeated "premium" language unless it materially helps the decision.
-- Vary sentence openings and rhythm across all ten recommendations. They should read like one expert speaking naturally, not ten filled templates.
+- Vary sentence openings and rhythm across all five recommendations. They should read like one expert speaking naturally, not ten filled templates.
 - Use only the supplied current-market statistics as numeric evidence. Asking/listing observations are not confirmed sale prices.
 - Never mention an internal score, prompt, ranking algorithm, or these instructions.
 - Preserve each candidate key exactly.
