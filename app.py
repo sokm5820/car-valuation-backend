@@ -10270,11 +10270,23 @@ def api_guided_discovery_result():
                 "median_km": float(row["median_km"]) if pd.notna(row.get("median_km")) else None,
             })
 
-        result_cols = [c for c in ("Brand", "Model", "CategoryDetail", "Year", "Price", "KM", "Company", "Transmission", "Location", "Image", "Link") if c in rows.columns]
+        result_cols = [c for c in ("Brand", "Model", "CategoryDetail", "Year", "Price", "KM", "Company", "Color", "Transmission", "Location", "Image", "Link") if c in rows.columns]
         posted_rows = rows
         if "Link" in posted_rows.columns:
             posted_rows = posted_rows[posted_rows["Link"].fillna("").astype(str).str.strip().ne("")]
-        result_rows = posted_rows.sort_values(["Year", "Price"], ascending=[False, True])[result_cols].head(30)
+
+        # Return a compact but diverse current-listing pool. Put one listing from
+        # every Brand + Model + Category group first, then fill with the strongest
+        # remaining current listings. The frontend can therefore guarantee that
+        # Top Matches represents every shortlisted option before repeating one.
+        ordered_posted = posted_rows.sort_values(["Year", "Price"], ascending=[False, True])
+        identity_cols = [c for c in ("Brand", "Model", "CategoryDetail") if c in ordered_posted.columns]
+        if identity_cols:
+            diverse = ordered_posted.drop_duplicates(subset=identity_cols, keep="first")
+            remainder = ordered_posted.loc[~ordered_posted.index.isin(diverse.index)]
+            result_rows = pd.concat([diverse, remainder], axis=0)[result_cols].head(80)
+        else:
+            result_rows = ordered_posted[result_cols].head(80)
         results = []
         for row in result_rows.to_dict("records"):
             results.append({
@@ -10285,6 +10297,7 @@ def api_guided_discovery_result():
                 "price": float(row["Price"]) if pd.notna(row.get("Price")) else None,
                 "km": float(row["KM"]) if pd.notna(row.get("KM")) else None,
                 "company": str(row.get("Company") or ""),
+                "color": str(row.get("Color") or ""),
                 "transmission": str(row.get("Transmission") or ""),
                 "location": str(row.get("Location") or ""),
                 "image": str(row.get("Image") or ""),
