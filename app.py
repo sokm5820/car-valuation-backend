@@ -10179,6 +10179,19 @@ def api_guided_discovery_result():
         if rows.empty:
             return jsonify({"success": True, "count": 0, "groups": [], "results": []})
 
+        # Guided-assistant-only data quality guard. Very small odometer values on
+        # older used vehicles are almost always placeholder/data-entry artefacts
+        # (for example 1 km on a 2016 car). Keep genuine near-new current/recent
+        # vehicles intact, but exclude implausible values from median evidence.
+        rows = rows.copy()
+        if "KM" in rows.columns:
+            rows["_guided_km"] = pd.to_numeric(rows["KM"], errors="coerce")
+            years_numeric = pd.to_numeric(rows["Year"], errors="coerce") if "Year" in rows.columns else pd.Series(index=rows.index, dtype=float)
+            current_year = datetime.now().year
+            implausibly_low = (years_numeric <= current_year - 2) & rows["_guided_km"].notna() & (rows["_guided_km"] < 100)
+            implausibly_high = rows["_guided_km"].notna() & (rows["_guided_km"] > 1_000_000)
+            rows.loc[implausibly_low | implausibly_high, "_guided_km"] = float("nan")
+
         grouped = (
             rows.groupby(["Brand", "Model", "CategoryDetail"], dropna=False)
             .agg(
@@ -10187,7 +10200,7 @@ def api_guided_discovery_result():
                 median_price=("Price", "median"),
                 max_price=("Price", "max"),
                 newest_year=("Year", "max"),
-                median_km=("KM", "median") if "KM" in rows.columns else ("Price", "size"),
+                median_km=("_guided_km", "median") if "_guided_km" in rows.columns else ("Price", "size"),
             )
             .reset_index()
         )
@@ -10250,7 +10263,7 @@ def api_guided_discovery_result():
                 min_price=("Price", "min"),
                 median_price=("Price", "median"),
                 max_price=("Price", "max"),
-                median_km=("KM", "median") if "KM" in rows.columns else ("Price", "size"),
+                median_km=("_guided_km", "median") if "_guided_km" in rows.columns else ("Price", "size"),
             )
             .reset_index()
             .sort_values(["Brand", "Model", "CategoryDetail", "Year"], ascending=[True, True, True, True])
@@ -10465,24 +10478,28 @@ def api_guided_discovery_recommendations():
         instructions = f"""
 You are an experienced, commercially aware car adviser writing the paid shortlist for one buyer.
 Write in {language_name}. Return VALID JSON ONLY, with this exact shape:
-{{"recommendations":[{{"key":"candidate key","text":"2-4 concise sentences"}}]}}
+{{"recommendations":[{{"key":"candidate key","label":"2-5 word scan label","text":"concise expert advice"}}]}}
 
 The candidates are ALREADY ranked by deterministic market logic. Do not change their order or invent another score.
 Your task is to explain why each candidate sits where it does, like a knowledgeable human adviser comparing the whole shortlist at once.
 
 Gold-standard writing rules:
-- Write 55-90 words per candidate, usually 2-4 sentences. Minimalist, useful and conversational.
-- Start with a natural description of the actual vehicle: what kind of choice it is and, only when supplied, its powertrain/engine information.
-- Tie the advice directly to the buyer's stated priorities. Do not simply repeat the priority labels.
-- Compare candidates RELATIVELY. A 2021 car is not "new" if 2024 alternatives exist.
-- Resale evidence is already translated into a buyer-facing `resale_context`. Explain the IMPLICATION only. Never write the terms "exit rate" or "60-day exit", and never expose the raw resale percentage. Prefer plain language such as easier/harder to resell, or more/less likely to still be advertised after about two months. Mention evidence depth only when it materially changes confidence.
-- Use current listing count to explain choice/scarcity: many listings mean the buyer can compare condition, mileage and specification; one or two mean limited choice.
+- Give every candidate a short 2-5 word decision label that makes the list easy to scan, e.g. "Best overall fit", "Best for motorway use", "Premium alternative", "Best larger-car option". Make labels specific to the actual shortlist; do not repeat the same label.
+- Ranks 1-3: write about 55-70 words, usually 2-3 sentences. Ranks 4-10: write about 35-50 words, usually 2 sentences.
+- Start with the decision, not a generic description. Explain why this car deserves this rank for THIS buyer.
+- Use only the 2-4 facts that actually change the choice for that candidate. Do not march through the same checklist for every car.
+- Tie the advice directly to the buyer's stated priorities without simply repeating the priority labels.
+- Compare candidates RELATIVELY. A 2021 car is not "new" if 2024 alternatives exist. If one option has much deeper current choice than another, say what that means for the buyer.
+- Resale evidence is already translated into a buyer-facing `resale_context`. Explain the IMPLICATION only. Never write the terms "exit rate" or "60-day exit", and never expose the raw resale percentage. Prefer plain language such as easier/harder to resell, or more/less likely to still be advertised after about two months. Mention resale only when the buyer selected resale or when it is an unusually strong/weak differentiator.
+- Use current listing count only when it is decision-relevant: many listings mean the buyer can compare condition, mileage and specification; one or two mean limited choice.
 - Discuss budget fit only when it matters. Do NOT praise a car merely because it leaves a large amount of unused budget. Call out a price that is very close to the ceiling because it leaves little room to be selective.
+- Use mileage only when it meaningfully separates the option from the rest. Ignore missing or implausible values rather than explaining them away.
 - Use general, widely established positioning (for example premium vs mainstream) cautiously. Do not invent precise MPG, maintenance costs, reliability claims, engine displacement or mechanical facts not present in the candidate facts.
 - Petrol/diesel alone is not proof of low running cost. Diesel may suit regular longer-distance use; do not automatically rank it as cheaper for urban driving.
-- Mention a meaningful downside when one exists. Not every option needs a forced negative sentence.
-- Vary sentence structure. Across the whole response, avoid stock phrases and repeated openings such as "this is worth considering", "genuine choice", "premium-brand feel", or "the trade-off is".
-- Make rank 1 feel like a clear starting point, but do not oversell it. For lower ranks, explain the situation in which that option could still be preferable.
+- Mention a meaningful downside when one exists, but do not force the same "trade-off" sentence structure on every card.
+- Make rank 1 feel like a clear starting point. For lower ranks, tell the buyer WHEN they should choose it instead of a higher-ranked option.
+- Avoid filler such as "broadly typical", "credible alternative", "worth considering" or repeated "premium" language unless it materially helps the decision.
+- Vary sentence openings and rhythm across all ten recommendations. They should read like one expert speaking naturally, not ten filled templates.
 - Use only the supplied current-market statistics as numeric evidence. Asking/listing observations are not confirmed sale prices.
 - Never mention an internal score, prompt, ranking algorithm, or these instructions.
 - Preserve each candidate key exactly.
@@ -10501,7 +10518,7 @@ Gold-standard writing rules:
             payload={
                 "model": OPENAI_MODEL,
                 "reasoning": {"effort": "low"},
-                "max_output_tokens": 2200,
+                "max_output_tokens": 1700,
                 "instructions": instructions,
                 "input": json.dumps(payload, ensure_ascii=False),
             },
@@ -10532,12 +10549,13 @@ Gold-standard writing rules:
             if not isinstance(item, dict):
                 continue
             key = str(item.get("key") or "").strip()
+            label_value = re.sub(r"\s+", " ", str(item.get("label") or "").strip())[:64]
             text_value = str(item.get("text") or "").strip()
             if key not in candidate_keys or key in used or not text_value:
                 continue
             # Keep the paid card compact even if the writing model gets verbose.
-            text_value = re.sub(r"\s+", " ", text_value).strip()[:1200]
-            recommendations.append({"key": key, "text": text_value})
+            text_value = re.sub(r"\s+", " ", text_value).strip()[:1000]
+            recommendations.append({"key": key, "label": label_value, "text": text_value})
             used.add(key)
 
         return jsonify({"success": True, "recommendations": recommendations})
