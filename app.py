@@ -10206,6 +10206,43 @@ def api_guided_discovery_result():
                 "median_km": float(row["median_km"]) if pd.notna(row.get("median_km")) else None,
             })
 
+        # Enrich the guided buyer groups with the existing historical buyer-intelligence
+        # evidence so Personal recommendations can rank resale/demand preferences without
+        # changing any standalone valuation routes or calculations.
+        if groups:
+            hard_results = [
+                {
+                    "brand": str(row.get("Brand") or ""),
+                    "model": str(row.get("Model") or ""),
+                    "category": str(row.get("CategoryDetail") or ""),
+                }
+                for row in rows[["Brand", "Model", "CategoryDetail"]].drop_duplicates().to_dict("records")
+            ]
+            enrich_inputs = [
+                {
+                    "brand": item.get("brand"),
+                    "model": item.get("model"),
+                    "category": item.get("category"),
+                    "newest_year": item.get("newest_year"),
+                    "count": item.get("listing_count"),
+                    "starting_price": item.get("min_price"),
+                }
+                for item in groups
+            ]
+            try:
+                enriched = enrich_model_options_with_buyer_intelligence(
+                    enrich_inputs,
+                    {"budget": max_budget, "min_year": min_year},
+                    [],
+                    hard_results,
+                )
+                for item, enriched_item in zip(groups, enriched):
+                    item["buyer_intelligence"] = enriched_item.get("buyer_intelligence")
+            except Exception as exc:
+                print("GUIDED BUYER INTELLIGENCE ENRICHMENT FAILED:", repr(exc), flush=True)
+                for item in groups:
+                    item["buyer_intelligence"] = None
+
         year_grouped = (
             rows.groupby(["Brand", "Model", "CategoryDetail", "Year"], dropna=False)
             .agg(
