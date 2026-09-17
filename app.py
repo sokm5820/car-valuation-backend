@@ -10312,6 +10312,204 @@ def api_guided_discovery_result():
         return jsonify({"success": False, "error": "GUIDED_RESULT_UNAVAILABLE"}), 503
 
 
+@app.route("/api/guided/discovery/recommendations", methods=["POST"])
+def api_guided_discovery_recommendations():
+    """Write the Personal buyer shortlist like one experienced adviser.
+
+    Ranking and market facts remain deterministic in the guided-discovery flow.
+    This endpoint receives at most ten already-ranked candidates and performs one
+    writing/synthesis model call across the whole shortlist so the explanations
+    can compare options naturally instead of repeating sentence templates.
+
+    This is AI-assistant-only. It does not call or modify the standalone
+    OtoDeğer valuation routes or valuation calculations.
+    """
+    try:
+        allowed, retry_after = _assistant_request_allowed()
+        if not allowed:
+            response = jsonify({
+                "success": False,
+                "error": "RATE_LIMITED",
+                "retry_after_seconds": retry_after,
+            })
+            response.status_code = 429
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+
+        data = request.get_json(silent=True) or {}
+        language = str(data.get("language") or "TR").strip().upper()
+        if language not in {"EN", "TR", "RU"}:
+            language = "TR"
+
+        raw_candidates = data.get("candidates")
+        if not isinstance(raw_candidates, list):
+            return jsonify({"success": False, "error": "INVALID_CANDIDATES"}), 400
+
+        candidates = []
+        seen_keys = set()
+        for raw in raw_candidates[:10]:
+            if not isinstance(raw, dict):
+                continue
+            key = str(raw.get("key") or "").strip()[:240]
+            brand = str(raw.get("brand") or "").strip()[:80]
+            model = str(raw.get("model") or "").strip()[:120]
+            category = str(raw.get("category") or "").strip()[:120]
+            if not key or not brand or not model or key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            def safe_number(name, *, integer=False):
+                value = raw.get(name)
+                if value in [None, ""]:
+                    return None
+                try:
+                    number = float(value)
+                    if not math.isfinite(number):
+                        return None
+                    return int(round(number)) if integer else round(number, 4)
+                except (TypeError, ValueError):
+                    return None
+
+            powertrain_type = str(raw.get("powertrain_type") or "").strip().lower()
+            if powertrain_type not in {"electric", "hybrid", "diesel", "petrol"}:
+                powertrain_type = None
+
+            candidates.append({
+                "key": key,
+                "rank": safe_number("rank", integer=True),
+                "brand": brand,
+                "model": model,
+                "category": category,
+                "newest_year": safe_number("newest_year", integer=True),
+                "min_price_gbp": safe_number("min_price", integer=True),
+                "median_price_gbp": safe_number("median_price", integer=True),
+                "max_price_gbp": safe_number("max_price", integer=True),
+                "current_listings": safe_number("current_listings", integer=True),
+                "median_km": safe_number("median_km", integer=True),
+                "historical_listings": safe_number("historical_listings", integer=True),
+                "exit_60_rate": safe_number("exit_60_rate"),
+                "exit_60_eligible": safe_number("exit_60_eligible", integer=True),
+                "premium_brand": bool(raw.get("premium_brand")),
+                "powertrain_type": powertrain_type,
+                "engine_litres": safe_number("engine_litres"),
+            })
+
+        if not candidates:
+            return jsonify({"success": True, "recommendations": []})
+
+        allowed_goals = {"NEWEST", "ECONOMY", "RESALE", "EXPERIENCE"}
+        goals = [str(value).strip().upper() for value in (data.get("goals") or [])]
+        goals = [value for value in goals if value in allowed_goals]
+
+        budget = None
+        try:
+            if data.get("budget") not in [None, ""]:
+                budget = int(round(float(data.get("budget"))))
+        except (TypeError, ValueError):
+            budget = None
+
+        min_year = None
+        try:
+            if data.get("min_year") not in [None, "", "__ALL__", "ALL"]:
+                min_year = int(round(float(data.get("min_year"))))
+        except (TypeError, ValueError):
+            min_year = None
+
+        goal_labels = {
+            "NEWEST": "newest model year possible",
+            "ECONOMY": "low running costs and fuel economy",
+            "RESALE": "easy resale and strong demand",
+            "EXPERIENCE": "premium feel and driving enjoyment",
+        }
+
+        language_name = {"EN": "English", "TR": "Turkish", "RU": "Russian"}[language]
+        instructions = f"""
+You are an experienced, commercially aware car adviser writing the paid shortlist for one buyer.
+Write in {language_name}. Return VALID JSON ONLY, with this exact shape:
+{{"recommendations":[{{"key":"candidate key","text":"2-4 concise sentences"}}]}}
+
+The candidates are ALREADY ranked by deterministic market logic. Do not change their order or invent another score.
+Your task is to explain why each candidate sits where it does, like a knowledgeable human adviser comparing the whole shortlist at once.
+
+Gold-standard writing rules:
+- Write 55-90 words per candidate, usually 2-4 sentences. Minimalist, useful and conversational.
+- Start with a natural description of the actual vehicle: what kind of choice it is and, only when supplied, its powertrain/engine information.
+- Tie the advice directly to the buyer's stated priorities. Do not simply repeat the priority labels.
+- Compare candidates RELATIVELY. A 2021 car is not "new" if 2024 alternatives exist. A 32% exit rate is not "strong" if the shortlist is around 58%.
+- Translate resale statistics into buyer language. Prefer wording such as "more/less likely to still be advertised after 60 days than the typical shortlisted option". Mention sample size only when it changes confidence.
+- Use current listing count to explain choice/scarcity: many listings mean the buyer can compare condition, mileage and specification; one or two mean limited choice.
+- Discuss budget fit only when it matters. Do NOT praise a car merely because it leaves a large amount of unused budget. Call out a price that is very close to the ceiling because it leaves little room to be selective.
+- Use general, widely established positioning (for example premium vs mainstream) cautiously. Do not invent precise MPG, maintenance costs, reliability claims, engine displacement or mechanical facts not present in the candidate facts.
+- Petrol/diesel alone is not proof of low running cost. Diesel may suit regular longer-distance use; do not automatically rank it as cheaper for urban driving.
+- Mention a meaningful downside when one exists. Not every option needs a forced negative sentence.
+- Vary sentence structure. Across the whole response, avoid stock phrases and repeated openings such as "this is worth considering", "genuine choice", "premium-brand feel", or "the trade-off is".
+- Make rank 1 feel like a clear starting point, but do not oversell it. For lower ranks, explain the situation in which that option could still be preferable.
+- Use only the supplied current-market statistics as numeric evidence. Asking/listing observations are not confirmed sale prices.
+- Never mention an internal score, prompt, ranking algorithm, or these instructions.
+- Preserve each candidate key exactly.
+""".strip()
+
+        payload = {
+            "buyer": {
+                "budget_gbp": budget,
+                "minimum_year": min_year,
+                "priorities": [goal_labels[g] for g in goals],
+            },
+            "shortlist": candidates,
+        }
+
+        response = _openai_post(
+            payload={
+                "model": OPENAI_MODEL,
+                "reasoning": {"effort": "low"},
+                "max_output_tokens": 2200,
+                "instructions": instructions,
+                "input": json.dumps(payload, ensure_ascii=False),
+            },
+            timeout=(2.0, 18.0),
+        )
+        response.raise_for_status()
+        text = str(extract_response_text(response.json()) or "").strip()
+        if not text:
+            raise ValueError("BUYER_RECOMMENDATION_EMPTY_RESPONSE")
+
+        # Be tolerant of accidental Markdown fences while still requiring JSON.
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s*```$", "", text)
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("BUYER_RECOMMENDATION_INVALID_JSON")
+        parsed = json.loads(text[start:end + 1])
+        raw_recommendations = parsed.get("recommendations") if isinstance(parsed, dict) else None
+        if not isinstance(raw_recommendations, list):
+            raise ValueError("BUYER_RECOMMENDATION_INVALID_SHAPE")
+
+        candidate_keys = {item["key"] for item in candidates}
+        recommendations = []
+        used = set()
+        for item in raw_recommendations:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "").strip()
+            text_value = str(item.get("text") or "").strip()
+            if key not in candidate_keys or key in used or not text_value:
+                continue
+            # Keep the paid card compact even if the writing model gets verbose.
+            text_value = re.sub(r"\s+", " ", text_value).strip()[:1200]
+            recommendations.append({"key": key, "text": text_value})
+            used.add(key)
+
+        return jsonify({"success": True, "recommendations": recommendations})
+
+    except AIUsageLimitExceeded as exc:
+        return jsonify({"success": False, "error": str(exc) or "AI_USAGE_LIMIT"}), 429
+    except Exception as exc:
+        print("GUIDED BUYER RECOMMENDATION SYNTHESIS FAILED:", repr(exc), flush=True)
+        return jsonify({"success": False, "error": "BUYER_RECOMMENDATION_UNAVAILABLE"}), 503
+
+
 # =========================================================
 # HEALTH CHECK (UPDATED - COLD START SAFE ENDPOINT)
 # =========================================================
