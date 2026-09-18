@@ -11679,8 +11679,8 @@ def _guided_stock_history_metrics(brand, model, year, category=None):
     # deliberately modest so exact year/variant evidence is preferred whenever it
     # can reasonably stand on its own.
     turnover_sufficient = bool(
-        exit60_eligible >= 8
-        and len(exited_durations) >= 5
+        exit60_eligible >= 5
+        and len(exited_durations) >= 3
         and exit60_rate is not None
         and median_exit is not None
     )
@@ -11706,6 +11706,104 @@ def _guided_stock_history_metrics(brand, model, year, category=None):
     }
     prepared["metrics"][cache_key] = result
     return result
+
+
+def _guided_precomputed_stock_history_metrics(brand, model, year, category=None):
+    """Fallback turnover evidence from the precomputed Business market table.
+
+    This is used only when the raw daily listing history is unavailable or cannot
+    support the requested same-year scope.  Granularity remains year-specific:
+    CATEGORY_YEAR for an exact variant, or MODEL_YEAR across categories.  We never
+    pool different years for guided stock recommendations.
+    """
+    if not BUSINESS_INTELLIGENCE_READY or business_market_df is None or business_market_df.empty:
+        return None
+
+    try:
+        year_key = int(float(year))
+    except (TypeError, ValueError):
+        return None
+
+    work = business_market_df.copy()
+    if not {"BusinessGranularity", "Brand", "Model", "Year"}.issubset(work.columns):
+        return None
+
+    brand_key = str(brand or "").strip().casefold()
+    model_key = str(model or "").strip().casefold()
+    work = work[
+        work["Brand"].fillna("").astype(str).str.strip().str.casefold().eq(brand_key)
+        & work["Model"].fillna("").astype(str).str.strip().str.casefold().eq(model_key)
+        & pd.to_numeric(work["Year"], errors="coerce").eq(year_key)
+    ].copy()
+    if work.empty:
+        return None
+
+    if category not in [None, ""]:
+        category_key = str(category).strip().casefold()
+        work = work[work["BusinessGranularity"].fillna("").astype(str).str.upper().eq("CATEGORY_YEAR")].copy()
+        if "CategoryDetail" not in work.columns:
+            return None
+        work = work[work["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold().eq(category_key)].copy()
+    else:
+        work = work[work["BusinessGranularity"].fillna("").astype(str).str.upper().eq("MODEL_YEAR")].copy()
+
+    if work.empty:
+        return None
+
+    evidence_rank = {"HIGH": 4, "MEDIUM": 3, "LOW": 2, "INSUFFICIENT": 0}
+    work["_evidence_rank"] = work.get("EvidenceQuality", pd.Series(index=work.index, dtype=object)).fillna("").astype(str).str.upper().map(evidence_rank).fillna(1)
+    if "Exit60EligibleListings" in work.columns:
+        work["_sample_rank"] = pd.to_numeric(work["Exit60EligibleListings"], errors="coerce").fillna(0)
+    elif "HistoricalDistinctListings" in work.columns:
+        work["_sample_rank"] = pd.to_numeric(work["HistoricalDistinctListings"], errors="coerce").fillna(0)
+    else:
+        work["_sample_rank"] = 0
+    row = work.sort_values(["_evidence_rank", "_sample_rank"], ascending=[False, False]).iloc[0]
+
+    def num(name):
+        value = pd.to_numeric(pd.Series([row.get(name)]), errors="coerce").iloc[0]
+        return None if pd.isna(value) else float(value)
+
+    exit60_rate = num("ObservedExitWithin60DaysRate")
+    if exit60_rate is not None and exit60_rate > 1.0 and exit60_rate <= 100.0:
+        exit60_rate /= 100.0
+    reduction_rate = num("PriceReductionRate")
+    if reduction_rate is not None and reduction_rate > 1.0 and reduction_rate <= 100.0:
+        reduction_rate /= 100.0
+
+    sample = num("Exit60EligibleListings")
+    if sample is None:
+        sample = num("HistoricalDistinctListings")
+    sample = int(sample or 0)
+    exits = num("HistoricalObservedMarketExits")
+    median_exit = num("MedianObservedDaysToExit")
+    hist_distinct = num("HistoricalDistinctListings")
+    quality = str(row.get("EvidenceQuality") or "").strip().upper() or "LOW"
+    usable = bool(sample >= 3 and exit60_rate is not None and median_exit is not None)
+
+    return {
+        "historical_distinct_listings": int(hist_distinct) if hist_distinct is not None else None,
+        "turnover_sample_size": sample,
+        "observed_exit_count": int(exits) if exits is not None else None,
+        "median_observed_days_to_exit": median_exit,
+        "observed_exit_within_60_days_rate": exit60_rate,
+        "historical_price_reduction_rate": reduction_rate,
+        "price_pressure_sample_size": int(num("PricePressureEligibleListings") or 0),
+        "evidence_quality": quality if quality != "INSUFFICIENT" or usable else "INSUFFICIENT",
+        "turnover_sufficient": usable and quality != "INSUFFICIENT",
+        "history_start_date": None,
+        "history_end_date": None,
+        "evidence_source": "PRECOMPUTED_BUSINESS_MARKET",
+    }
+
+
+def _guided_stock_metrics_usable(metrics, minimum_sample=3):
+    if not isinstance(metrics, dict):
+        return False
+    sample = pd.to_numeric(pd.Series([metrics.get("turnover_sample_size")]), errors="coerce").iloc[0]
+    rate = pd.to_numeric(pd.Series([metrics.get("observed_exit_within_60_days_rate")]), errors="coerce").iloc[0]
+    days = pd.to_numeric(pd.Series([metrics.get("median_observed_days_to_exit")]), errors="coerce").iloc[0]
+    return bool(pd.notna(sample) and float(sample) >= float(minimum_sample) and pd.notna(rate) and pd.notna(days))
 
 
 def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
@@ -11792,48 +11890,80 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
 
     candidate_records = []
     for current in current_groups:
-        exact_history = _guided_stock_history_metrics(
+        raw_exact = _guided_stock_history_metrics(
             current["brand"], current["model"], current["year"], current["category"]
         )
-        if not exact_history:
-            continue
+        precomputed_exact = None
+        if raw_exact is None:
+            precomputed_exact = _guided_precomputed_stock_history_metrics(
+                current["brand"], current["model"], current["year"], current["category"]
+            )
 
+        exact_history = raw_exact or precomputed_exact
         evidence = exact_history
         evidence_scope = "EXACT_CATEGORY_YEAR"
         fallback_context = None
 
-        if not bool(exact_history.get("turnover_sufficient")):
-            model_year_history = _guided_stock_history_metrics(
+        exact_sufficient = bool(exact_history and exact_history.get("turnover_sufficient"))
+        if not exact_sufficient:
+            raw_model_year = _guided_stock_history_metrics(
                 current["brand"], current["model"], current["year"], category=None
             )
-            if not model_year_history or not bool(model_year_history.get("turnover_sufficient")):
-                # Do not silently pool different years. If neither the exact variant-year
-                # nor the same-year model can support turnover statistics, skip it.
-                continue
-            evidence = model_year_history
-            evidence_scope = "MODEL_YEAR_FALLBACK"
-            fallback_context = {
-                "scope": "MODEL_YEAR_FALLBACK",
-                "exact_historical_distinct_listings": exact_history.get("historical_distinct_listings"),
-                "exact_turnover_sample_size": exact_history.get("turnover_sample_size"),
-                "fallback_historical_distinct_listings": model_year_history.get("historical_distinct_listings"),
-                "fallback_turnover_sample_size": model_year_history.get("turnover_sample_size"),
-            }
+            model_year_history = raw_model_year
+            if not _guided_stock_metrics_usable(model_year_history, minimum_sample=3):
+                precomputed_model_year = _guided_precomputed_stock_history_metrics(
+                    current["brand"], current["model"], current["year"], category=None
+                )
+                if _guided_stock_metrics_usable(precomputed_model_year, minimum_sample=3):
+                    model_year_history = precomputed_model_year
+
+            if _guided_stock_metrics_usable(model_year_history, minimum_sample=3):
+                evidence = model_year_history
+                evidence_scope = "MODEL_YEAR_FALLBACK"
+                fallback_context = {
+                    "scope": "MODEL_YEAR_FALLBACK",
+                    "exact_historical_distinct_listings": exact_history.get("historical_distinct_listings") if exact_history else None,
+                    "exact_turnover_sample_size": exact_history.get("turnover_sample_size") if exact_history else None,
+                    "fallback_historical_distinct_listings": model_year_history.get("historical_distinct_listings"),
+                    "fallback_turnover_sample_size": model_year_history.get("turnover_sample_size"),
+                    "fallback_source": model_year_history.get("evidence_source") or "RAW_DAILY_HISTORY",
+                }
+            elif _guided_stock_metrics_usable(exact_history, minimum_sample=2):
+                # If no same-year model fallback exists, retain the exact signal but
+                # flag it as thin rather than deleting the opportunity entirely.
+                evidence = exact_history
+                evidence_scope = "EXACT_THIN"
+                fallback_context = {
+                    "scope": "EXACT_THIN",
+                    "exact_historical_distinct_listings": exact_history.get("historical_distinct_listings"),
+                    "exact_turnover_sample_size": exact_history.get("turnover_sample_size"),
+                }
+            else:
+                # Historical turnover can occasionally be unavailable during a raw
+                # history refresh.  Preserve the exact current-market opportunity so
+                # the paid report remains useful, but do not invent liquidity metrics.
+                evidence = exact_history or {}
+                evidence_scope = "CURRENT_MARKET_ONLY"
+                fallback_context = {
+                    "scope": "CURRENT_MARKET_ONLY",
+                    "exact_historical_distinct_listings": exact_history.get("historical_distinct_listings") if exact_history else None,
+                    "exact_turnover_sample_size": exact_history.get("turnover_sample_size") if exact_history else None,
+                }
 
         candidate_records.append({
             **current,
-            # Historical-listing count remains exact to the visible category/year even
-            # when liquidity statistics need a same-year model fallback.
-            "historical_distinct_listings": exact_history.get("historical_distinct_listings"),
-            "turnover_sample_size": evidence.get("turnover_sample_size"),
-            "median_observed_days_to_exit": evidence.get("median_observed_days_to_exit"),
-            "observed_exit_within_60_days_rate": evidence.get("observed_exit_within_60_days_rate"),
-            "historical_price_reduction_rate": evidence.get("historical_price_reduction_rate"),
-            "evidence_quality": evidence.get("evidence_quality"),
+            # Historical-listing count remains exact to the visible category/year.
+            # Broader same-year evidence is used only for turnover metrics.
+            "historical_distinct_listings": exact_history.get("historical_distinct_listings") if exact_history else None,
+            "turnover_sample_size": evidence.get("turnover_sample_size") if evidence else None,
+            "median_observed_days_to_exit": evidence.get("median_observed_days_to_exit") if evidence else None,
+            "observed_exit_within_60_days_rate": evidence.get("observed_exit_within_60_days_rate") if evidence else None,
+            "historical_price_reduction_rate": evidence.get("historical_price_reduction_rate") if evidence else None,
+            "evidence_quality": (evidence.get("evidence_quality") if evidence else None) or ("INSUFFICIENT" if evidence_scope == "CURRENT_MARKET_ONLY" else "LOW"),
             "evidence_scope": evidence_scope,
             "fallback_context": fallback_context,
-            "history_start_date": exact_history.get("history_start_date"),
-            "history_end_date": exact_history.get("history_end_date"),
+            "history_start_date": exact_history.get("history_start_date") if exact_history else None,
+            "history_end_date": exact_history.get("history_end_date") if exact_history else None,
         })
 
     if not candidate_records:
@@ -11852,7 +11982,12 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
     ranked["_current_supply"] = pd.to_numeric(ranked["current_listings"], errors="coerce")
     ranked["_history_depth"] = pd.to_numeric(ranked["turnover_sample_size"], errors="coerce")
     ranked["_price_reduction"] = pd.to_numeric(ranked["historical_price_reduction_rate"], errors="coerce")
-    ranked["_scope_score"] = ranked["evidence_scope"].map({"EXACT_CATEGORY_YEAR": 1.0, "MODEL_YEAR_FALLBACK": 0.58}).fillna(0.4)
+    ranked["_scope_score"] = ranked["evidence_scope"].map({
+        "EXACT_CATEGORY_YEAR": 1.0,
+        "MODEL_YEAR_FALLBACK": 0.62,
+        "EXACT_THIN": 0.56,
+        "CURRENT_MARKET_ONLY": 0.28,
+    }).fillna(0.4)
     ranked["_evidence_score"] = ranked["evidence_quality"].map({"HIGH": 1.0, "MEDIUM": 0.70, "LOW": 0.38}).fillna(0.25)
 
     ranked["_turnover_score"] = _pct_rank(ranked["_turnover"], higher_is_better=True).fillna(0.25)
@@ -12591,6 +12726,8 @@ Writing rules:
 - `active_competing_listings`, `starting_price_gbp`, `median_asking_price_gbp`, and selected-price-range current examples are ALWAYS exact current-market statistics for that displayed Year + Brand + Model + Category.
 - `evidence_scope` tells you the scope of the HISTORICAL TURNOVER statistics. `EXACT_CATEGORY_YEAR` means they were rebuilt directly from distinct listing histories for the displayed Year + Brand + Model + Category. In this exact case, DO NOT waste words explaining the evidence level or saying that the statistics are exact; simply use the statistics naturally.
 - `MODEL_YEAR_FALLBACK` is used only when the exact category-year turnover sample is too small to support a useful liquidity read. In that case the turnover statistics use the SAME YEAR + BRAND + MODEL across categories. You MUST state this limitation once, naturally and concisely. Never imply that fallback turnover figures are category-specific, and never pool different years.
+- `EXACT_THIN` means the turnover figures are still exact to the displayed Year + Brand + Model + Category, but the eligible sample is small. State that the liquidity signal is directional because the exact sample is thin; do not broaden the claim.
+- `CURRENT_MARKET_ONLY` means reliable historical turnover could not be established. Explain the option using exact current competition and asking-price evidence only, explicitly noting that historical turnover is unavailable. Do not invent demand or liquidity claims.
 - `exact_historical_distinct_listings` is the number of distinct listing histories observed for the exact displayed Year + Brand + Model + Category. `turnover_sample_size` is the eligible sample supporting the 60-day turnover statistic and may be smaller because censored histories are excluded. Do not conflate these two numbers. Prefer the turnover sample when explaining the reliability of a turnover percentage.
 - Usually leave `exact_historical_distinct_listings` to the evidence strip rather than quoting it in the prose. If you discuss how well-supported a turnover percentage is, use `turnover_sample_size`; never write as though every historical listing was necessarily eligible for the 60-day statistic.
 - When `fallback_context` is present, it gives the exact category-year sample and the broader same-year model sample that justified the fallback. Mention it only to explain why a fallback was necessary; do not turn it into a second block of statistics.
