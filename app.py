@@ -9754,79 +9754,92 @@ def _guided_list_arg(name):
 
 
 def _guided_classify_row(row):
-    """Return the finite AI-assistant vehicle-type set for one market row.
+    """Return exactly one supported vehicle class for a guided-market row.
 
-    This is the same classification used by the guided selector, but it is kept
-    separate so we can precompute it once for the live market index instead of
-    re-running regex/profile logic for every request and every vehicle type.
+    The source marketplace's VehicleType is authoritative for unmistakable
+    classes such as motorcycles and ATVs.  Model profiles are used only to
+    refine broad car/4x4 rows (for example CAR -> SUV, or ARAZI -> PICKUP).
+
+    Keeping the classes mutually exclusive is important: selecting CAR must
+    never leak MOTORCYCLE/ATV rows into subsequent Brand/Model/Category facets.
+    This helper is used only by the AI assistant guided-market index.
     """
     brand = str(row.get("Brand") or "").strip()
     model = str(row.get("Model") or "").strip()
     profile = MODEL_PROFILE_LOOKUP.get((brand.casefold(), model.casefold()), {})
 
-    vt = str(profile.get("VehicleType") or row.get("VehicleType") or "").strip().upper()
-    body = str(profile.get("BodyStyle") or "").strip().upper()
-    raw_vt = str(row.get("VehicleType") or "").strip().casefold()
-    raw_type_key = (
-        raw_vt.replace("i̇", "i")
+    raw_vt = str(row.get("VehicleType") or "").strip()
+    raw_cf = (
+        raw_vt.casefold().replace("i̇", "i")
         .replace("ı", "i").replace("ş", "s").replace("ç", "c")
         .replace("ğ", "g").replace("ü", "u").replace("ö", "o")
     )
-    raw_type_key = re.sub(r"[^a-z0-9]+", "", raw_type_key)
-    if raw_type_key in {"gezi", "is", "cekici", "surat"}:
+    raw_words = re.sub(r"[^a-z0-9]+", " ", raw_cf).strip()
+    raw_key = raw_words.replace(" ", "")
+
+    # Non-supported source-taxonomy rows should never fall through to CAR.
+    if raw_key in {"gezi", "is", "cekici", "surat"}:
         return set()
 
-    matches = set()
-    if vt == "CAR" and body not in {"SUV", "CROSSOVER", "PICKUP"}:
-        matches.add("CAR")
-    if vt == "CAR" and body in {"SUV", "CROSSOVER"}:
-        matches.add("SUV")
-    if vt == "PICKUP" or body == "PICKUP":
-        matches.add("PICKUP")
-    if vt in {"MOTORCYCLE", "SCOOTER"} or body in {"MOTORCYCLE", "SCOOTER"}:
-        matches.add("MOTORCYCLE")
-    if vt in {"ATV", "UTV", "ATV/UTV", "ATV_UTV", "QUAD"} or body in {"ATV", "UTV", "ATV_UTV", "QUAD"}:
-        matches.add("ATV")
+    profile_vt = str(profile.get("VehicleType") or "").strip().upper()
+    body = str(profile.get("BodyStyle") or "").strip().upper().replace("-", "_")
 
-    if not matches:
-        if raw_vt == "otomobil":
-            matches.add("CAR")
-        elif "motosiklet" in raw_vt:
-            matches.add("MOTORCYCLE")
-        elif "atv" in raw_vt or "utv" in raw_vt:
-            matches.add("ATV")
-        elif "arazi" in raw_vt or "suv" in raw_vt or "pick-up" in raw_vt or "pickup" in raw_vt:
-            if body == "PICKUP":
-                matches.add("PICKUP")
-            elif body in {"SUV", "CROSSOVER"}:
-                matches.add("SUV")
-            else:
-                matches.update({"SUV", "PICKUP"})
+    # 1) Explicit source classes take precedence over model-profile defaults.
+    # This prevents motorcycle/ATV rows from being labelled CAR when a generic
+    # profile happens to exist for the same brand/model text.
+    if re.search(r"(?:^| )(?:motosiklet|motorcycle|scooter|vespa)(?: |$)", raw_words):
+        return {"MOTORCYCLE"}
+    if re.search(r"(?:^| )(?:atv|utv|quad)(?: |$)", raw_words):
+        return {"ATV"}
+    if re.search(r"(?:^| )(?:pick ?up|pickup|kamyonet)(?: |$)", raw_words):
+        return {"PICKUP"}
 
-    if not matches and vt:
-        if vt == "CAR":
-            matches.add("CAR")
-        elif vt in {"PICKUP", "MOTORCYCLE", "SCOOTER", "ATV", "UTV"}:
-            matches.add("MOTORCYCLE" if vt == "SCOOTER" else vt)
+    # ARAZI/4x4 is a broad marketplace bucket.  Let the profile distinguish a
+    # true pick-up; otherwise it belongs to SUV.  Never emit both classes.
+    if re.search(r"(?:^| )(?:arazi|suv|crossover|4x4)(?: |$)", raw_words):
+        if profile_vt == "PICKUP" or body == "PICKUP":
+            return {"PICKUP"}
+        return {"SUV"}
 
-    if not matches:
-        haystack = " ".join([
-            str(row.get("Brand") or ""), str(row.get("Model") or ""),
-            str(row.get("Category") or ""), str(row.get("CategoryDetail") or ""),
-            str(row.get("Link") or ""),
-        ]).casefold()
-        if re.search(r"\b(?:motosiklet|motorcycle|scooter|vespa)\b", haystack):
-            matches.add("MOTORCYCLE")
-        elif re.search(r"\b(?:atv|utv|quad)\b", haystack):
-            matches.add("ATV")
-        elif re.search(r"\b(?:pick[- ]?up|pickup)\b", haystack):
-            matches.add("PICKUP")
-        elif re.search(r"\b(?:suv|crossover)\b", haystack):
-            matches.add("SUV")
-        elif haystack.strip():
-            matches.add("CAR")
+    # 2) Refine ordinary car rows using the validated model/body profile.
+    if raw_key in {"otomobil", "car", "automobile", "araba"}:
+        if profile_vt == "PICKUP" or body == "PICKUP":
+            return {"PICKUP"}
+        if profile_vt in {"SUV", "CROSSOVER"} or body in {"SUV", "CROSSOVER"}:
+            return {"SUV"}
+        return {"CAR"}
 
-    return matches
+    # 3) If the source type is blank/unknown, use the profile as the next-best
+    # deterministic source.  Again, classification is intentionally exclusive.
+    if profile_vt in {"MOTORCYCLE", "SCOOTER"} or body in {"MOTORCYCLE", "SCOOTER"}:
+        return {"MOTORCYCLE"}
+    if profile_vt in {"ATV", "UTV", "ATV/UTV", "ATV_UTV", "QUAD"} or body in {"ATV", "UTV", "ATV/UTV", "ATV_UTV", "QUAD"}:
+        return {"ATV"}
+    if profile_vt == "PICKUP" or body == "PICKUP":
+        return {"PICKUP"}
+    if profile_vt in {"SUV", "CROSSOVER"} or body in {"SUV", "CROSSOVER"}:
+        return {"SUV"}
+    if profile_vt == "CAR":
+        return {"CAR"}
+
+    # 4) Conservative text fallback for genuinely unprofiled rows.  Inspecting
+    # Brand/Model/Category is useful, but special classes always win over CAR.
+    haystack = " ".join([
+        str(row.get("Brand") or ""), str(row.get("Model") or ""),
+        str(row.get("Category") or ""), str(row.get("CategoryDetail") or ""),
+        str(row.get("Link") or ""),
+    ]).casefold()
+    if re.search(r"\b(?:motosiklet|motorcycle|scooter|vespa)\b", haystack):
+        return {"MOTORCYCLE"}
+    if re.search(r"\b(?:atv|utv|quad)\b", haystack):
+        return {"ATV"}
+    if re.search(r"\b(?:pick[- ]?up|pickup|kamyonet)\b", haystack):
+        return {"PICKUP"}
+    if re.search(r"\b(?:suv|crossover|4x4|arazi)\b", haystack):
+        return {"SUV"}
+    if haystack.strip():
+        return {"CAR"}
+    return set()
 
 
 def _guided_type_matches(row, requested_types):
