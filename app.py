@@ -11935,10 +11935,14 @@ def _guided_stock_metrics_usable(metrics, minimum_sample=3):
 def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
     """Rank exact Year + Brand + Model + Category stock opportunities.
 
-    Current supply/pricing always comes from the exact live combination. Historical
-    turnover is rebuilt from raw listing histories at that same exact grain. Only
-    when the exact turnover sample is genuinely insufficient do we broaden one step
-    to same-year Brand + Model across categories; we never pool different years.
+    The selected listing-price range is only an eligibility filter for which exact
+    combinations can enter the shortlist. Once a combination qualifies, CURRENT
+    supply/pricing is measured across every active listing for that exact Year +
+    Brand + Model + Category, regardless of price band. HISTORICAL statistics are
+    rebuilt from every available listing history at that exact grain, again with no
+    price-band restriction. Only when the exact turnover sample is genuinely
+    insufficient do we broaden one step to same-year Brand + Model across categories;
+    we never pool different years.
     """
     if rows is None or rows.empty:
         return []
@@ -12817,14 +12821,14 @@ def api_guided_discovery_stock_recommendations():
                 "model": str(item.get("model") or ""),
                 "category": str(item.get("category") or ""),
                 "year": item.get("year"),
+                # The price-band selection only qualified this candidate for the
+                # shortlist. Every statistic below is deliberately full-market.
+                "market_statistics_scope": "FULL_EXACT_MARKET",
                 "active_competing_listings": item.get("current_listings"),
                 "competition_context_within_shortlist": item.get("competition_context"),
                 "starting_price_gbp": item.get("starting_price"),
                 "median_asking_price_gbp": item.get("median_price"),
-                "selected_price_range_current_examples": item.get("selected_price_range_listings"),
-                "selected_price_range_starting_price_gbp": item.get("selected_price_range_starting_price"),
-                "selected_price_range_median_price_gbp": item.get("selected_price_range_median_price"),
-                "selected_price_range_highest_price_gbp": item.get("selected_price_range_highest_price"),
+                "highest_asking_price_gbp": item.get("highest_price"),
                 "exact_historical_distinct_listings": item.get("historical_distinct_listings"),
                 "turnover_sample_size": item.get("turnover_sample_size"),
                 "median_observed_days_to_leave_market": item.get("median_observed_days_to_exit"),
@@ -12849,12 +12853,14 @@ Writing rules:
 - Rank 1-3: about 55-70 words. Ranks 4-5: about 35-50 words.
 - Give each candidate a short, distinct scan label such as "Best demand/competition balance", "Fast turnover, low competition", "Strong demand, crowded market", or "Low-competition opportunity" when supported.
 - Every recommendation is an exact YEAR + BRAND + MODEL + CATEGORY opportunity. Always name all four components; never collapse a candidate to brand-model or model-year only.
-- `active_competing_listings`, `starting_price_gbp`, `median_asking_price_gbp`, and selected-price-range current examples are ALWAYS exact current-market statistics for that displayed Year + Brand + Model + Category.
+- The commercial question is: which vehicles look attractive to import because they combine quick observed turnover with a manageable number of competing listings. Profit itself cannot be calculated here because acquisition, shipping, preparation and tax costs are unknown.
+- `market_statistics_scope` is `FULL_EXACT_MARKET`. The user's selected listing-price band was used ONLY to decide whether this candidate belongs in the shortlist. It MUST NOT limit or redefine any statistic in this recommendation.
+- `active_competing_listings` is the count of ALL currently active listings for the exact displayed Year + Brand + Model + Category across ALL asking prices. `starting_price_gbp`, `median_asking_price_gbp`, and `highest_asking_price_gbp` are likewise calculated across ALL active listings for that exact vehicle, not merely listings inside the selected price band.
 - `evidence_scope` tells you the scope of the HISTORICAL TURNOVER statistics. `EXACT_CATEGORY_YEAR` means they were rebuilt directly from distinct listing histories for the displayed Year + Brand + Model + Category. In this exact case, DO NOT waste words explaining the evidence level or saying that the statistics are exact; simply use the statistics naturally.
 - `MODEL_YEAR_FALLBACK` is used only when the exact category-year turnover sample is too small to support a useful liquidity read. In that case the turnover statistics use the SAME YEAR + BRAND + MODEL across categories. You MUST state this limitation once, naturally and concisely. Never imply that fallback turnover figures are category-specific, and never pool different years.
 - `EXACT_THIN` means the turnover figures are still exact to the displayed Year + Brand + Model + Category, but the eligible sample is small. State that the liquidity signal is directional because the exact sample is thin; do not broaden the claim.
 - `CURRENT_MARKET_ONLY` means reliable historical turnover could not be established. Explain the option using exact current competition and asking-price evidence only, explicitly noting that historical turnover is unavailable. Do not invent demand or liquidity claims.
-- `exact_historical_distinct_listings` is the number of distinct listing histories observed for the exact displayed Year + Brand + Model + Category. `turnover_sample_size` is the eligible sample supporting the 60-day turnover statistic and may be smaller because censored histories are excluded. Do not conflate these two numbers. Prefer the turnover sample when explaining the reliability of a turnover percentage.
+- `exact_historical_distinct_listings` is the number of ALL distinct listing histories observed for the exact displayed Year + Brand + Model + Category across ALL asking-price levels. `turnover_sample_size`, the 60-day exit statistic, median observed exit time, and historical price-reduction rate are also calculated from the full available historical universe at the applicable evidence scope; the selected listing-price band never filters them. `turnover_sample_size` may still be smaller than total history because censored histories are excluded. Do not conflate these two numbers. Prefer the turnover sample when explaining the reliability of a turnover percentage.
 - Usually leave `exact_historical_distinct_listings` to the evidence strip rather than quoting it in the prose. If you discuss how well-supported a turnover percentage is, use `turnover_sample_size`; never write as though every historical listing was necessarily eligible for the 60-day statistic.
 - When `fallback_context` is present, it gives the exact category-year sample and the broader same-year model sample that justified the fallback. Mention it only to explain why a fallback was necessary; do not turn it into a second block of statistics.
 - Focus on demand/turnover first, then ACTIVE LOCAL COMPETITION, then asking-price context. Mention only the 2-4 facts that materially explain the ranking.
@@ -12864,9 +12870,9 @@ Writing rules:
 - If `active_competing_listings` is 1, never describe the asking price as a market median/typical price. Say the only current competing example is advertised at X if useful.
 - Explain the implication of the statistics rather than dumping numbers. For example, "72% were no longer advertised within 60 days and the median observed exit was 34 days, giving this one of the stronger turnover signals in the shortlist."
 - Use historical asking-price reductions only as a caution about price pressure; do not infer margin or wholesale acquisition cost.
-- The user may have selected one or more DESIRED LISTING-PRICE RANGES. Those ranges define the retail market segment the dealer wants to target; they are not an acquisition budget. If `selected_price_range_current_examples` is positive, you MAY clearly say the candidate has current examples within the dealer's desired listing-price range/segment, and you may quote the supplied selected-range prices.
+- The user may have selected one or more DESIRED LISTING-PRICE RANGES. Those ranges are an eligibility filter defining the retail segment the dealer wants to target, not a statistical scope and not an acquisition budget. Because every supplied candidate already qualified for that segment, there is normally no need to repeat the price-band selection in the prose. NEVER use it as the denominator for competition, turnover, historical depth or pricing statistics.
 - Advertised asking prices are retail-market context only. NEVER infer dealer acquisition affordability, wholesale cost or a stock-purchase budget from an advertised price.
-- Do not imply profit. The dealer's actual acquisition cost, preparation cost and margin are unknown.
+- Do not claim a profit or margin. You may describe a vehicle as commercially attractive to import because of turnover and competition, but actual profit depends on landed acquisition and preparation cost, which are unknown.
 - Compare candidates to each other where useful. Make the commercial trade-off explicit: strong turnover with low/moderate active competition is especially attractive; strong turnover with many active competitors can still work but is a more crowded opportunity. Tell the dealer when a lower-ranked option would make more sense than the one above it.
 - Avoid internal jargon such as OpportunityPercentile, AcquisitionSignal, confidence-adjusted index, evidence base or algorithm.
 - Avoid repeated stock phrases. Each recommendation should feel written for that vehicle.
@@ -12877,7 +12883,7 @@ Writing rules:
             "selection_context": {
                 "minimum_year": data.get("min_year"),
                 "desired_listing_price_ranges": selected_listing_price_labels or ["All listing-price ranges"],
-                "asking_price_note": "Selected listing-price ranges define the desired retail market segment. Advertised asking prices are still not dealer acquisition cost.",
+                "asking_price_note": "Selected listing-price ranges are only an opportunity filter. All competition, current-price and historical-turnover statistics in each candidate describe the full exact market for that vehicle across all asking prices. Advertised asking prices are not dealer acquisition cost.",
             },
             "ranked_stock_candidates": clean_candidates,
         }
