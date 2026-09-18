@@ -9459,6 +9459,154 @@ def _request_access_context(data=None):
     )
 
 
+
+def _normalise_fraction(value):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    if abs(numeric) > 1 and abs(numeric) <= 100:
+        numeric = numeric / 100.0
+    return numeric
+
+
+def _business_advertising_recommendations(company, limit=5):
+    """Rank current dealership stock by where paid visibility is most defensible.
+
+    Advertising is treated as a visibility lever, not a substitute for pricing.
+    The score therefore combines stock-age pressure, historical market turnover,
+    competitive price position and evidence quality. Vehicles that are clearly
+    high-priced versus current comparables are penalised because repricing may be
+    the more appropriate first action.
+    """
+    if not company or business_stock_df is None or business_stock_df.empty:
+        return []
+
+    work = business_stock_df[
+        business_stock_df["Company"].fillna("").astype(str).str.casefold()
+        == str(company).casefold()
+    ].copy()
+    if work.empty:
+        return []
+
+    price_scores = {
+        "LOW": 1.00,
+        "LOW_MID": 0.92,
+        "MID_MARKET": 0.82,
+        "HIGH_MID": 0.48,
+        "HIGH": 0.22,
+    }
+    confidence_scores = {"HIGH": 1.0, "MEDIUM": 0.78, "LOW": 0.48}
+
+    ranked = []
+    for row in work.to_dict("records"):
+        public = _business_manage_row_public(row)
+        age = public.get("listing_age_days")
+        median_days = public.get("historical_median_days_to_exit")
+        exit60 = _normalise_fraction(public.get("historical_exit60_rate"))
+        price_position = str(public.get("price_position") or "").strip().upper()
+        liquidity_conf = str(public.get("liquidity_confidence") or "").strip().upper()
+        comparable_conf = str(public.get("comparable_confidence") or "").strip().upper()
+
+        if age is not None and median_days not in [None, 0]:
+            ratio = max(float(age), 0.0) / max(float(median_days), 1.0)
+            age_score = min(max((ratio - 0.45) / 1.55, 0.0), 1.0)
+        elif age is not None:
+            age_score = min(max(float(age), 0.0) / 180.0, 1.0) * 0.72
+        else:
+            age_score = 0.20
+
+        if exit60 is not None:
+            liquidity_score = min(max(exit60, 0.0), 1.0)
+        elif median_days is not None:
+            liquidity_score = min(max(1.0 - (float(median_days) / 180.0), 0.08), 0.92)
+        else:
+            liquidity_score = 0.35
+
+        price_score = price_scores.get(price_position, 0.62)
+        evidence_score = (
+            confidence_scores.get(liquidity_conf, 0.55)
+            + confidence_scores.get(comparable_conf, 0.55)
+        ) / 2.0
+
+        score = (
+            0.36 * age_score
+            + 0.34 * liquidity_score
+            + 0.22 * price_score
+            + 0.08 * evidence_score
+        )
+        # Advertising should not be presented as the first fix for a vehicle whose
+        # asking price is already materially high versus the market.
+        if price_position == "HIGH":
+            score -= 0.11
+        elif price_position == "HIGH_MID":
+            score -= 0.05
+        score = max(0.0, min(score, 1.0))
+
+        public["promotion_score"] = round(score, 4)
+        public["historical_exit60_rate"] = exit60
+        public["historical_distinct_listings"] = int(row["HistoricalDistinctListings"]) if pd.notna(row.get("HistoricalDistinctListings")) else None
+        ranked.append(public)
+
+    ranked.sort(
+        key=lambda item: (
+            float(item.get("promotion_score") or 0),
+            float(item.get("listing_age_days") or 0),
+            -abs(float(item.get("price_vs_median_pct") or 0)),
+        ),
+        reverse=True,
+    )
+    return ranked[:max(1, min(int(limit or 5), 8))]
+
+
+@app.route("/api/guided/business/ad-recommendations", methods=["POST"])
+def api_guided_business_ad_recommendations():
+    """Rank a gallery's own active stock for advertising allocation.
+
+    In enforced commercial mode the organisation comes only from the verified
+    entitlement. During owner-preview/shadow mode the existing gallery selector
+    may supply a recognised company name for product testing.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        manager = get_access_manager()
+        context = _request_access_context(data)
+        g.otodeger_access_context = context
+        requested_business = _normalize_access_tier(data.get("access_tier") or data.get("tier")) == "BUSINESS"
+
+        if manager.enforcement_enabled:
+            if not requested_business or not context.business_entitled:
+                raise BusinessAccessRequired("An authorised Business account is required")
+            manager.activate_business_device(context)
+            company = str(context.org_name or "").strip()
+        elif context.business_entitled and requested_business and context.org_name:
+            company = str(context.org_name).strip()
+        else:
+            company = _resolve_business_company(
+                "",
+                requested_company=str(data.get("business_company") or "").strip() or None,
+            )
+
+        if not company:
+            return jsonify({"success": False, "error": "BUSINESS_COMPANY_REQUIRED", "recommendations": []}), 400
+
+        recommendations = _business_advertising_recommendations(company, limit=data.get("limit") or 5)
+        return jsonify({
+            "success": True,
+            "company": company,
+            "recommendations": recommendations,
+            "count": len(recommendations),
+        })
+    except AccessControlError as exc:
+        return _access_control_error_response(exc)
+    except Exception as exc:
+        print("BUSINESS AD RECOMMENDATIONS FAILED:", repr(exc), flush=True)
+        traceback.print_exc()
+        return jsonify({"success": False, "error": "BUSINESS_AD_RECOMMENDATIONS_UNAVAILABLE", "recommendations": []}), 503
+
+
 @app.route("/api/business/galleries", methods=["GET"])
 def api_business_gallery_options():
     """Return gallery names that have Business intelligence coverage.
