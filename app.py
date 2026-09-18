@@ -11982,6 +11982,207 @@ def _guided_stock_history_frame():
     return payload
 
 
+
+def _guided_stock_history_metrics_bulk(current_groups):
+    """Precompute turnover metrics for all current stock candidates in one pass.
+
+    The older implementation filtered and regrouped the full daily listing-history
+    frame once for every candidate (and often a second time for the same-year
+    model fallback). Broad dealer selections can produce dozens of exact
+    Year+Brand+Model+Category candidates, turning one report request into many
+    repeated scans of the same large dataframe.
+
+    This routine narrows the history once to the model-years actually present in
+    the current shortlist universe, reduces it to one row per distinct listing,
+    and fills the existing metrics cache for both exact category-year and
+    same-year model scopes. Subsequent `_guided_stock_history_metrics` lookups are
+    therefore O(1) for this request.
+    """
+    prepared = _guided_stock_history_frame()
+    if not prepared or not current_groups:
+        return
+
+    work = prepared.get("frame")
+    if work is None or work.empty:
+        return
+
+    wanted_model_year = set()
+    wanted_exact = set()
+    for item in current_groups:
+        brand = str(item.get("brand") or "").strip().casefold()
+        model = str(item.get("model") or "").strip().casefold()
+        category = str(item.get("category") or "").strip().casefold()
+        try:
+            year = int(float(item.get("year")))
+        except (TypeError, ValueError):
+            continue
+        if not brand or not model:
+            continue
+        wanted_model_year.add((brand, model, year))
+        if category:
+            wanted_exact.add((brand, model, category, year))
+
+    if not wanted_model_year:
+        return
+
+    # Filter once. Constructing a temporary MultiIndex is materially faster than
+    # N dataframe scans for broad selections and does not mutate the cached frame.
+    model_index = pd.MultiIndex.from_arrays(
+        [work["_brand"], work["_model"], work["_year"]],
+        names=["brand", "model", "year"],
+    )
+    wanted_index = pd.MultiIndex.from_tuples(
+        list(wanted_model_year), names=["brand", "model", "year"]
+    )
+    subset = work.loc[model_index.isin(wanted_index)].copy()
+    if subset.empty:
+        return
+
+    listing_cols = ["_brand", "_model", "_year", "_category", "_link"]
+    subset = (
+        subset.sort_values(listing_cols + ["_date"], kind="stable")
+        .drop_duplicates(subset=listing_cols + ["_date"], keep="last")
+    )
+    subset["_price_numeric"] = pd.to_numeric(subset["_price"], errors="coerce")
+    subset["_price_diff"] = subset.groupby(listing_cols, sort=False)["_price_numeric"].diff()
+    subset["_price_reduced_step"] = subset["_price_diff"].lt(-0.5)
+
+    # Reduce the daily history to one row per exact listing before computing any
+    # candidate statistics. This is usually orders of magnitude smaller.
+    listing_summary = (
+        subset.groupby(listing_cols, sort=False, dropna=False)
+        .agg(
+            first_seen=("_date", "min"),
+            last_seen=("_date", "max"),
+            valid_price_count=("_price_numeric", "count"),
+            had_reduction=("_price_reduced_step", "max"),
+        )
+        .reset_index()
+    )
+    if listing_summary.empty:
+        return
+
+    dataset_first = prepared["earliest"]
+    dataset_last = prepared["latest"]
+    listing_summary["left_censored"] = listing_summary["first_seen"].le(dataset_first)
+    listing_summary["exited"] = listing_summary["last_seen"].lt(dataset_last)
+    listing_summary["observed_days"] = (
+        (listing_summary["last_seen"] - listing_summary["first_seen"]).dt.days + 1
+    ).clip(lower=1)
+    listing_summary["current_observed_age"] = (
+        (dataset_last - listing_summary["first_seen"]).dt.days + 1
+    ).clip(lower=1)
+    listing_summary["turnover_eligible"] = (
+        ~listing_summary["left_censored"]
+        & (
+            listing_summary["exited"]
+            | listing_summary["current_observed_age"].ge(60)
+        )
+    )
+    listing_summary["exit60_success"] = (
+        listing_summary["turnover_eligible"]
+        & listing_summary["exited"]
+        & listing_summary["observed_days"].le(60)
+    )
+    listing_summary["exit_duration_eligible"] = (
+        ~listing_summary["left_censored"] & listing_summary["exited"]
+    )
+    listing_summary["price_pressure_eligible"] = listing_summary["valid_price_count"].ge(2)
+    listing_summary["had_reduction"] = listing_summary["had_reduction"].fillna(False).astype(bool)
+
+    def summarize(group):
+        distinct = int(len(group))
+        turnover_sample = int(group["turnover_eligible"].sum())
+        exits = group.loc[group["exit_duration_eligible"], "observed_days"]
+        exit_count = int(len(exits))
+        median_exit = float(exits.median()) if exit_count else None
+        success_count = int(group["exit60_success"].sum())
+        exit60_rate = (float(success_count) / float(turnover_sample)) if turnover_sample else None
+        price_eligible = int(group["price_pressure_eligible"].sum())
+        reduced = int((group["price_pressure_eligible"] & group["had_reduction"]).sum())
+        reduction_rate = (float(reduced) / float(price_eligible)) if price_eligible else None
+        turnover_sufficient = bool(
+            turnover_sample >= 5
+            and exit_count >= 3
+            and exit60_rate is not None
+            and median_exit is not None
+        )
+        quality = (
+            "HIGH" if turnover_sample >= 30 and exit_count >= 20
+            else "MEDIUM" if turnover_sample >= 15 and exit_count >= 10
+            else "LOW" if turnover_sufficient
+            else "INSUFFICIENT"
+        )
+        return {
+            "historical_distinct_listings": distinct,
+            "turnover_sample_size": turnover_sample,
+            "observed_exit_count": exit_count,
+            "median_observed_days_to_exit": median_exit,
+            "observed_exit_within_60_days_rate": exit60_rate,
+            "historical_price_reduction_rate": reduction_rate,
+            "price_pressure_sample_size": price_eligible,
+            "evidence_quality": quality,
+            "turnover_sufficient": turnover_sufficient,
+            "history_start_date": dataset_first.date().isoformat(),
+            "history_end_date": dataset_last.date().isoformat(),
+            "evidence_source": "RAW_DAILY_HISTORY",
+        }
+
+    # Exact Year + Brand + Model + Category cache.
+    for key_values, group in listing_summary.groupby(
+        ["_brand", "_model", "_category", "_year"], sort=False, dropna=False
+    ):
+        brand, model, category, year = key_values
+        exact_key = (str(brand), str(model), str(category), int(year))
+        if exact_key not in wanted_exact:
+            continue
+        prepared["metrics"][(str(brand), str(model), str(category), int(year))] = summarize(group)
+
+    # Same-year Brand + Model fallback cache. Collapse category splits so a listing
+    # is counted once even if its category label changed between observations.
+    model_listing_summary = (
+        listing_summary.groupby(["_brand", "_model", "_year", "_link"], sort=False, dropna=False)
+        .agg(
+            first_seen=("first_seen", "min"),
+            last_seen=("last_seen", "max"),
+            valid_price_count=("valid_price_count", "sum"),
+            had_reduction=("had_reduction", "max"),
+        )
+        .reset_index()
+    )
+    model_listing_summary["left_censored"] = model_listing_summary["first_seen"].le(dataset_first)
+    model_listing_summary["exited"] = model_listing_summary["last_seen"].lt(dataset_last)
+    model_listing_summary["observed_days"] = (
+        (model_listing_summary["last_seen"] - model_listing_summary["first_seen"]).dt.days + 1
+    ).clip(lower=1)
+    model_listing_summary["current_observed_age"] = (
+        (dataset_last - model_listing_summary["first_seen"]).dt.days + 1
+    ).clip(lower=1)
+    model_listing_summary["turnover_eligible"] = (
+        ~model_listing_summary["left_censored"]
+        & (model_listing_summary["exited"] | model_listing_summary["current_observed_age"].ge(60))
+    )
+    model_listing_summary["exit60_success"] = (
+        model_listing_summary["turnover_eligible"]
+        & model_listing_summary["exited"]
+        & model_listing_summary["observed_days"].le(60)
+    )
+    model_listing_summary["exit_duration_eligible"] = (
+        ~model_listing_summary["left_censored"] & model_listing_summary["exited"]
+    )
+    model_listing_summary["price_pressure_eligible"] = model_listing_summary["valid_price_count"].ge(2)
+    model_listing_summary["had_reduction"] = model_listing_summary["had_reduction"].fillna(False).astype(bool)
+
+    for key_values, group in model_listing_summary.groupby(
+        ["_brand", "_model", "_year"], sort=False, dropna=False
+    ):
+        brand, model, year = key_values
+        model_key = (str(brand), str(model), int(year))
+        if model_key not in wanted_model_year:
+            continue
+        prepared["metrics"][(str(brand), str(model), "__MODEL_YEAR__", int(year))] = summarize(group)
+
+
 def _guided_stock_history_metrics(brand, model, year, category=None):
     """Compute observed turnover statistics from distinct listing histories.
 
@@ -12407,6 +12608,21 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
     if not current_groups:
         return []
 
+    # Prefill all exact and same-year historical metrics in one pass. Without this,
+    # broad selections repeatedly scan/group the full daily-history dataframe for
+    # every candidate and can leave the browser waiting for a minute or more.
+    _stock_history_started = time.perf_counter()
+    try:
+        _guided_stock_history_metrics_bulk(current_groups)
+    except Exception as exc:
+        print("GUIDED STOCK BULK HISTORY PREFILL FAILED:", repr(exc), flush=True)
+    finally:
+        print(
+            f"GUIDED STOCK HISTORY PREFILL: {len(current_groups)} candidates in "
+            f"{time.perf_counter() - _stock_history_started:.3f}s",
+            flush=True,
+        )
+
     candidate_records = []
     for current in current_groups:
         raw_exact = _guided_stock_history_metrics(
@@ -12749,7 +12965,7 @@ def api_guided_discovery_result():
         # Enrich the guided buyer groups with the existing historical buyer-intelligence
         # evidence so Personal recommendations can rank resale/demand preferences without
         # changing any standalone valuation routes or calculations.
-        if groups:
+        if groups and task != "STOCK_PURCHASE":
             hard_results = [
                 {
                     "brand": str(row.get("Brand") or ""),
@@ -12839,6 +13055,7 @@ def api_guided_discovery_result():
 
         stock_opportunities = []
         if task == "STOCK_PURCHASE":
+            _stock_rank_started = time.perf_counter()
             try:
                 stock_opportunities = _guided_stock_opportunities(
                     rows, limit=5, listing_price_ranges=listing_price_ranges
@@ -12857,6 +13074,11 @@ def api_guided_discovery_result():
                 stock_opportunities = _guided_stock_current_market_fallback(
                     rows, limit=5, listing_price_ranges=listing_price_ranges
                 )
+            print(
+                f"GUIDED STOCK RANKING TOTAL: {len(stock_opportunities)} selected from "
+                f"{len(rows)} qualifying live rows in {time.perf_counter() - _stock_rank_started:.3f}s",
+                flush=True,
+            )
 
         result_cols = [c for c in ("Brand", "Model", "CategoryDetail", "Year", "Price", "KM", "_guided_km_reliable", "Company", "Color", "Transmission", "Location", "Image", "Link") if c in rows.columns]
         posted_rows = rows
@@ -13304,7 +13526,7 @@ Writing rules:
                 "instructions": instructions,
                 "input": json.dumps(payload, ensure_ascii=False),
             },
-            timeout=(2.0, 18.0),
+            timeout=(2.0, 10.0),
         )
         response.raise_for_status()
         text = str(extract_response_text(response.json()) or "").strip()
