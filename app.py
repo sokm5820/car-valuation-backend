@@ -12486,14 +12486,15 @@ def _guided_stock_metrics_usable(metrics, minimum_sample=3):
 
 
 
-def _guided_stock_current_market_fallback(rows, limit=5, listing_price_ranges=None):
+def _guided_stock_current_market_fallback(rows, limit=5, listing_price_ranges=None, max_listing_price=None):
     """Return exact current-market stock candidates when turnover evidence fails.
 
     This is a resilience path, not a substitute for historical ranking.  The
-    dealer's selected listing-price bands still determine which exact
-    Year+Brand+Model+Category combinations qualify.  Once qualified, current
+    the dealer's maximum desired advertised listing price determines which exact
+    Year+Brand+Model+Category combinations qualify. Once qualified, current
     competition/pricing is measured against ALL live listings for that exact
-    combination.  No turnover, demand or liquidity claim is manufactured.
+    combination. This ceiling is a retail-market filter, not acquisition spend.
+    No turnover, demand or liquidity claim is manufactured.
     """
     if rows is None or rows.empty:
         return []
@@ -12563,6 +12564,9 @@ def _guided_stock_current_market_fallback(rows, limit=5, listing_price_ranges=No
             "selected_price_range_starting_price": float(qualifying_prices.min()) if not qualifying_prices.empty else None,
             "selected_price_range_median_price": float(qualifying_prices.median()) if not qualifying_prices.empty else None,
             "selected_price_range_highest_price": float(qualifying_prices.max()) if not qualifying_prices.empty else None,
+            "desired_listing_range_listings": int(len(qualifying_prices)) if not qualifying_prices.empty else 0,
+            "desired_listing_range_starting_price": float(qualifying_prices.min()) if not qualifying_prices.empty else None,
+            "maximum_desired_listing_price": float(max_listing_price) if max_listing_price is not None else None,
             "historical_distinct_listings": None,
             "turnover_sample_size": None,
             "median_observed_days_to_exit": None,
@@ -12614,15 +12618,15 @@ def _guided_stock_current_market_fallback(rows, limit=5, listing_price_ranges=No
         item["stock_rank_score"] = None
     return selected
 
-def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
+def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None, max_listing_price=None):
     """Rank exact Year + Brand + Model + Category stock opportunities.
 
-    The selected listing-price range is only an eligibility filter for which exact
-    combinations can enter the shortlist. Once a combination qualifies, CURRENT
-    supply/pricing is measured across every active listing for that exact Year +
-    Brand + Model + Category, regardless of price band. HISTORICAL statistics are
+    The maximum desired advertised listing price is only an eligibility ceiling for
+    which exact combinations can enter the shortlist. Once a combination qualifies,
+    CURRENT supply/pricing is measured across every active listing for that exact
+    Year + Brand + Model + Category, regardless of price. HISTORICAL statistics are
     rebuilt from every available listing history at that exact grain, again with no
-    price-band restriction. Only when the exact turnover sample is genuinely
+    price-ceiling restriction. Only when the exact turnover sample is genuinely
     insufficient do we broaden one step to same-year Brand + Model across categories;
     we never pool different years.
     """
@@ -12873,7 +12877,7 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
     result = []
     for row in selected:
         selected_range_stats = {"count": None, "min": None, "median": None, "max": None}
-        if selected_listing_price_ranges:
+        if selected_listing_price_ranges or max_listing_price is not None:
             exact = exact_rows[
                 exact_rows["_brand_key"].eq(str(row.get("brand_key") or ""))
                 & exact_rows["_model_key2"].eq(str(row.get("model_key") or ""))
@@ -12909,6 +12913,9 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
             "selected_price_range_starting_price": selected_range_stats["min"],
             "selected_price_range_median_price": selected_range_stats["median"],
             "selected_price_range_highest_price": selected_range_stats["max"],
+            "desired_listing_range_listings": selected_range_stats["count"],
+            "desired_listing_range_starting_price": selected_range_stats["min"],
+            "maximum_desired_listing_price": float(max_listing_price) if max_listing_price is not None else None,
             "historical_distinct_listings": row.get("historical_distinct_listings"),
             "turnover_sample_size": row.get("turnover_sample_size"),
             "median_observed_days_to_exit": row.get("median_observed_days_to_exit"),
@@ -12955,12 +12962,11 @@ def api_guided_discovery_result():
         else:
             max_budget = float(max_budget)
 
-        listing_price_ranges = _guided_normalize_listing_price_ranges(answers.get("priceRanges") or [])
-
-        # Personal buying budget can cap retail asking prices. A dealership's
-        # stock-purchase budget cannot: advertised prices describe the resale
-        # market, not the gallery's eventual acquisition cost.
-        listing_budget_ceiling = None if task == "STOCK_PURCHASE" else max_budget
+        # Legacy listing-price bands are ignored for new Stock Purchase journeys.
+        # The Stock Purchase `budget` is deliberately a MAXIMUM ADVERTISED LISTING
+        # PRICE used to define the target retail segment. It is not acquisition cost.
+        listing_price_ranges = tuple() if task == "STOCK_PURCHASE" else _guided_normalize_listing_price_ranges(answers.get("priceRanges") or [])
+        listing_budget_ceiling = max_budget
 
         rows = _guided_index_filter(
             index,
@@ -12969,7 +12975,7 @@ def api_guided_discovery_result():
             brands=brands,
             model_keys=model_keys,
             max_budget=listing_budget_ceiling,
-            price_ranges=listing_price_ranges if task == "STOCK_PURCHASE" else None,
+            price_ranges=None,
         )
         rows = _guided_apply_category_keys(rows, category_keys)
 
@@ -13150,7 +13156,7 @@ def api_guided_discovery_result():
             _stock_rank_started = time.perf_counter()
             try:
                 stock_opportunities = _guided_stock_opportunities(
-                    rows, limit=5, listing_price_ranges=listing_price_ranges
+                    rows, limit=5, listing_price_ranges=None, max_listing_price=max_budget
                 )
             except Exception as stock_exc:
                 # A history-source/schema problem must never take down the whole
@@ -13159,12 +13165,12 @@ def api_guided_discovery_result():
                 print("GUIDED STOCK OPPORTUNITY RANKING FAILED:", repr(stock_exc), flush=True)
                 traceback.print_exc()
                 stock_opportunities = _guided_stock_current_market_fallback(
-                    rows, limit=5, listing_price_ranges=listing_price_ranges
+                    rows, limit=5, listing_price_ranges=None, max_listing_price=max_budget
                 )
 
             if not stock_opportunities:
                 stock_opportunities = _guided_stock_current_market_fallback(
-                    rows, limit=5, listing_price_ranges=listing_price_ranges
+                    rows, limit=5, listing_price_ranges=None, max_listing_price=max_budget
                 )
             print(
                 f"GUIDED STOCK RANKING TOTAL: {len(stock_opportunities)} selected from "
@@ -13527,8 +13533,14 @@ def api_guided_discovery_stock_recommendations():
             language = "EN"
         candidates = data.get("candidates") if isinstance(data.get("candidates"), list) else []
         candidates = [item for item in candidates[:5] if isinstance(item, dict)]
-        selected_listing_price_ranges = _guided_normalize_listing_price_ranges(data.get("price_ranges") or [])
-        selected_listing_price_labels = [label for label in (_guided_listing_price_range_label(key) for key in selected_listing_price_ranges) if label]
+        max_listing_price = data.get("max_listing_price")
+        try:
+            max_listing_price = float(max_listing_price) if max_listing_price not in [None, ""] else None
+            if max_listing_price is not None and (not math.isfinite(max_listing_price) or max_listing_price <= 0):
+                max_listing_price = None
+        except (TypeError, ValueError):
+            max_listing_price = None
+        no_maximum_listing_price = bool(data.get("no_maximum_listing_price"))
         if not candidates:
             return jsonify({"success": True, "recommendations": []})
 
@@ -13544,7 +13556,7 @@ def api_guided_discovery_stock_recommendations():
                 "model": str(item.get("model") or ""),
                 "category": str(item.get("category") or ""),
                 "year": item.get("year"),
-                # The price-band selection only qualified this candidate for the
+                # The listing-price ceiling only qualified this candidate for the
                 # shortlist. Every statistic below is deliberately full-market.
                 "market_statistics_scope": "FULL_EXACT_MARKET",
                 "active_competing_listings": item.get("current_listings"),
@@ -13552,6 +13564,9 @@ def api_guided_discovery_stock_recommendations():
                 "starting_price_gbp": item.get("starting_price"),
                 "median_asking_price_gbp": item.get("median_price"),
                 "highest_asking_price_gbp": item.get("highest_price"),
+                "desired_listing_range_listings": item.get("desired_listing_range_listings"),
+                "desired_listing_range_starting_price_gbp": item.get("desired_listing_range_starting_price"),
+                "maximum_desired_listing_price_gbp": max_listing_price,
                 "exact_historical_distinct_listings": item.get("historical_distinct_listings"),
                 "turnover_sample_size": item.get("turnover_sample_size"),
                 "median_observed_days_to_leave_market": item.get("median_observed_days_to_exit"),
@@ -13577,13 +13592,13 @@ Writing rules:
 - Give each candidate a short, distinct scan label such as "Best demand/competition balance", "Fast turnover, low competition", "Strong demand, crowded market", or "Low-competition opportunity" when supported.
 - Every recommendation is an exact YEAR + BRAND + MODEL + CATEGORY opportunity. Always name all four components; never collapse a candidate to brand-model or model-year only.
 - The commercial question is: which vehicles look attractive to import because they combine quick observed turnover with a manageable number of competing listings. Profit itself cannot be calculated here because acquisition, shipping, preparation and tax costs are unknown.
-- `market_statistics_scope` is `FULL_EXACT_MARKET`. The user's selected listing-price band was used ONLY to decide whether this candidate belongs in the shortlist. It MUST NOT limit or redefine any statistic in this recommendation.
-- `active_competing_listings` is the count of ALL currently active listings for the exact displayed Year + Brand + Model + Category across ALL asking prices. `starting_price_gbp`, `median_asking_price_gbp`, and `highest_asking_price_gbp` are likewise calculated across ALL active listings for that exact vehicle, not merely listings inside the selected price band.
+- `market_statistics_scope` is `FULL_EXACT_MARKET`. The user's maximum desired advertised listing price was used ONLY to decide whether this candidate belongs in the shortlist. It MUST NOT limit or redefine any statistic in this recommendation.
+- `active_competing_listings` is the count of ALL currently active listings for the exact displayed Year + Brand + Model + Category across ALL asking prices. `starting_price_gbp`, `median_asking_price_gbp`, and `highest_asking_price_gbp` are likewise calculated across ALL active listings for that exact vehicle, not merely listings below the user's listing-price ceiling.
 - `evidence_scope` tells you the scope of the HISTORICAL TURNOVER statistics. `EXACT_CATEGORY_YEAR` means they were rebuilt directly from distinct listing histories for the displayed Year + Brand + Model + Category. In this exact case, DO NOT waste words explaining the evidence level or saying that the statistics are exact; simply use the statistics naturally.
 - `MODEL_YEAR_FALLBACK` is used only when the exact category-year turnover sample is too small to support a useful liquidity read. In that case the turnover statistics use the SAME YEAR + BRAND + MODEL across categories. You MUST state this limitation once, naturally and concisely. Never imply that fallback turnover figures are category-specific, and never pool different years.
 - `EXACT_THIN` means the turnover figures are still exact to the displayed Year + Brand + Model + Category, but the eligible sample is small. State that the liquidity signal is directional because the exact sample is thin; do not broaden the claim.
 - `CURRENT_MARKET_ONLY` means reliable historical turnover could not be established. Explain the option using exact current competition and asking-price evidence only, explicitly noting that historical turnover is unavailable. Do not invent demand or liquidity claims.
-- `exact_historical_distinct_listings` is the number of ALL distinct listing histories observed for the exact displayed Year + Brand + Model + Category across ALL asking-price levels. `turnover_sample_size`, the 60-day exit statistic, median observed exit time, and historical price-reduction rate are also calculated from the full available historical universe at the applicable evidence scope; the selected listing-price band never filters them. `turnover_sample_size` may still be smaller than total history because censored histories are excluded. Do not conflate these two numbers. Prefer the turnover sample when explaining the reliability of a turnover percentage.
+- `exact_historical_distinct_listings` is the number of ALL distinct listing histories observed for the exact displayed Year + Brand + Model + Category across ALL asking-price levels. `turnover_sample_size`, the 60-day exit statistic, median observed exit time, and historical price-reduction rate are also calculated from the full available historical universe at the applicable evidence scope; the user's listing-price ceiling never filters them. `turnover_sample_size` may still be smaller than total history because censored histories are excluded. Do not conflate these two numbers. Prefer the turnover sample when explaining the reliability of a turnover percentage.
 - Usually leave `exact_historical_distinct_listings` to the evidence strip rather than quoting it in the prose. If you discuss how well-supported a turnover percentage is, use `turnover_sample_size`; never write as though every historical listing was necessarily eligible for the 60-day statistic.
 - When `fallback_context` is present, it gives the exact category-year sample and the broader same-year model sample that justified the fallback. Mention it only to explain why a fallback was necessary; do not turn it into a second block of statistics.
 - Focus on demand/turnover first, then ACTIVE LOCAL COMPETITION, then asking-price context. Mention only the 2-4 facts that materially explain the ranking.
@@ -13593,8 +13608,9 @@ Writing rules:
 - If `active_competing_listings` is 1, never describe the asking price as a market median/typical price. Say the only current competing example is advertised at X if useful.
 - Explain the implication of the statistics rather than dumping numbers. For example, "72% were no longer advertised within 60 days and the median observed exit was 34 days, giving this one of the stronger turnover signals in the shortlist."
 - Use historical asking-price reductions only as a caution about price pressure; do not infer margin or wholesale acquisition cost.
-- The user may have selected one or more DESIRED LISTING-PRICE RANGES. Those ranges are an eligibility filter defining the retail segment the dealer wants to target, not a statistical scope and not an acquisition budget. Because every supplied candidate already qualified for that segment, there is normally no need to repeat the price-band selection in the prose. NEVER use it as the denominator for competition, turnover, historical depth or pricing statistics.
-- Advertised asking prices are retail-market context only. NEVER infer dealer acquisition affordability, wholesale cost or a stock-purchase budget from an advertised price.
+- The user may have supplied a MAXIMUM DESIRED ADVERTISED LISTING PRICE. This is an eligibility ceiling defining the retail segment the dealer wants to target; it is NOT the amount the dealer expects to pay to acquire the vehicle. Because every supplied candidate already qualified, NEVER use the ceiling as the denominator for competition, turnover, historical depth or pricing statistics.
+- If `maximum_desired_listing_price_gbp` is present and `desired_listing_range_listings` is positive, you may naturally say that a current listing price sits within the user's desired range when it helps explain the recommendation. NEVER say the vehicle is "within budget" or imply acquisition affordability.
+- Advertised asking prices are retail-market context only. NEVER infer dealer acquisition affordability, wholesale cost or margin from an advertised price.
 - Do not claim a profit or margin. You may describe a vehicle as commercially attractive to import because of turnover and competition, but actual profit depends on landed acquisition and preparation cost, which are unknown.
 - Compare candidates to each other where useful. Make the commercial trade-off explicit: strong turnover with low/moderate active competition is especially attractive; strong turnover with many active competitors can still work but is a more crowded opportunity. Tell the dealer when a lower-ranked option would make more sense than the one above it.
 - Avoid internal jargon such as OpportunityPercentile, AcquisitionSignal, confidence-adjusted index, evidence base or algorithm.
@@ -13605,8 +13621,9 @@ Writing rules:
         payload = {
             "selection_context": {
                 "minimum_year": data.get("min_year"),
-                "desired_listing_price_ranges": selected_listing_price_labels or ["All listing-price ranges"],
-                "asking_price_note": "Selected listing-price ranges are only an opportunity filter. All competition, current-price and historical-turnover statistics in each candidate describe the full exact market for that vehicle across all asking prices. Advertised asking prices are not dealer acquisition cost.",
+                "maximum_desired_listing_price_gbp": max_listing_price,
+                "no_maximum_listing_price": no_maximum_listing_price,
+                "asking_price_note": "The maximum budget question refers only to the maximum advertised listing price of the retail segment the dealer wants to target. It is not dealer acquisition cost. All competition, current-price and historical-turnover statistics describe the full exact market for each vehicle across all asking prices.",
             },
             "ranked_stock_candidates": clean_candidates,
         }
