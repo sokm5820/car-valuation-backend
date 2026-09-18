@@ -10021,54 +10021,83 @@ def _business_activity_event_details(company, start, end, expected_metrics=None,
         "value_estimates_used": False,
     }
 
-    source_frame = (
-        business_activity_history_df
-        if BUSINESS_ACTIVITY_HISTORY_READY
-        and business_activity_history_df is not None
-        and not business_activity_history_df.empty
-        else pd.DataFrame()
-    )
-    if source_frame is None or source_frame.empty or not company:
+    if not company:
         return empty
 
-    source = source_frame.copy()
-    lower = {str(col).strip().casefold(): col for col in source.columns}
+    def _prepare_activity_source(candidate):
+        if candidate is None or not isinstance(candidate, pd.DataFrame) or candidate.empty:
+            return None
+        prepared = candidate.copy()
+        lower = {str(col).strip().casefold(): col for col in prepared.columns}
 
-    def _column(*names):
-        for name in names:
-            if name in source.columns:
-                return name
-            found = lower.get(str(name).strip().casefold())
-            if found:
-                return found
-        return None
+        def _find(*names):
+            for name in names:
+                if name in prepared.columns:
+                    return name
+                found = lower.get(str(name).strip().casefold())
+                if found:
+                    return found
+            return None
 
-    date_col = _column("DATE", "Date")
-    company_col = _column("Company", "Seller", "Dealer")
-    link_col = _column("Link", "URL", "Url")
-    price_col = _column("Price", "CurrentAskingPrice")
-    if not all([date_col, company_col, link_col, price_col]):
+        date_col_local = _find("DATE", "Date")
+        company_col_local = _find("Company", "Seller", "Dealer")
+        link_col_local = _find("Link", "URL", "Url")
+        price_col_local = _find("Price", "CurrentAskingPrice")
+        if not all([date_col_local, company_col_local, link_col_local, price_col_local]):
+            return None
+        prepared[date_col_local] = pd.to_datetime(prepared[date_col_local], errors="coerce")
+        prepared[price_col_local] = pd.to_numeric(prepared[price_col_local], errors="coerce")
+        prepared[company_col_local] = prepared[company_col_local].fillna("").astype(str).str.strip()
+        prepared[link_col_local] = prepared[link_col_local].fillna("").astype(str).str.strip()
+        target_company = _normalize_company_name(company)
+        prepared["_company_key"] = prepared[company_col_local].map(_normalize_company_name)
+        prepared = prepared[
+            prepared[date_col_local].notna()
+            & prepared[link_col_local].ne("")
+            & (prepared["_company_key"] == target_company)
+        ].copy()
+        if prepared.empty or prepared[date_col_local].dt.normalize().nunique() < 2:
+            return None
+        return {
+            "frame": prepared,
+            "date": date_col_local,
+            "company": company_col_local,
+            "link": link_col_local,
+            "price": price_col_local,
+            "brand": _find("Brand"),
+            "model": _find("Model"),
+            "category": _find("Category", "CategoryDetail"),
+            "year": _find("Year"),
+            "km": _find("KM", "Mileage"),
+        }
+
+    source_candidates = []
+    if BUSINESS_ACTIVITY_HISTORY_READY and business_activity_history_df is not None and not business_activity_history_df.empty:
+        source_candidates.append(business_activity_history_df)
+    # `ads_base.csv` is not the preferred activity source, but older deployments
+    # can still contain repeated daily observations there.  Use it as a defensive
+    # identity/detail fallback rather than returning an empty vehicle-level report.
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        source_candidates.append(df)
+
+    prepared_source = None
+    for candidate in source_candidates:
+        prepared_source = _prepare_activity_source(candidate)
+        if prepared_source is not None:
+            break
+    if prepared_source is None:
         return empty
 
-    brand_col = _column("Brand")
-    model_col = _column("Model")
-    category_col = _column("Category", "CategoryDetail")
-    year_col = _column("Year")
-    km_col = _column("KM", "Mileage")
-
-    source[date_col] = pd.to_datetime(source[date_col], errors="coerce")
-    source[price_col] = pd.to_numeric(source[price_col], errors="coerce")
-    source[company_col] = source[company_col].fillna("").astype(str).str.strip()
-    source[link_col] = source[link_col].fillna("").astype(str).str.strip()
-    target_company = _normalize_company_name(company)
-    source["_company_key"] = source[company_col].map(_normalize_company_name)
-    source = source[
-        source[date_col].notna()
-        & source[link_col].ne("")
-        & (source["_company_key"] == target_company)
-    ].copy()
-    if source.empty:
-        return empty
+    source = prepared_source["frame"]
+    date_col = prepared_source["date"]
+    company_col = prepared_source["company"]
+    link_col = prepared_source["link"]
+    price_col = prepared_source["price"]
+    brand_col = prepared_source["brand"]
+    model_col = prepared_source["model"]
+    category_col = prepared_source["category"]
+    year_col = prepared_source["year"]
+    km_col = prepared_source["km"]
 
     source["_activity_date"] = source[date_col].dt.normalize()
     source = source.sort_values(["_activity_date", link_col, date_col], kind="stable")
@@ -10324,6 +10353,56 @@ def _business_activity_event_details(company, start, end, expected_metrics=None,
             "price_increase_value": increase_value,
         }
 
+    # Supplement the flat vehicle-detail feed directly from every raw snapshot
+    # transition in the requested window.  Aggregate company-day builders and the
+    # raw scraper can occasionally have slightly different date coverage; that
+    # should not make otherwise observable vehicle identities disappear from the
+    # interactive report.  Aggregate counts remain authoritative.
+    seen_event_keys = {
+        (str(item.get("type") or ""), str(item.get("date") or ""), str(item.get("link") or ""))
+        for item in (all_new + all_exits + all_reductions + all_increases)
+    }
+    for raw_day in snapshot_dates:
+        raw_day = pd.Timestamp(raw_day).normalize()
+        if raw_day < start or raw_day > end:
+            continue
+        prev_day, previous_snapshot = _previous_snapshot(raw_day)
+        current_snapshot = snapshots.get(raw_day, {})
+        if prev_day is None:
+            continue
+        current_links = set(current_snapshot)
+        previous_links = set(previous_snapshot)
+        for link in sorted(current_links - previous_links):
+            event = _event_base(current_snapshot[link], raw_day, link)
+            event["type"] = "NEW_LISTING"
+            key = (event["type"], event["date"], event["link"])
+            if key not in seen_event_keys:
+                all_new.append(event); seen_event_keys.add(key)
+        for link in sorted(previous_links - current_links):
+            event = _event_base(previous_snapshot[link], raw_day, link)
+            event["type"] = "OBSERVED_EXIT"
+            key = (event["type"], event["date"], event["link"])
+            if key not in seen_event_keys:
+                all_exits.append(event); seen_event_keys.add(key)
+        for link in sorted(current_links & previous_links):
+            prev_row, curr_row = previous_snapshot[link], current_snapshot[link]
+            prev_price = _plain_number(prev_row.get(price_col))
+            curr_price = _plain_number(curr_row.get(price_col))
+            if prev_price is None or curr_price is None or abs(curr_price - prev_price) < 0.5:
+                continue
+            event = _event_base(curr_row, raw_day, link)
+            event["previous_price"] = float(prev_price)
+            event["new_price"] = float(curr_price)
+            event["change_amount"] = float(curr_price) - float(prev_price)
+            event["change_pct"] = round(((curr_price - prev_price) / prev_price) * 100.0, 2) if prev_price else None
+            if curr_price < prev_price:
+                event["type"] = "PRICE_REDUCTION"; target_events = all_reductions
+            else:
+                event["type"] = "PRICE_INCREASE"; target_events = all_increases
+            key = (event["type"], event["date"], event["link"])
+            if key not in seen_event_keys:
+                target_events.append(event); seen_event_keys.add(key)
+
     event_map = {
         "new_listings": all_new, "observed_exits": all_exits,
         "price_reductions": all_reductions, "price_increases": all_increases,
@@ -10430,7 +10509,8 @@ def _business_activity_ageing_report(company):
         pricing_rows = []
     pricing_by_link = {str(x.get("link") or "").strip(): x for x in pricing_rows if str(x.get("link") or "").strip()}
     try:
-        history_by_link = _business_inventory_price_history(company)
+        ageing_links = work["Link"].dropna().astype(str).str.strip().tolist() if "Link" in work.columns else []
+        history_by_link = _business_inventory_price_history(company, ageing_links)
     except Exception:
         history_by_link = {}
 
@@ -10445,14 +10525,14 @@ def _business_activity_ageing_report(company):
         reference_date = pd.Timestamp(datetime.now(timezone.utc)).tz_localize(None)
     reference_date = pd.Timestamp(reference_date).normalize()
 
+    # Four operational ageing bands.  Boundaries are half-open in practice:
+    # 0–59, 60–119, 120–179 and 180+ days, while the customer-facing labels
+    # remain the simpler 0–60 / 60–120 / 120–180 / 180+ convention.
     defs = [
-        ("AGE_0_30", "0–30 days", 0, 30),
-        ("AGE_31_60", "31–60 days", 31, 60),
-        ("AGE_61_90", "61–90 days", 61, 90),
-        ("AGE_91_120", "91–120 days", 91, 120),
-        ("AGE_121_150", "121–150 days", 121, 150),
-        ("AGE_151_180", "151–180 days", 151, 180),
-        ("AGE_180_PLUS", "180+ days", 181, None),
+        ("AGE_0_60", "0–60 days", 0, 59),
+        ("AGE_60_120", "60–120 days", 60, 119),
+        ("AGE_120_180", "120–180 days", 120, 179),
+        ("AGE_180_PLUS", "180+ days", 180, None),
     ]
     buckets = {key: {"key": key, "label": label, "min_days": low, "max_days": high, "vehicles": []} for key,label,low,high in defs}
 
