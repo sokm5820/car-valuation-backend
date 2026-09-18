@@ -11394,6 +11394,19 @@ _GUIDED_LISTING_PRICE_RANGES = {
 }
 
 
+def _guided_safe_text(value):
+    """Return a JSON-safe display string for scalar marketplace values."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return "" if text.casefold() in {"nan", "none", "<na>"} else text
+
+
 def _guided_normalize_listing_price_ranges(values):
     if values in [None, ""]:
         return tuple()
@@ -11962,6 +11975,135 @@ def _guided_stock_metrics_usable(metrics, minimum_sample=3):
     return bool(pd.notna(sample) and float(sample) >= float(minimum_sample) and pd.notna(rate) and pd.notna(days))
 
 
+
+def _guided_stock_current_market_fallback(rows, limit=5, listing_price_ranges=None):
+    """Return exact current-market stock candidates when turnover evidence fails.
+
+    This is a resilience path, not a substitute for historical ranking.  The
+    dealer's selected listing-price bands still determine which exact
+    Year+Brand+Model+Category combinations qualify.  Once qualified, current
+    competition/pricing is measured against ALL live listings for that exact
+    combination.  No turnover, demand or liquidity claim is manufactured.
+    """
+    if rows is None or rows.empty:
+        return []
+
+    work = rows.copy()
+    required = {"Brand", "Model", "CategoryDetail", "Year", "Price"}
+    if not required.issubset(work.columns):
+        return []
+
+    work["_brand_key"] = work["Brand"].fillna("").astype(str).str.strip().str.casefold()
+    work["_model_key2"] = work["Model"].fillna("").astype(str).str.strip().str.casefold()
+    work["_category_key"] = work["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold()
+    work["_year_key"] = pd.to_numeric(work["Year"], errors="coerce").astype("Int64")
+    work = work[
+        work["_brand_key"].ne("")
+        & work["_model_key2"].ne("")
+        & work["_category_key"].ne("")
+        & ~work["_category_key"].isin({"-", "nan", "none"})
+        & work["_year_key"].notna()
+    ].copy()
+    if work.empty:
+        return []
+
+    full_market = _guided_market_index()
+    full = full_market.copy() if isinstance(full_market, pd.DataFrame) and not full_market.empty else work.copy()
+    full["_brand_key"] = full["Brand"].fillna("").astype(str).str.strip().str.casefold()
+    full["_model_key2"] = full["Model"].fillna("").astype(str).str.strip().str.casefold()
+    full["_category_key"] = full["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold()
+    full["_year_key"] = pd.to_numeric(full["Year"], errors="coerce").astype("Int64")
+    if "Link" in full.columns:
+        full["_link_key"] = full["Link"].fillna("").astype(str).str.strip()
+
+    candidates = []
+    for (brand_key, model_key, category_key, year_key), qualifying in work.groupby(
+        ["_brand_key", "_model_key2", "_category_key", "_year_key"], dropna=False
+    ):
+        if qualifying.empty:
+            continue
+        first = qualifying.iloc[0]
+        market = full[
+            full["_brand_key"].eq(brand_key)
+            & full["_model_key2"].eq(model_key)
+            & full["_category_key"].eq(category_key)
+            & full["_year_key"].eq(int(year_key))
+        ].copy()
+        if "_link_key" in market.columns:
+            market = market[market["_link_key"].ne("")].drop_duplicates("_link_key", keep="last")
+        if market.empty:
+            market = qualifying.copy()
+            if "Link" in market.columns:
+                market["_link_key"] = market["Link"].fillna("").astype(str).str.strip()
+                market = market[market["_link_key"].ne("")].drop_duplicates("_link_key", keep="last")
+        prices = pd.to_numeric(market["Price"], errors="coerce").dropna()
+        qualifying_prices = pd.to_numeric(qualifying["Price"], errors="coerce").dropna()
+        candidates.append({
+            "vehicle_type": str(first.get("VehicleType") if pd.notna(first.get("VehicleType")) else "").strip(),
+            "brand": str(first.get("Brand") if pd.notna(first.get("Brand")) else "").strip(),
+            "model": str(first.get("Model") if pd.notna(first.get("Model")) else "").strip(),
+            "category": str(first.get("CategoryDetail") if pd.notna(first.get("CategoryDetail")) else "").strip(),
+            "year": int(year_key),
+            "current_listings": int(len(market)),
+            "starting_price": float(prices.min()) if not prices.empty else None,
+            "median_price": float(prices.median()) if not prices.empty else None,
+            "highest_price": float(prices.max()) if not prices.empty else None,
+            "selected_price_ranges": list(_guided_normalize_listing_price_ranges(listing_price_ranges)),
+            "selected_price_range_listings": int(len(qualifying_prices)) if not qualifying_prices.empty else 0,
+            "selected_price_range_starting_price": float(qualifying_prices.min()) if not qualifying_prices.empty else None,
+            "selected_price_range_median_price": float(qualifying_prices.median()) if not qualifying_prices.empty else None,
+            "selected_price_range_highest_price": float(qualifying_prices.max()) if not qualifying_prices.empty else None,
+            "historical_distinct_listings": None,
+            "turnover_sample_size": None,
+            "median_observed_days_to_exit": None,
+            "observed_exit_within_60_days_rate": None,
+            "historical_price_reduction_rate": None,
+            "evidence_quality": "INSUFFICIENT",
+            "evidence_scope": "CURRENT_MARKET_ONLY",
+            "fallback_context": {"scope": "CURRENT_MARKET_ONLY", "reason": "HISTORICAL_EVIDENCE_TEMPORARILY_UNAVAILABLE"},
+            "history_start_date": None,
+            "history_end_date": None,
+            # Deterministic resilience ranking: lower live competition first;
+            # within that, prefer combinations with more evidence inside the
+            # selected retail segment.  This does NOT imply stronger demand.
+            "_fallback_current_supply": int(len(market)),
+            "_fallback_qualifying_supply": int(len(qualifying_prices)),
+        })
+
+    candidates.sort(key=lambda item: (
+        int(item.get("_fallback_current_supply") or 0),
+        -int(item.get("_fallback_qualifying_supply") or 0),
+        float(item.get("median_price")) if item.get("median_price") is not None else float("inf"),
+    ))
+
+    selected = []
+    seen_families = set()
+    for item in candidates:
+        family = (str(item.get("brand") or "").casefold(), str(item.get("model") or "").casefold())
+        if family in seen_families:
+            continue
+        seen_families.add(family)
+        item.pop("_fallback_current_supply", None)
+        item.pop("_fallback_qualifying_supply", None)
+        selected.append(item)
+        if len(selected) >= int(limit):
+            break
+
+    supplies = [int(item.get("current_listings") or 0) for item in selected]
+    if len(supplies) >= 3:
+        series = pd.Series(supplies, dtype="float64")
+        low, high = float(series.quantile(0.33)), float(series.quantile(0.67))
+    else:
+        low = high = None
+    for item in selected:
+        value = float(item.get("current_listings") or 0)
+        if low is not None and high is not None:
+            item["competition_context"] = "LOW" if value <= low else "HIGH" if value >= high else "MODERATE"
+        else:
+            item["competition_context"] = "LOW" if value <= 2 else "MODERATE" if value <= 6 else "HIGH"
+        item["stock_rank_score"] = None
+    return selected
+
 def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
     """Rank exact Year + Brand + Model + Category stock opportunities.
 
@@ -12036,10 +12178,10 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
             "model_key": model_key,
             "category_key": category_key,
             "year": int(year_key),
-            "brand": str(first.get("Brand") or "").strip(),
-            "model": str(first.get("Model") or "").strip(),
-            "category": str(first.get("CategoryDetail") or "").strip(),
-            "vehicle_type": str(first.get("VehicleType") or "").strip(),
+            "brand": _guided_safe_text(first.get("Brand")),
+            "model": _guided_safe_text(first.get("Model")),
+            "category": _guided_safe_text(first.get("CategoryDetail")),
+            "vehicle_type": _guided_safe_text(first.get("VehicleType")),
             "current_listings": int(len(market_group)),
             "starting_price": float(prices.min()) if not prices.empty else None,
             "median_price": float(prices.median()) if not prices.empty else None,
@@ -12376,9 +12518,9 @@ def api_guided_discovery_result():
         groups = []
         for row in grouped.to_dict("records"):
             groups.append({
-                "brand": str(row.get("Brand") or ""),
-                "model": str(row.get("Model") or ""),
-                "category": str(row.get("CategoryDetail") or ""),
+                "brand": _guided_safe_text(row.get("Brand")),
+                "model": _guided_safe_text(row.get("Model")),
+                "category": _guided_safe_text(row.get("CategoryDetail")),
                 "listing_count": int(row.get("listing_count") or 0),
                 "min_price": float(row["min_price"]) if pd.notna(row.get("min_price")) else None,
                 "median_price": float(row["median_price"]) if pd.notna(row.get("median_price")) else None,
@@ -12439,9 +12581,9 @@ def api_guided_discovery_result():
         year_options = []
         for row in year_grouped.to_dict("records"):
             year_options.append({
-                "brand": str(row.get("Brand") or ""),
-                "model": str(row.get("Model") or ""),
-                "category": str(row.get("CategoryDetail") or ""),
+                "brand": _guided_safe_text(row.get("Brand")),
+                "model": _guided_safe_text(row.get("Model")),
+                "category": _guided_safe_text(row.get("CategoryDetail")),
                 "year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
                 "listing_count": int(row.get("listing_count") or 0),
                 "min_price": float(row["min_price"]) if pd.notna(row.get("min_price")) else None,
@@ -12478,7 +12620,26 @@ def api_guided_discovery_result():
             item["newest_year_max_price"] = exact.get("max_price")
             item["newest_year_median_km"] = exact.get("median_km")
 
-        stock_opportunities = _guided_stock_opportunities(rows, limit=5, listing_price_ranges=listing_price_ranges) if task == "STOCK_PURCHASE" else []
+        stock_opportunities = []
+        if task == "STOCK_PURCHASE":
+            try:
+                stock_opportunities = _guided_stock_opportunities(
+                    rows, limit=5, listing_price_ranges=listing_price_ranges
+                )
+            except Exception as stock_exc:
+                # A history-source/schema problem must never take down the whole
+                # paid Stock Purchase report. Preserve exact current-market
+                # candidates and make the missing turnover evidence explicit.
+                print("GUIDED STOCK OPPORTUNITY RANKING FAILED:", repr(stock_exc), flush=True)
+                traceback.print_exc()
+                stock_opportunities = _guided_stock_current_market_fallback(
+                    rows, limit=5, listing_price_ranges=listing_price_ranges
+                )
+
+            if not stock_opportunities:
+                stock_opportunities = _guided_stock_current_market_fallback(
+                    rows, limit=5, listing_price_ranges=listing_price_ranges
+                )
 
         result_cols = [c for c in ("Brand", "Model", "CategoryDetail", "Year", "Price", "KM", "_guided_km_reliable", "Company", "Color", "Transmission", "Location", "Image", "Link") if c in rows.columns]
         posted_rows = rows
@@ -12539,19 +12700,19 @@ def api_guided_discovery_result():
         results = []
         for row in result_rows.to_dict("records"):
             results.append({
-                "brand": str(row.get("Brand") or ""),
-                "model": str(row.get("Model") or ""),
-                "category": str(row.get("CategoryDetail") or ""),
+                "brand": _guided_safe_text(row.get("Brand")),
+                "model": _guided_safe_text(row.get("Model")),
+                "category": _guided_safe_text(row.get("CategoryDetail")),
                 "year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
                 "price": float(row["Price"]) if pd.notna(row.get("Price")) else None,
                 "km": float(row["KM"]) if pd.notna(row.get("KM")) else None,
                 "km_reliable": bool(row.get("_guided_km_reliable", True)),
-                "company": str(row.get("Company") or ""),
-                "color": str(row.get("Color") or ""),
-                "transmission": str(row.get("Transmission") or ""),
-                "location": str(row.get("Location") or ""),
-                "image": str(row.get("Image") or ""),
-                "link": str(row.get("Link") or ""),
+                "company": _guided_safe_text(row.get("Company")),
+                "color": _guided_safe_text(row.get("Color")),
+                "transmission": _guided_safe_text(row.get("Transmission")),
+                "location": _guided_safe_text(row.get("Location")),
+                "image": _guided_safe_text(row.get("Image")),
+                "link": _guided_safe_text(row.get("Link")),
             })
 
         return jsonify({
@@ -12566,6 +12727,7 @@ def api_guided_discovery_result():
         return jsonify({"success": False, "error": "INVALID_GUIDED_RESULT"}), 400
     except Exception as exc:
         print("GUIDED DISCOVERY RESULT FAILED:", repr(exc), flush=True)
+        traceback.print_exc()
         return jsonify({"success": False, "error": "GUIDED_RESULT_UNAVAILABLE"}), 503
 
 
