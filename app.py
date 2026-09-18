@@ -9560,13 +9560,17 @@ def _round_business_benchmark(value, step=50):
     return int(math.floor((numeric / step) + 0.5) * step)
 
 
-def _business_inventory_pricing_recommendations(company, limit=5):
-    """Return structured pricing priorities for a gallery's active inventory.
+def _business_inventory_pricing_recommendations(company, limit=500):
+    """Return a complete, price-focused view of a gallery's active inventory.
 
-    Ranking is deterministic and combines the existing inventory-action rules,
-    observed listing age, historical exit benchmarks and current comparable-price
-    position. This powers the paid report UI directly rather than flattening the
-    analysis into one long prose response.
+    Every active vehicle is assigned to exactly one pricing bucket:
+      * PRICE_REVIEW               — asking position is high vs current comparables
+      * COMPETITIVELY_POSITIONED   — broadly market-aligned / no clear price gap
+      * POTENTIALLY_UNDER_PRICED   — asking position is low vs current comparables
+
+    Stock age is deliberately not used to classify these buckets. Ageing analysis
+    belongs to Business Activity; this endpoint answers the narrower pricing
+    question so the three pricing states remain mutually exclusive.
     """
     if not company or business_stock_df is None or business_stock_df.empty:
         return {"recommendations": [], "summary": {}}
@@ -9578,34 +9582,38 @@ def _business_inventory_pricing_recommendations(company, limit=5):
     if work.empty:
         return {"recommendations": [], "summary": {}}
 
-    action_rank = {
-        "REPRICE_REVIEW": 0,
-        "WATCH_REPRICE": 1,
-        "NON_PRICE_REVIEW": 2,
-        "WATCH": 3,
-        "REVIEW_MANUALLY": 4,
-        "HOLD_MONITOR": 5,
+    bucket_rank = {
+        "PRICE_REVIEW": 0,
+        "POTENTIALLY_UNDER_PRICED": 1,
+        "COMPETITIVELY_POSITIONED": 2,
     }
-
+    counts = {
+        "PRICE_REVIEW": 0,
+        "COMPETITIVELY_POSITIONED": 0,
+        "POTENTIALLY_UNDER_PRICED": 0,
+    }
     rows = []
-    review_now = 0
-    ageing = 0
-    already_competitive = 0
 
     for raw in work.to_dict("records"):
         public = _business_manage_row_public(raw)
-        action = str(public.get("recommended_action") or "REVIEW_MANUALLY").strip().upper()
-        age = public.get("listing_age_days")
-        med_days = public.get("historical_median_days_to_exit")
-        price_vs = public.get("price_vs_median_pct")
         price_position = str(public.get("price_position") or "").strip().upper()
+        comp_conf = str(public.get("comparable_confidence") or "").strip().upper()
+        comp_count = public.get("comparable_count")
 
-        if action in {"REPRICE_REVIEW", "WATCH_REPRICE"}:
-            review_now += 1
-        if age is not None and med_days not in [None, 0] and float(age) > float(med_days):
-            ageing += 1
-        if price_position in {"LOW", "LOW_MID", "MID_MARKET"}:
-            already_competitive += 1
+        # PricePositionBand is produced from the current comparable market and is
+        # the clearest deterministic source for this price-only segmentation.
+        # Unknown/neutral rows sit in the middle bucket rather than being labelled
+        # overpriced or underpriced without evidence.
+        if price_position in {"HIGH", "HIGH_MID"}:
+            bucket = "PRICE_REVIEW"
+        elif price_position in {"LOW", "LOW_MID"}:
+            bucket = "POTENTIALLY_UNDER_PRICED"
+        else:
+            bucket = "COMPETITIVELY_POSITIONED"
+
+        counts[bucket] += 1
+        public["pricing_bucket"] = bucket
+        public["pricing_evidence_limited"] = comp_conf not in {"HIGH", "MEDIUM"} or not comp_count or int(comp_count) < 2
 
         median_raw = public.get("comparable_median_price")
         p25_raw = public.get("comparable_p25_price")
@@ -9614,58 +9622,78 @@ def _business_inventory_pricing_recommendations(company, limit=5):
         public["display_comparable_p25_price"] = _round_business_benchmark(p25_raw, 50)
         public["display_comparable_p75_price"] = _round_business_benchmark(p75_raw, 50)
 
-        # Suggested positions are analytical guidance, so use coarser £250 steps.
-        # Never imply these are exact valuations or guaranteed transaction prices.
+        # Market-position guidance is shown only for stock clearly above the
+        # current comparable market. It must always be a positive currency value,
+        # never a signed delta that could render as "-£14,000".
         asking = public.get("asking_price")
         median_target = _round_business_benchmark(median_raw, 250)
         lower_target = _round_business_benchmark(p25_raw, 250)
-        should_reprice = action in {"REPRICE_REVIEW", "WATCH_REPRICE"}
-        if should_reprice and asking is not None and median_target is not None and median_target < float(asking):
-            public["suggested_market_position_high"] = median_target
-            if lower_target is not None and lower_target < median_target:
-                public["suggested_market_position_low"] = lower_target
-            else:
-                public["suggested_market_position_low"] = None
+        if (
+            bucket == "PRICE_REVIEW"
+            and asking is not None
+            and median_target is not None
+            and abs(float(median_target)) < float(asking)
+        ):
+            high_target = abs(int(median_target))
+            low_target = abs(int(lower_target)) if lower_target is not None else None
+            public["suggested_market_position_high"] = high_target
+            public["suggested_market_position_low"] = low_target if low_target is not None and low_target < high_target else None
         else:
             public["suggested_market_position_low"] = None
             public["suggested_market_position_high"] = None
 
-        age_pressure = 0.0
-        if age is not None and med_days not in [None, 0]:
-            age_pressure = max(0.0, float(age) / max(float(med_days), 1.0))
-        elif age is not None:
-            age_pressure = float(age) / 90.0
+        # Sort within each bucket by the size of the current price gap; stronger
+        # evidence then wins ties. This affects presentation only, not bucket membership.
+        raw_delta = public.get("price_vs_median_pct")
+        try:
+            delta = float(raw_delta) if raw_delta is not None else 0.0
+            if abs(delta) <= 1:
+                delta *= 100.0
+        except (TypeError, ValueError):
+            delta = 0.0
+        if bucket == "PRICE_REVIEW":
+            sort_pressure = delta
+        elif bucket == "POTENTIALLY_UNDER_PRICED":
+            sort_pressure = abs(min(delta, 0.0))
+        else:
+            sort_pressure = -abs(delta)
 
         rows.append({
             **public,
-            "_action_rank": action_rank.get(action, 9),
-            "_age_pressure": age_pressure,
-            "_price_pressure": float(price_vs) if price_vs is not None else -99.0,
+            "_bucket_rank": bucket_rank[bucket],
+            "_sort_pressure": float(sort_pressure),
+            "_comp_count": int(comp_count or 0),
         })
 
     rows.sort(
         key=lambda item: (
-            item.get("_action_rank", 9),
-            -float(item.get("_age_pressure") or 0),
-            -float(item.get("_price_pressure") or -99),
-            -float(item.get("listing_age_days") or 0),
+            item.get("_bucket_rank", 9),
+            -float(item.get("_sort_pressure") or 0),
+            -int(item.get("_comp_count") or 0),
+            str(item.get("brand") or ""),
+            str(item.get("model") or ""),
         )
     )
 
-    limit = max(1, min(int(limit or 5), 8))
+    try:
+        requested_limit = int(limit or len(rows))
+    except (TypeError, ValueError):
+        requested_limit = len(rows)
+    requested_limit = max(1, min(requested_limit, 500))
+
     public_rows = []
-    for item in rows[:limit]:
+    for item in rows[:requested_limit]:
         item = dict(item)
-        item.pop("_action_rank", None)
-        item.pop("_age_pressure", None)
-        item.pop("_price_pressure", None)
+        item.pop("_bucket_rank", None)
+        item.pop("_sort_pressure", None)
+        item.pop("_comp_count", None)
         public_rows.append(item)
 
     summary = {
         "active_stock_count": int(len(work)),
-        "price_review_count": int(review_now),
-        "ageing_count": int(ageing),
-        "already_competitive_count": int(already_competitive),
+        "price_review_count": int(counts["PRICE_REVIEW"]),
+        "competitively_positioned_count": int(counts["COMPETITIVELY_POSITIONED"]),
+        "potentially_underpriced_count": int(counts["POTENTIALLY_UNDER_PRICED"]),
     }
     return {"recommendations": public_rows, "summary": summary}
 
@@ -10606,7 +10634,7 @@ def api_guided_business_inventory_pricing():
                 "summary": {},
             }), 400
 
-        payload = _business_inventory_pricing_recommendations(company, limit=data.get("limit") or 5)
+        payload = _business_inventory_pricing_recommendations(company, limit=data.get("limit") or 500)
         recommendations = payload.get("recommendations") or []
         return jsonify({
             "success": True,
