@@ -9980,7 +9980,65 @@ def _guided_market_index():
         return _GUIDED_INDEX
 
 
-def _guided_index_filter(index, *, min_year=None, vehicle_types=None, brands=None, model_keys=None, categories=None, max_budget=None):
+_GUIDED_LISTING_PRICE_RANGES = {
+    "0_10000": (0.0, 10000.0),
+    "10000_20000": (10000.0, 20000.0),
+    "20000_30000": (20000.0, 30000.0),
+    "30000_40000": (30000.0, 40000.0),
+    "40000_50000": (40000.0, 50000.0),
+    "50000_60000": (50000.0, 60000.0),
+    "60000_70000": (60000.0, 70000.0),
+    "70000_80000": (70000.0, 80000.0),
+    "80000_90000": (80000.0, 90000.0),
+    "90000_100000": (90000.0, 100000.0),
+    "100000_PLUS": (100000.0, None),
+}
+
+
+def _guided_normalize_listing_price_ranges(values):
+    if values in [None, ""]:
+        return tuple()
+    if isinstance(values, str):
+        values = [values]
+    normalized = []
+    seen = set()
+    for raw in values or []:
+        key = str(raw or "").strip().upper()
+        if not key or key in {"__ALL__", "ALL"}:
+            continue
+        if key not in _GUIDED_LISTING_PRICE_RANGES or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(key)
+    return tuple(normalized)
+
+
+def _guided_listing_price_range_label(key):
+    bounds = _GUIDED_LISTING_PRICE_RANGES.get(str(key or "").strip().upper())
+    if not bounds:
+        return None
+    low, high = bounds
+    if high is None:
+        return f"£{int(low / 1000)}K+"
+    return f"£{int(low / 1000)}–{int(high / 1000)}K"
+
+
+def _guided_listing_price_mask(index, price_ranges):
+    normalized = _guided_normalize_listing_price_ranges(price_ranges)
+    if not normalized:
+        return pd.Series(True, index=index.index)
+    mask = pd.Series(False, index=index.index)
+    prices = pd.to_numeric(index["Price"], errors="coerce")
+    for key in normalized:
+        low, high = _GUIDED_LISTING_PRICE_RANGES[key]
+        band = prices.ge(float(low))
+        if high is not None:
+            band &= prices.lt(float(high))
+        mask |= band
+    return mask
+
+
+def _guided_index_filter(index, *, min_year=None, vehicle_types=None, brands=None, model_keys=None, categories=None, max_budget=None, price_ranges=None):
     if index is None or index.empty:
         return index.iloc[0:0] if isinstance(index, pd.DataFrame) else pd.DataFrame()
 
@@ -9989,6 +10047,8 @@ def _guided_index_filter(index, *, min_year=None, vehicle_types=None, brands=Non
         mask &= index["Year"].ge(int(min_year))
     if max_budget is not None:
         mask &= index["Price"].le(float(max_budget))
+    if price_ranges:
+        mask &= _guided_listing_price_mask(index, price_ranges)
     if vehicle_types:
         type_mask = pd.Series(False, index=index.index)
         for vehicle_type in vehicle_types:
@@ -10070,6 +10130,8 @@ def api_guided_discovery_options():
             if not math.isfinite(max_budget) or max_budget <= 0:
                 raise ValueError("INVALID_MAX_BUDGET")
 
+        listing_price_ranges = _guided_normalize_listing_price_ranges(_guided_list_arg("price_range"))
+
         import_only = str(request.args.get("import_only") or "false").strip().casefold() in {
             "1", "true", "yes", "on"
         }
@@ -10080,7 +10142,7 @@ def api_guided_discovery_options():
         cache_key = (
             _GUIDED_INDEX_SOURCE, categories_only, all_models,
             requested_types, selected_brands, selected_model_keys,
-            min_year, max_budget, import_only,
+            min_year, max_budget, listing_price_ranges, import_only,
         )
         cached = _guided_cache_get(cache_key)
         if cached is not None:
@@ -10092,6 +10154,7 @@ def api_guided_discovery_options():
             min_year=min_year,
             vehicle_types=requested_types,
             max_budget=max_budget,
+            price_ranges=listing_price_ranges,
         )
 
         if categories_only:
@@ -10117,6 +10180,7 @@ def api_guided_discovery_options():
                 "success": True,
                 "effective_min_year": min_year,
                 "effective_max_budget": max_budget,
+                "effective_listing_price_ranges": list(listing_price_ranges),
                 "import_only": import_only,
                 "import_max_age_years": IMPORT_MAX_AGE_YEARS,
                 "categories_by_model": categories_by_model,
@@ -10127,7 +10191,7 @@ def api_guided_discovery_options():
             return jsonify(payload)
 
         # Vehicle-type facets come from the already budget/year-constrained rows.
-        type_scope = _guided_index_filter(index, min_year=min_year, brands=selected_brands, max_budget=max_budget)
+        type_scope = _guided_index_filter(index, min_year=min_year, brands=selected_brands, max_budget=max_budget, price_ranges=listing_price_ranges)
         available_vehicle_types = [
             vehicle_type for vehicle_type in _GUIDED_SUPPORTED_TYPES
             if f"_type_{vehicle_type}" in type_scope.columns and bool(type_scope[f"_type_{vehicle_type}"].any())
@@ -10153,6 +10217,7 @@ def api_guided_discovery_options():
             "max_year": int(index["Year"].max()) if index["Year"].notna().any() else None,
             "effective_min_year": min_year,
             "effective_max_budget": max_budget,
+            "effective_listing_price_ranges": list(listing_price_ranges),
             "import_only": import_only,
             "import_max_age_years": IMPORT_MAX_AGE_YEARS,
             "vehicle_types": available_vehicle_types,
@@ -10197,12 +10262,13 @@ def _guided_apply_category_keys(rows, category_keys):
 
 
 
-def _guided_stock_opportunities(rows, limit=5):
+def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
     """Rank stock opportunities within the EXACT guided-selection universe.
 
-    The hard selector (vehicle type, year, brand, model and category) is
-    resolved first against the guided listing index. A dealer's acquisition
-    budget is deliberately not treated as a retail asking-price ceiling. Business intelligence is
+    The hard selector (listing-price range, vehicle type, year, brand, model and
+    category) is resolved first against the guided listing index. Listing-price
+    ranges describe the retail market segment the dealer wants to target; they
+    are not an estimate of dealer acquisition cost. Business intelligence is
     then joined only to those surviving Brand/Model/Category/Year combinations,
     so a Business report cannot re-introduce a motorcycle, ATV or other vehicle
     that the guided type classifier excluded.
@@ -10329,6 +10395,8 @@ def _guided_stock_opportunities(rows, limit=5):
         if len(selected) >= int(limit):
             break
 
+    selected_listing_price_ranges = _guided_normalize_listing_price_ranges(listing_price_ranges)
+
     result = []
     for row in selected:
         def num(name, integer=False):
@@ -10336,6 +10404,30 @@ def _guided_stock_opportunities(rows, limit=5):
             if value is None or pd.isna(value):
                 return None
             return int(value) if integer else float(value)
+
+        selected_range_stats = {
+            "count": None,
+            "min": None,
+            "median": None,
+            "max": None,
+        }
+        if selected_listing_price_ranges:
+            exact = rows.copy()
+            exact = exact[
+                exact["_brand_cf"].eq(str(row.get("Brand") or "").strip().casefold())
+                & exact["_model_cf"].eq(str(row.get("Model") or "").strip().casefold())
+                & pd.to_numeric(exact["Year"], errors="coerce").eq(pd.to_numeric(pd.Series([row.get("Year")]), errors="coerce").iloc[0])
+            ]
+            if str(row.get("_granularity") or "").upper() == "CATEGORY_YEAR":
+                exact = exact[exact["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold().eq(str(row.get("CategoryDetail") or "").strip().casefold())]
+            exact_prices = pd.to_numeric(exact.get("Price"), errors="coerce").dropna()
+            if not exact_prices.empty:
+                selected_range_stats = {
+                    "count": int(len(exact_prices)),
+                    "min": float(exact_prices.min()),
+                    "median": float(exact_prices.median()),
+                    "max": float(exact_prices.max()),
+                }
 
         result.append({
             "vehicle_type": str(row.get("VehicleType") or "").strip(),
@@ -10349,6 +10441,11 @@ def _guided_stock_opportunities(rows, limit=5):
             "starting_price": num("CurrentStartingPrice"),
             "median_price": num("CurrentMedianPrice"),
             "highest_price": num("CurrentHighestPrice"),
+            "selected_price_ranges": list(selected_listing_price_ranges),
+            "selected_price_range_listings": selected_range_stats["count"],
+            "selected_price_range_starting_price": selected_range_stats["min"],
+            "selected_price_range_median_price": selected_range_stats["median"],
+            "selected_price_range_highest_price": selected_range_stats["max"],
             "gallery_listings": num("GalleryListings", integer=True),
             "private_listings": num("PrivateListings", integer=True),
             "distinct_companies": num("DistinctCompanies", integer=True),
@@ -10396,6 +10493,8 @@ def api_guided_discovery_result():
         else:
             max_budget = float(max_budget)
 
+        listing_price_ranges = _guided_normalize_listing_price_ranges(answers.get("priceRanges") or [])
+
         # Personal buying budget can cap retail asking prices. A dealership's
         # stock-purchase budget cannot: advertised prices describe the resale
         # market, not the gallery's eventual acquisition cost.
@@ -10408,6 +10507,7 @@ def api_guided_discovery_result():
             brands=brands,
             model_keys=model_keys,
             max_budget=listing_budget_ceiling,
+            price_ranges=listing_price_ranges if task == "STOCK_PURCHASE" else None,
         )
         rows = _guided_apply_category_keys(rows, category_keys)
 
@@ -10642,7 +10742,7 @@ def api_guided_discovery_result():
                 "link": str(row.get("Link") or ""),
             })
 
-        stock_opportunities = _guided_stock_opportunities(rows, limit=5) if task == "STOCK_PURCHASE" else []
+        stock_opportunities = _guided_stock_opportunities(rows, limit=5, listing_price_ranges=listing_price_ranges) if task == "STOCK_PURCHASE" else []
         return jsonify({
             "success": True,
             "count": int(len(rows)),
@@ -10923,6 +11023,8 @@ def api_guided_discovery_stock_recommendations():
             language = "EN"
         candidates = data.get("candidates") if isinstance(data.get("candidates"), list) else []
         candidates = [item for item in candidates[:5] if isinstance(item, dict)]
+        selected_listing_price_ranges = _guided_normalize_listing_price_ranges(data.get("price_ranges") or [])
+        selected_listing_price_labels = [label for label in (_guided_listing_price_range_label(key) for key in selected_listing_price_ranges) if label]
         if not candidates:
             return jsonify({"success": True, "recommendations": []})
 
@@ -10942,6 +11044,10 @@ def api_guided_discovery_stock_recommendations():
                 "competition_context_within_shortlist": item.get("competition_context"),
                 "starting_price_gbp": item.get("starting_price"),
                 "median_asking_price_gbp": item.get("median_price"),
+                "selected_price_range_current_examples": item.get("selected_price_range_listings"),
+                "selected_price_range_starting_price_gbp": item.get("selected_price_range_starting_price"),
+                "selected_price_range_median_price_gbp": item.get("selected_price_range_median_price"),
+                "selected_price_range_highest_price_gbp": item.get("selected_price_range_highest_price"),
                 "historical_distinct_listings": item.get("historical_distinct_listings"),
                 "median_observed_days_to_leave_market": item.get("median_observed_days_to_exit"),
                 "observed_share_no_longer_advertised_within_60_days": item.get("observed_exit_within_60_days_rate"),
@@ -10969,7 +11075,8 @@ Writing rules:
 - If `active_competing_listings` is 1, never describe the asking price as a market median/typical price. Say the only current competing example is advertised at X if useful.
 - Explain the implication of the statistics rather than dumping numbers. For example, "72% were no longer advertised within 60 days and the median observed exit was 34 days, giving this one of the stronger turnover signals in the shortlist."
 - Use historical asking-price reductions only as a caution about price pressure; do not infer margin or wholesale acquisition cost.
-- Advertised asking prices are retail-market context only. NEVER compare them with the dealer's stock-purchase budget, never say a candidate is near/within/outside budget, and never infer acquisition affordability from an advertised price.
+- The user may have selected one or more DESIRED LISTING-PRICE RANGES. Those ranges define the retail market segment the dealer wants to target; they are not an acquisition budget. If `selected_price_range_current_examples` is positive, you MAY clearly say the candidate has current examples within the dealer's desired listing-price range/segment, and you may quote the supplied selected-range prices.
+- Advertised asking prices are retail-market context only. NEVER infer dealer acquisition affordability, wholesale cost or a stock-purchase budget from an advertised price.
 - Do not imply profit. The dealer's actual acquisition cost, preparation cost and margin are unknown.
 - Compare candidates to each other where useful. Make the commercial trade-off explicit: strong turnover with low/moderate active competition is especially attractive; strong turnover with many active competitors can still work but is a more crowded opportunity. Tell the dealer when a lower-ranked option would make more sense than the one above it.
 - Avoid internal jargon such as OpportunityPercentile, AcquisitionSignal, confidence-adjusted index, evidence base or algorithm.
@@ -10980,7 +11087,8 @@ Writing rules:
         payload = {
             "selection_context": {
                 "minimum_year": data.get("min_year"),
-                "asking_price_note": "Advertised asking prices are retail-market/competition context, not dealer acquisition cost.",
+                "desired_listing_price_ranges": selected_listing_price_labels or ["All listing-price ranges"],
+                "asking_price_note": "Selected listing-price ranges define the desired retail market segment. Advertised asking prices are still not dealer acquisition cost.",
             },
             "ranked_stock_candidates": clean_candidates,
         }
