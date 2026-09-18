@@ -1150,6 +1150,10 @@ def load_business_activity_history():
         ].copy()
         business_activity_history_df = frame
         BUSINESS_ACTIVITY_HISTORY_READY = not frame.empty
+        # Stock Purchase uses this same raw history for exact Year + Brand + Model +
+        # Category turnover evidence.  Never retain a cache built from an older
+        # history snapshot after the daily source refreshes.
+        globals()["_GUIDED_STOCK_HISTORY_CACHE"] = None
         print(f"Business activity history loaded successfully: {len(frame)} daily listing rows")
     except Exception as exc:
         print("BUSINESS ACTIVITY HISTORY LOAD FAILED:", exc)
@@ -11474,23 +11478,33 @@ def _guided_apply_category_keys(rows, category_keys):
 
 
 def _guided_stock_history_frame():
-    """Prepare a compact, normalized listing-history frame for stock analysis.
+    """Prepare normalized daily listing history for stock-purchase analysis.
 
-    Stock recommendations need historical evidence at exactly the same grain as the
-    visible recommendation.  The offline Business intelligence tables may carry a
-    broader historical benchmark behind a category/year row, so this helper rebuilds
-    the history directly from the listing observations instead of assuming that a
-    precomputed row's historical fields are year/category-specific.
+    The stock recommender must measure turnover at the exact visible
+    Year + Brand + Model + Category grain.  `ads_base.csv` is a compact valuation
+    snapshot and cannot reliably reconstruct listing lifetimes, so prefer the raw
+    daily listing history already loaded for Business Activity.  The valuation
+    frame remains only a backwards-compatible fallback for deployments where it
+    genuinely contains repeated daily observations.
     """
     global _GUIDED_STOCK_HISTORY_CACHE
 
-    if df is None or df.empty:
+    raw_history = globals().get("business_activity_history_df")
+    raw_ready = bool(globals().get("BUSINESS_ACTIVITY_HISTORY_READY"))
+    source_name = "daily_listing_history"
+    source = raw_history if raw_ready and isinstance(raw_history, pd.DataFrame) and not raw_history.empty else None
+
+    if source is None:
+        source_name = "valuation_snapshot_fallback"
+        source = df if isinstance(df, pd.DataFrame) and not df.empty else None
+
+    if source is None or source.empty:
         return None
 
-    lower = {str(col).strip().casefold(): col for col in df.columns}
+    lower = {str(col).strip().casefold(): col for col in source.columns}
     def col(*names):
         for name in names:
-            if name in df.columns:
+            if name in source.columns:
                 return name
             found = lower.get(str(name).strip().casefold())
             if found:
@@ -11507,13 +11521,13 @@ def _guided_stock_history_frame():
     if not all([date_col, link_col, brand_col, model_col, category_col, year_col]):
         return None
 
-    dates = pd.to_datetime(df[date_col], errors="coerce")
+    dates = pd.to_datetime(source[date_col], errors="coerce")
     latest = dates.max()
     earliest = dates.min()
     if pd.isna(latest) or pd.isna(earliest):
         return None
 
-    stamp = (len(df), str(pd.Timestamp(latest)), str(pd.Timestamp(earliest)))
+    stamp = (source_name, len(source), str(pd.Timestamp(latest)), str(pd.Timestamp(earliest)))
     cached = globals().get("_GUIDED_STOCK_HISTORY_CACHE")
     if isinstance(cached, dict) and cached.get("stamp") == stamp:
         return cached.get("payload")
@@ -11521,7 +11535,7 @@ def _guided_stock_history_frame():
     columns = [date_col, link_col, brand_col, model_col, category_col, year_col]
     if price_col:
         columns.append(price_col)
-    work = df[columns].copy()
+    work = source[columns].copy()
     work["_date"] = pd.to_datetime(work[date_col], errors="coerce").dt.normalize()
     work["_link"] = work[link_col].fillna("").astype(str).str.strip()
     work["_brand"] = work[brand_col].fillna("").astype(str).str.strip().str.casefold()
@@ -11536,6 +11550,13 @@ def _guided_stock_history_frame():
         & work["_model"].ne("")
         & work["_year"].notna()
     ][["_date", "_link", "_brand", "_model", "_category", "_year", "_price"]].copy()
+
+    # A compact one-row-per-listing snapshot cannot support observed exit-time or
+    # 60-day turnover statistics.  Refuse to manufacture historical metrics from it.
+    if source_name == "valuation_snapshot_fallback" and not work.empty:
+        observations_per_link = work.groupby("_link", sort=False)["_date"].nunique()
+        if observations_per_link.empty or int(observations_per_link.max()) <= 1:
+            return None
 
     payload = {
         "frame": work,
