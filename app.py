@@ -9689,22 +9689,353 @@ def _business_advertising_recommendations(company, limit=5):
 
 
 
-def _business_activity_period_summary(company, period="30D", custom_from=None, custom_to=None):
-    """Build a deterministic period-over-period activity pulse for one gallery.
+def _business_activity_current_stock_value(company):
+    """Return the selected gallery's current asking-value exposure when available."""
+    if not company:
+        return None
 
-    The source is business_company_activity_daily.csv.  It records observed listing
-    movement and asking-price actions by company/day; observed exits are explicitly
-    not treated as confirmed sales.
+    try:
+        if business_company_df is not None and not business_company_df.empty and {"Company", "CurrentStockAskingValue"}.issubset(business_company_df.columns):
+            rows = business_company_df[
+                business_company_df["Company"].fillna("").astype(str).str.casefold()
+                == str(company).casefold()
+            ]
+            if not rows.empty:
+                value = pd.to_numeric(rows.iloc[0].get("CurrentStockAskingValue"), errors="coerce")
+                if pd.notna(value):
+                    return float(value)
+    except Exception:
+        pass
+
+    try:
+        if business_stock_df is not None and not business_stock_df.empty and {"Company", "CurrentAskingPrice"}.issubset(business_stock_df.columns):
+            rows = business_stock_df[
+                business_stock_df["Company"].fillna("").astype(str).str.casefold()
+                == str(company).casefold()
+            ]
+            prices = pd.to_numeric(rows["CurrentAskingPrice"], errors="coerce").dropna()
+            if not prices.empty:
+                return float(prices.sum())
+    except Exception:
+        pass
+
+    return None
+
+
+def _business_activity_event_details(company, start, end, expected_metrics=None, daily_expected=None, available_end=None):
+    """Reconstruct vehicle-level activity from the historical listing observations.
+
+    The daily Business activity file is the authoritative source for aggregate counts.
+    This helper only exposes a vehicle-level breakdown when the underlying historical
+    observations can reproduce those counts, so the UI never invents which vehicles
+    changed merely to make a richer report.
+    """
+    empty = {
+        "available": False,
+        "details_complete": False,
+        "coverage": {},
+        "new_listings": [],
+        "observed_exits": [],
+        "price_reductions": [],
+        "price_increases": [],
+        "daily_events": {},
+        "opening_stock_value": None,
+        "closing_stock_value": None,
+        "net_stock_value_change": None,
+        "net_stock_value_change_pct": None,
+        "new_listing_asking_value": None,
+        "observed_exit_asking_value": None,
+        "price_reduction_value": None,
+        "price_increase_value": None,
+        "net_price_change_value": None,
+        "value_movement_complete": False,
+    }
+
+    if df is None or df.empty or not company:
+        return empty
+
+    source = df.copy()
+    lower = {str(col).strip().casefold(): col for col in source.columns}
+
+    def _column(*names):
+        for name in names:
+            if name in source.columns:
+                return name
+            found = lower.get(str(name).strip().casefold())
+            if found:
+                return found
+        return None
+
+    date_col = _column("DATE", "Date")
+    company_col = _column("Company", "Seller", "Dealer")
+    link_col = _column("Link", "URL", "Url")
+    price_col = _column("Price", "CurrentAskingPrice")
+    if not all([date_col, company_col, link_col, price_col]):
+        return empty
+
+    brand_col = _column("Brand")
+    model_col = _column("Model")
+    category_col = _column("Category", "CategoryDetail")
+    year_col = _column("Year")
+    km_col = _column("KM", "Mileage")
+
+    source[date_col] = pd.to_datetime(source[date_col], errors="coerce")
+    source[price_col] = pd.to_numeric(source[price_col], errors="coerce")
+    source[company_col] = source[company_col].fillna("").astype(str).str.strip()
+    source[link_col] = source[link_col].fillna("").astype(str).str.strip()
+    source = source[
+        source[date_col].notna()
+        & source[price_col].notna()
+        & source[link_col].ne("")
+        & (source[company_col].str.casefold() == str(company).casefold())
+    ].copy()
+    if source.empty:
+        return empty
+
+    source["_activity_date"] = source[date_col].dt.normalize()
+    dataset_latest = pd.Timestamp(df[date_col].max()).normalize() if date_col in df.columns and pd.notna(pd.to_datetime(df[date_col], errors="coerce").max()) else pd.Timestamp(source["_activity_date"].max()).normalize()
+    start = pd.Timestamp(start).normalize()
+    end = pd.Timestamp(end).normalize()
+
+    histories = []
+    for link, group in source.groupby(link_col, sort=False):
+        ordered = group.sort_values(["_activity_date", date_col], kind="stable").copy()
+        # One observed state per listing/day is enough to reconstruct changes.
+        ordered = ordered.drop_duplicates(subset=["_activity_date"], keep="last")
+        if ordered.empty:
+            continue
+        histories.append((str(link), ordered))
+
+    if not histories:
+        return empty
+
+    expected_daily = {}
+    for item in daily_expected or []:
+        key = str(item.get("date") or "")
+        if key:
+            expected_daily[key] = item
+
+    # Different offline builders can stamp an observed exit on either the last
+    # seen day or the first absent day. Choose the convention that best matches
+    # the authoritative company-day totals for this period.
+    def _exit_score(offset_days):
+        counts = defaultdict(int)
+        for _link, history in histories:
+            last_seen = pd.Timestamp(history.iloc[-1]["_activity_date"]).normalize()
+            if last_seen >= dataset_latest:
+                continue
+            event_date = last_seen + pd.Timedelta(days=offset_days)
+            if start <= event_date <= end:
+                counts[event_date.date().isoformat()] += 1
+        score = 0
+        dates = set(expected_daily) | set(counts)
+        for date_key in dates:
+            expected = int((expected_daily.get(date_key) or {}).get("observed_exits") or 0)
+            score += abs(int(counts.get(date_key, 0)) - expected)
+        return score
+
+    exit_offset = 0 if _exit_score(0) <= _exit_score(1) else 1
+
+    def _plain_number(value, integer=False):
+        number = pd.to_numeric(value, errors="coerce")
+        if pd.isna(number):
+            return None
+        return int(round(float(number))) if integer else float(number)
+
+    def _event_base(row, event_date, link):
+        return {
+            "date": pd.Timestamp(event_date).date().isoformat(),
+            "link": str(link or "").strip(),
+            "year": _plain_number(row.get(year_col), integer=True) if year_col else None,
+            "brand": str(row.get(brand_col) or "").strip() if brand_col else "",
+            "model": str(row.get(model_col) or "").strip() if model_col else "",
+            "category": str(row.get(category_col) or "").strip() if category_col else "",
+            "km": _plain_number(row.get(km_col), integer=True) if km_col else None,
+            "price": _plain_number(row.get(price_col)),
+        }
+
+    new_events = []
+    exit_events = []
+    reductions = []
+    increases = []
+
+    for link, history in histories:
+        first_row = history.iloc[0]
+        last_row = history.iloc[-1]
+        first_seen = pd.Timestamp(first_row["_activity_date"]).normalize()
+        last_seen = pd.Timestamp(last_row["_activity_date"]).normalize()
+
+        if start <= first_seen <= end:
+            event = _event_base(first_row, first_seen, link)
+            event["type"] = "NEW_LISTING"
+            new_events.append(event)
+
+        if last_seen < dataset_latest:
+            exit_date = last_seen + pd.Timedelta(days=exit_offset)
+            if start <= exit_date <= end:
+                event = _event_base(last_row, exit_date, link)
+                event["type"] = "OBSERVED_EXIT"
+                exit_events.append(event)
+
+        previous_price = None
+        previous_row = None
+        for _, row in history.iterrows():
+            current_price = _plain_number(row.get(price_col))
+            if current_price is None:
+                continue
+            if previous_price is not None and abs(float(current_price) - float(previous_price)) >= 0.5:
+                event_date = pd.Timestamp(row["_activity_date"]).normalize()
+                if start <= event_date <= end:
+                    event = _event_base(row, event_date, link)
+                    event["previous_price"] = float(previous_price)
+                    event["new_price"] = float(current_price)
+                    event["change_amount"] = float(current_price) - float(previous_price)
+                    event["change_pct"] = round(((float(current_price) - float(previous_price)) / float(previous_price)) * 100.0, 2) if previous_price else None
+                    if current_price < previous_price:
+                        event["type"] = "PRICE_REDUCTION"
+                        reductions.append(event)
+                    else:
+                        event["type"] = "PRICE_INCREASE"
+                        increases.append(event)
+            previous_price = current_price
+            previous_row = row
+
+    expected_metrics = expected_metrics or {}
+    event_map = {
+        "new_listings": new_events,
+        "observed_exits": exit_events,
+        "price_reductions": reductions,
+        "price_increases": increases,
+    }
+    coverage = {}
+    for key, events in event_map.items():
+        expected = int(expected_metrics.get(key) or 0)
+        coverage[key] = len(events) == expected
+
+    details_complete = bool(coverage) and all(coverage.values())
+
+    def _sum_event_prices(events, field="price"):
+        values = [event.get(field) for event in events]
+        if any(value is None for value in values):
+            return None
+        return float(sum(float(value) for value in values))
+
+    new_value = _sum_event_prices(new_events) if coverage.get("new_listings") else None
+    exit_value = _sum_event_prices(exit_events) if coverage.get("observed_exits") else None
+    reduction_value = float(sum(abs(float(event.get("change_amount") or 0)) for event in reductions)) if coverage.get("price_reductions") else None
+    increase_value = float(sum(abs(float(event.get("change_amount") or 0)) for event in increases)) if coverage.get("price_increases") else None
+    net_price_change = (float(increase_value or 0) - float(reduction_value or 0)) if reduction_value is not None and increase_value is not None else None
+
+    def _snapshot(target_date):
+        target_date = pd.Timestamp(target_date).normalize()
+        total = 0.0
+        count = 0
+        for _link, history in histories:
+            first_seen = pd.Timestamp(history.iloc[0]["_activity_date"]).normalize()
+            last_seen = pd.Timestamp(history.iloc[-1]["_activity_date"]).normalize()
+            if first_seen > target_date or last_seen < target_date:
+                continue
+            eligible = history[history["_activity_date"] <= target_date]
+            if eligible.empty:
+                continue
+            price = _plain_number(eligible.iloc[-1].get(price_col))
+            if price is None:
+                continue
+            count += 1
+            total += float(price)
+        return count, total
+
+    expected_opening = expected_metrics.get("opening_stock")
+    expected_closing = expected_metrics.get("closing_stock")
+    opening_count, opening_snapshot_value = _snapshot(start - pd.Timedelta(days=1))
+    closing_count, closing_snapshot_value = _snapshot(end)
+
+    opening_value = None
+    closing_value = None
+    if expected_opening is not None and int(expected_opening) == int(opening_count):
+        opening_value = float(opening_snapshot_value)
+    if expected_closing is not None and int(expected_closing) == int(closing_count):
+        closing_value = float(closing_snapshot_value)
+
+    # The Business company snapshot is authoritative for the latest closing value.
+    if closing_value is None and available_end is not None and end == pd.Timestamp(available_end).normalize():
+        current_value = _business_activity_current_stock_value(company)
+        if current_value is not None:
+            closing_value = float(current_value)
+
+    event_value_complete = details_complete and all(
+        value is not None for value in [new_value, exit_value, reduction_value, increase_value]
+    )
+    event_net_value = None
+    if event_value_complete:
+        event_net_value = float(new_value) - float(exit_value) - float(reduction_value) + float(increase_value)
+        if opening_value is None and closing_value is not None:
+            opening_value = float(closing_value) - event_net_value
+        elif closing_value is None and opening_value is not None:
+            closing_value = float(opening_value) + event_net_value
+
+    value_movement_complete = opening_value is not None and closing_value is not None
+    net_value_change = float(closing_value) - float(opening_value) if value_movement_complete else event_net_value
+    net_value_pct = None
+    if value_movement_complete and opening_value and abs(float(opening_value)) > 0.01:
+        net_value_pct = round((net_value_change / float(opening_value)) * 100.0, 1)
+
+    daily_events = defaultdict(lambda: {
+        "new_listings": [],
+        "observed_exits": [],
+        "price_reductions": [],
+        "price_increases": [],
+    })
+    for key, events in event_map.items():
+        for event in events:
+            daily_events[event["date"]][key].append(event)
+
+    # Sort detailed actions in the order a manager is most likely to inspect them:
+    # newest first, then largest asking-value impact.
+    def _event_sort_key(event):
+        return (str(event.get("date") or ""), abs(float(event.get("change_amount") or event.get("price") or 0)))
+
+    for events in event_map.values():
+        events.sort(key=_event_sort_key, reverse=True)
+
+    return {
+        "available": any(len(events) for events in event_map.values()),
+        "details_complete": details_complete,
+        "coverage": coverage,
+        "new_listings": new_events,
+        "observed_exits": exit_events,
+        "price_reductions": reductions,
+        "price_increases": increases,
+        "daily_events": dict(daily_events),
+        "opening_stock_value": opening_value,
+        "closing_stock_value": closing_value,
+        "net_stock_value_change": net_value_change,
+        "net_stock_value_change_pct": net_value_pct,
+        "new_listing_asking_value": new_value,
+        "observed_exit_asking_value": exit_value,
+        "price_reduction_value": reduction_value,
+        "price_increase_value": increase_value,
+        "net_price_change_value": net_price_change,
+        "value_movement_complete": value_movement_complete,
+    }
+
+
+def _business_activity_period_summary(company, period="30D", custom_from=None, custom_to=None):
+    """Build a deterministic, decision-oriented activity report for one gallery.
+
+    Aggregate counts come from business_company_activity_daily.csv. Vehicle-level
+    movement and asking-value changes are added only when historical observations
+    can reproduce those authoritative counts.
     """
     if not company or business_activity_df is None or business_activity_df.empty:
-        return {"data_available": False, "summary": {}, "daily": [], "top_days": []}
+        return {"data_available": False, "summary": {}, "daily": [], "top_days": [], "events": {}}
 
     work = business_activity_df[
         business_activity_df["Company"].fillna("").astype(str).str.casefold()
         == str(company).casefold()
     ].copy()
     if work.empty:
-        return {"data_available": False, "summary": {}, "daily": [], "top_days": []}
+        return {"data_available": False, "summary": {}, "daily": [], "top_days": [], "events": {}}
 
     work = work.sort_values("Date").copy()
     available_start = pd.Timestamp(work["Date"].min()).normalize()
@@ -9715,12 +10046,11 @@ def _business_activity_period_summary(company, period="30D", custom_from=None, c
         start = pd.to_datetime(custom_from, errors="coerce")
         end = pd.to_datetime(custom_to, errors="coerce")
         if pd.isna(start) or pd.isna(end):
-            return {"data_available": False, "summary": {}, "daily": [], "top_days": [], "error": "INVALID_CUSTOM_PERIOD"}
+            return {"data_available": False, "summary": {}, "daily": [], "top_days": [], "events": {}, "error": "INVALID_CUSTOM_PERIOD"}
         start = pd.Timestamp(start).normalize()
         end = pd.Timestamp(end).normalize()
         if start > end:
             start, end = end, start
-        # Never imply coverage beyond the intelligence snapshot actually loaded.
         start = max(start, available_start)
         end = min(end, available_end)
     else:
@@ -9734,6 +10064,7 @@ def _business_activity_period_summary(company, period="30D", custom_from=None, c
             "summary": {},
             "daily": [],
             "top_days": [],
+            "events": {},
             "available_from": available_start.date().isoformat(),
             "available_to": available_end.date().isoformat(),
         }
@@ -9751,6 +10082,7 @@ def _business_activity_period_summary(company, period="30D", custom_from=None, c
             "summary": {},
             "daily": [],
             "top_days": [],
+            "events": {},
             "period_start": start.date().isoformat(),
             "period_end": end.date().isoformat(),
             "available_from": available_start.date().isoformat(),
@@ -9842,11 +10174,37 @@ def _business_activity_period_summary(company, period="30D", custom_from=None, c
             "total_activity": new_listings + exits + reductions + increases,
         })
 
+    detail = _business_activity_event_details(
+        company,
+        start,
+        end,
+        expected_metrics=current_metrics,
+        daily_expected=daily,
+        available_end=available_end,
+    )
+
     top_days = sorted(
-        [item for item in daily if item.get("total_activity", 0) > 0],
+        [item.copy() for item in daily if item.get("total_activity", 0) > 0],
         key=lambda item: (item.get("total_activity", 0), item.get("date", "")),
         reverse=True,
     )[:3]
+
+    coverage = detail.get("coverage") or {}
+    daily_events = detail.get("daily_events") or {}
+    for item in top_days:
+        date_key = str(item.get("date") or "")
+        day_events = daily_events.get(date_key) or {}
+        detail_payload = {}
+        complete_for_day = True
+        for key in ["new_listings", "observed_exits", "price_reductions", "price_increases"]:
+            expected_count = int(item.get(key) or 0)
+            events = list(day_events.get(key) or [])
+            exact = bool(coverage.get(key)) and len(events) == expected_count
+            detail_payload[key] = events if exact else []
+            if expected_count > 0 and not exact:
+                complete_for_day = False
+        item["event_details"] = detail_payload
+        item["event_details_complete"] = complete_for_day
 
     reductions = int(current_metrics.get("price_reductions") or 0)
     increases = int(current_metrics.get("price_increases") or 0)
@@ -9858,6 +10216,7 @@ def _business_activity_period_summary(company, period="30D", custom_from=None, c
 
     summary = {
         **current_metrics,
+        "period_key": period_key,
         "period_days": period_days,
         "period_start": start.date().isoformat(),
         "period_end": end.date().isoformat(),
@@ -9870,6 +10229,19 @@ def _business_activity_period_summary(company, period="30D", custom_from=None, c
         "average_daily_activity": round((current_metrics.get("total_activity") or 0) / period_days, 2),
         "available_from": available_start.date().isoformat(),
         "available_to": available_end.date().isoformat(),
+        "vehicle_detail_available": bool(detail.get("available")),
+        "vehicle_detail_complete": bool(detail.get("details_complete")),
+        "detail_coverage": coverage,
+        "opening_stock_value": detail.get("opening_stock_value"),
+        "closing_stock_value": detail.get("closing_stock_value"),
+        "net_stock_value_change": detail.get("net_stock_value_change"),
+        "net_stock_value_change_pct": detail.get("net_stock_value_change_pct"),
+        "new_listing_asking_value": detail.get("new_listing_asking_value"),
+        "observed_exit_asking_value": detail.get("observed_exit_asking_value"),
+        "price_reduction_value": detail.get("price_reduction_value"),
+        "price_increase_value": detail.get("price_increase_value"),
+        "net_price_change_value": detail.get("net_price_change_value"),
+        "value_movement_complete": bool(detail.get("value_movement_complete")),
     }
 
     return {
@@ -9877,7 +10249,14 @@ def _business_activity_period_summary(company, period="30D", custom_from=None, c
         "summary": summary,
         "daily": daily,
         "top_days": top_days,
+        "events": {
+            "new_listings": detail.get("new_listings") or [],
+            "observed_exits": detail.get("observed_exits") or [],
+            "price_reductions": detail.get("price_reductions") or [],
+            "price_increases": detail.get("price_increases") or [],
+        },
     }
+
 
 
 @app.route("/api/guided/business/activity-summary", methods=["POST"])
