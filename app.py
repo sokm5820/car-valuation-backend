@@ -9472,6 +9472,133 @@ def _normalise_fraction(value):
     return numeric
 
 
+
+def _round_business_benchmark(value, step=50):
+    """Round derived market statistics to a sensible vehicle-pricing increment.
+
+    Actual advertised asking prices remain exact. Derived medians/targets should
+    not expose false precision such as £14,262.50 in a commercial vehicle report.
+    """
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    step = max(int(step or 50), 1)
+    return int(math.floor((numeric / step) + 0.5) * step)
+
+
+def _business_inventory_pricing_recommendations(company, limit=5):
+    """Return structured pricing priorities for a gallery's active inventory.
+
+    Ranking is deterministic and combines the existing inventory-action rules,
+    observed listing age, historical exit benchmarks and current comparable-price
+    position. This powers the paid report UI directly rather than flattening the
+    analysis into one long prose response.
+    """
+    if not company or business_stock_df is None or business_stock_df.empty:
+        return {"recommendations": [], "summary": {}}
+
+    work = business_stock_df[
+        business_stock_df["Company"].fillna("").astype(str).str.casefold()
+        == str(company).casefold()
+    ].copy()
+    if work.empty:
+        return {"recommendations": [], "summary": {}}
+
+    action_rank = {
+        "REPRICE_REVIEW": 0,
+        "WATCH_REPRICE": 1,
+        "NON_PRICE_REVIEW": 2,
+        "WATCH": 3,
+        "REVIEW_MANUALLY": 4,
+        "HOLD_MONITOR": 5,
+    }
+
+    rows = []
+    review_now = 0
+    ageing = 0
+    already_competitive = 0
+
+    for raw in work.to_dict("records"):
+        public = _business_manage_row_public(raw)
+        action = str(public.get("recommended_action") or "REVIEW_MANUALLY").strip().upper()
+        age = public.get("listing_age_days")
+        med_days = public.get("historical_median_days_to_exit")
+        price_vs = public.get("price_vs_median_pct")
+        price_position = str(public.get("price_position") or "").strip().upper()
+
+        if action in {"REPRICE_REVIEW", "WATCH_REPRICE"}:
+            review_now += 1
+        if age is not None and med_days not in [None, 0] and float(age) > float(med_days):
+            ageing += 1
+        if price_position in {"LOW", "LOW_MID", "MID_MARKET"}:
+            already_competitive += 1
+
+        median_raw = public.get("comparable_median_price")
+        p25_raw = public.get("comparable_p25_price")
+        p75_raw = public.get("comparable_p75_price")
+        public["display_comparable_median_price"] = _round_business_benchmark(median_raw, 50)
+        public["display_comparable_p25_price"] = _round_business_benchmark(p25_raw, 50)
+        public["display_comparable_p75_price"] = _round_business_benchmark(p75_raw, 50)
+
+        # Suggested positions are analytical guidance, so use coarser £250 steps.
+        # Never imply these are exact valuations or guaranteed transaction prices.
+        asking = public.get("asking_price")
+        median_target = _round_business_benchmark(median_raw, 250)
+        lower_target = _round_business_benchmark(p25_raw, 250)
+        should_reprice = action in {"REPRICE_REVIEW", "WATCH_REPRICE"}
+        if should_reprice and asking is not None and median_target is not None and median_target < float(asking):
+            public["suggested_market_position_high"] = median_target
+            if lower_target is not None and lower_target < median_target:
+                public["suggested_market_position_low"] = lower_target
+            else:
+                public["suggested_market_position_low"] = None
+        else:
+            public["suggested_market_position_low"] = None
+            public["suggested_market_position_high"] = None
+
+        age_pressure = 0.0
+        if age is not None and med_days not in [None, 0]:
+            age_pressure = max(0.0, float(age) / max(float(med_days), 1.0))
+        elif age is not None:
+            age_pressure = float(age) / 90.0
+
+        rows.append({
+            **public,
+            "_action_rank": action_rank.get(action, 9),
+            "_age_pressure": age_pressure,
+            "_price_pressure": float(price_vs) if price_vs is not None else -99.0,
+        })
+
+    rows.sort(
+        key=lambda item: (
+            item.get("_action_rank", 9),
+            -float(item.get("_age_pressure") or 0),
+            -float(item.get("_price_pressure") or -99),
+            -float(item.get("listing_age_days") or 0),
+        )
+    )
+
+    limit = max(1, min(int(limit or 5), 8))
+    public_rows = []
+    for item in rows[:limit]:
+        item = dict(item)
+        item.pop("_action_rank", None)
+        item.pop("_age_pressure", None)
+        item.pop("_price_pressure", None)
+        public_rows.append(item)
+
+    summary = {
+        "active_stock_count": int(len(work)),
+        "price_review_count": int(review_now),
+        "ageing_count": int(ageing),
+        "already_competitive_count": int(already_competitive),
+    }
+    return {"recommendations": public_rows, "summary": summary}
+
+
 def _business_advertising_recommendations(company, limit=5):
     """Rank current dealership stock by where paid visibility is most defensible.
 
@@ -9559,6 +9686,60 @@ def _business_advertising_recommendations(company, limit=5):
         reverse=True,
     )
     return ranked[:max(1, min(int(limit or 5), 8))]
+
+
+
+@app.route("/api/guided/business/inventory-pricing", methods=["POST"])
+def api_guided_business_inventory_pricing():
+    """Return structured pricing priorities for the selected gallery's own stock."""
+    try:
+        data = request.get_json(silent=True) or {}
+        manager = get_access_manager()
+        context = _request_access_context(data)
+        g.otodeger_access_context = context
+        requested_business = _normalize_access_tier(data.get("access_tier") or data.get("tier")) == "BUSINESS"
+
+        if manager.enforcement_enabled:
+            if not requested_business or not context.business_entitled:
+                raise BusinessAccessRequired("An authorised Business account is required")
+            manager.activate_business_device(context)
+            company = str(context.org_name or "").strip()
+        elif context.business_entitled and requested_business and context.org_name:
+            company = str(context.org_name).strip()
+        else:
+            company = _resolve_business_company(
+                "",
+                requested_company=str(data.get("business_company") or "").strip() or None,
+            )
+
+        if not company:
+            return jsonify({
+                "success": False,
+                "error": "BUSINESS_COMPANY_REQUIRED",
+                "recommendations": [],
+                "summary": {},
+            }), 400
+
+        payload = _business_inventory_pricing_recommendations(company, limit=data.get("limit") or 5)
+        recommendations = payload.get("recommendations") or []
+        return jsonify({
+            "success": True,
+            "company": company,
+            "recommendations": recommendations,
+            "summary": payload.get("summary") or {},
+            "count": len(recommendations),
+        })
+    except AccessControlError as exc:
+        return _access_control_error_response(exc)
+    except Exception as exc:
+        print("BUSINESS INVENTORY PRICING RECOMMENDATIONS FAILED:", repr(exc), flush=True)
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": "BUSINESS_INVENTORY_PRICING_UNAVAILABLE",
+            "recommendations": [],
+            "summary": {},
+        }), 503
 
 
 @app.route("/api/guided/business/ad-recommendations", methods=["POST"])
