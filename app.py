@@ -9753,6 +9753,28 @@ def _guided_list_arg(name):
     return [value.strip() for value in values if value and value.strip()]
 
 
+# Curated overrides for brands whose marketplace taxonomy is known to be
+# unreliable. These only affect the AI assistant guided-discovery index.
+# Mixed-use brands (for example Honda) are intentionally NOT listed here.
+_GUIDED_MOTORCYCLE_ONLY_BRAND_KEYS = {
+    "aprilia", "yamaha", "rks", "triumph", "ducati", "kawasaki",
+    "harleydavidson", "ktm", "husqvarna", "benelli", "vespa", "piaggio",
+    "kymco", "sym", "bajaj", "royalenfield", "motoguzzi", "mvagusta",
+    "cfmoto", "keeway",
+}
+_GUIDED_ATV_ONLY_BRAND_KEYS = {"yuki"}
+_GUIDED_UNSUPPORTED_BRAND_KEYS = {"jet"}
+
+
+def _guided_taxonomy_key(value):
+    key = (
+        str(value or "").strip().casefold().replace("i̇", "i")
+        .replace("ı", "i").replace("ş", "s").replace("ç", "c")
+        .replace("ğ", "g").replace("ü", "u").replace("ö", "o")
+    )
+    return re.sub(r"[^a-z0-9]+", "", key)
+
+
 def _guided_classify_row(row):
     """Return exactly one supported vehicle class for a guided-market row.
 
@@ -9766,7 +9788,19 @@ def _guided_classify_row(row):
     """
     brand = str(row.get("Brand") or "").strip()
     model = str(row.get("Model") or "").strip()
+    brand_key = _guided_taxonomy_key(brand)
     profile = MODEL_PROFILE_LOOKUP.get((brand.casefold(), model.casefold()), {})
+
+    # Brand-level overrides are evaluated before the source VehicleType because
+    # several motorcycle/ATV brands have been observed with generic automobile
+    # taxonomy in the source feed. Unknown/unsupported brands are excluded rather
+    # than silently assumed to be cars.
+    if brand_key in _GUIDED_UNSUPPORTED_BRAND_KEYS:
+        return set()
+    if brand_key in _GUIDED_MOTORCYCLE_ONLY_BRAND_KEYS:
+        return {"MOTORCYCLE"}
+    if brand_key in _GUIDED_ATV_ONLY_BRAND_KEYS:
+        return {"ATV"}
 
     raw_vt = str(row.get("VehicleType") or "").strip()
     raw_cf = (
@@ -9800,6 +9834,19 @@ def _guided_classify_row(row):
         if profile_vt == "PICKUP" or body == "PICKUP":
             return {"PICKUP"}
         return {"SUV"}
+
+    # Some source rows carry an ordinary-car VehicleType even though their
+    # category/link text explicitly identifies a motorcycle or ATV. Catch those
+    # signals before accepting the broad automobile label.
+    special_haystack = " ".join([
+        str(row.get("Brand") or ""), str(row.get("Model") or ""),
+        str(row.get("Category") or ""), str(row.get("CategoryDetail") or ""),
+        str(row.get("Link") or ""),
+    ]).casefold()
+    if re.search(r"\b(?:motosiklet|motorcycle|scooter|vespa)\b", special_haystack):
+        return {"MOTORCYCLE"}
+    if re.search(r"\b(?:atv|utv|quad)\b", special_haystack):
+        return {"ATV"}
 
     # 2) Refine ordinary car rows using the validated model/body profile.
     if raw_key in {"otomobil", "car", "automobile", "araba"}:
@@ -9837,8 +9884,10 @@ def _guided_classify_row(row):
         return {"PICKUP"}
     if re.search(r"\b(?:suv|crossover|4x4|arazi)\b", haystack):
         return {"SUV"}
-    if haystack.strip():
-        return {"CAR"}
+
+    # Do not guess CAR for an unknown source taxonomy. A false positive here
+    # pollutes every later Brand/Model/Category facet; omission is safer until
+    # the row has an explicit source type or a validated model profile.
     return set()
 
 
@@ -9849,7 +9898,7 @@ def _guided_type_matches(row, requested_types):
     return bool(_guided_classify_row(row) & requested)
 
 
-_GUIDED_EXCLUDED_BRAND_KEYS = {"is", "cekici", "surat", "gezi"}
+_GUIDED_EXCLUDED_BRAND_KEYS = {"is", "cekici", "surat", "gezi"} | _GUIDED_UNSUPPORTED_BRAND_KEYS
 _GUIDED_SUPPORTED_TYPES = ("CAR", "SUV", "PICKUP", "MOTORCYCLE", "ATV")
 _GUIDED_INDEX_LOCK = threading.Lock()
 _GUIDED_INDEX_SOURCE = None
@@ -9859,12 +9908,7 @@ _GUIDED_OPTIONS_CACHE_MAX = 256
 
 
 def _guided_brand_key(value):
-    key = (
-        str(value or "").strip().casefold().replace("i̇", "i")
-        .replace("ı", "i").replace("ş", "s").replace("ç", "c")
-        .replace("ğ", "g").replace("ü", "u").replace("ö", "o")
-    )
-    return re.sub(r"[^a-z0-9]+", "", key)
+    return _guided_taxonomy_key(value)
 
 
 def _guided_brand_allowed(value):
