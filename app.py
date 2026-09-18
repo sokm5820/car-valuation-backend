@@ -10281,16 +10281,72 @@ def _guided_stock_opportunities(rows, max_budget=None, limit=5):
     matched["_turnover"] = pd.to_numeric(matched.get("ObservedExitWithin60DaysRate"), errors="coerce")
     matched["_median_exit_days"] = pd.to_numeric(matched.get("MedianObservedDaysToExit"), errors="coerce")
     matched["_current_supply"] = pd.to_numeric(matched.get("CurrentListings"), errors="coerce")
+    matched["_historical_depth"] = pd.to_numeric(matched.get("HistoricalDistinctListings"), errors="coerce")
+    matched["_price_reduction"] = pd.to_numeric(matched.get("PriceReductionRate"), errors="coerce")
     matched["_specificity"] = matched["_granularity"].map({"CATEGORY_YEAR": 0, "MODEL_YEAR": 1}).fillna(2)
 
-    # The offline Business opportunity signal already combines demand, supply,
-    # price pressure and evidence. We preserve it as the primary deterministic
-    # ranking, then use transparent turnover/supply statistics as tie-breakers.
+    # For a dealer who normally imports stock, active local listings are not
+    # sourcing inventory: they are the vehicles the dealer will compete against
+    # after the imported vehicle reaches the island.  Rank therefore rewards
+    # observed turnover and faster market exit, while *lower* active supply is a
+    # positive competition signal. Historical depth and evidence quality prevent
+    # a one-off/niche vehicle with very little history from winning simply because
+    # there happens to be little current competition.
+    def _pct_rank(series, higher_is_better=True):
+        numeric = pd.to_numeric(series, errors="coerce")
+        if numeric.notna().sum() <= 1:
+            return pd.Series(0.5, index=numeric.index, dtype="float64")
+        return numeric.rank(ascending=higher_is_better, pct=True, method="average")
+
+    matched["_turnover_score"] = _pct_rank(matched["_turnover"], higher_is_better=True)
+    matched["_speed_score"] = _pct_rank(matched["_median_exit_days"], higher_is_better=False)
+    matched["_competition_score"] = _pct_rank(matched["_current_supply"], higher_is_better=False)
+    matched["_history_score"] = _pct_rank(matched["_historical_depth"], higher_is_better=True)
+    matched["_price_pressure_score"] = _pct_rank(matched["_price_reduction"], higher_is_better=False)
+    matched["_evidence_score"] = matched["EvidenceQuality"].map({"HIGH": 1.0, "MEDIUM": 0.65, "LOW": 0.30}).fillna(0.45)
+
+    matched["_turnover_score"] = matched["_turnover_score"].fillna(0.25)
+    matched["_speed_score"] = matched["_speed_score"].fillna(0.25)
+    matched["_competition_score"] = matched["_competition_score"].fillna(0.35)
+    matched["_history_score"] = matched["_history_score"].fillna(0.20)
+    matched["_price_pressure_score"] = matched["_price_pressure_score"].fillna(0.50)
+
+    matched["_stock_score"] = (
+        0.34 * matched["_turnover_score"]
+        + 0.24 * matched["_speed_score"]
+        + 0.20 * matched["_competition_score"]
+        + 0.10 * matched["_history_score"]
+        + 0.08 * matched["_evidence_score"]
+        + 0.04 * matched["_price_pressure_score"]
+    )
+
+    # Give category-year evidence a tiny deterministic preference when all of
+    # the commercial evidence is otherwise effectively equal.
     matched = matched.sort_values(
-        ["_signal_rank", "_evidence_rank", "_confidence_index", "_opportunity_percentile", "_specificity", "_turnover", "_median_exit_days", "_current_supply"],
-        ascending=[True, True, False, False, True, False, True, False],
+        ["_stock_score", "_specificity", "_turnover", "_median_exit_days", "_current_supply", "_historical_depth"],
+        ascending=[False, True, False, True, True, False],
         na_position="last",
     )
+
+    valid_supply = matched["_current_supply"].dropna()
+    supply_low = float(valid_supply.quantile(0.33)) if len(valid_supply) >= 3 else None
+    supply_high = float(valid_supply.quantile(0.67)) if len(valid_supply) >= 3 else None
+
+    def _competition_context(value):
+        if value is None or pd.isna(value):
+            return "UNKNOWN"
+        value = float(value)
+        if supply_low is not None and supply_high is not None:
+            if value <= supply_low:
+                return "LOW"
+            if value >= supply_high:
+                return "HIGH"
+            return "MODERATE"
+        if value <= 2:
+            return "LOW"
+        if value <= 6:
+            return "MODERATE"
+        return "HIGH"
 
     selected = []
     seen_models = set()
@@ -10318,6 +10374,8 @@ def _guided_stock_opportunities(rows, max_budget=None, limit=5):
             "category": str(row.get("CategoryDetail") or "").strip(),
             "year": num("Year", integer=True),
             "current_listings": num("CurrentListings", integer=True),
+            "competition_context": _competition_context(row.get("CurrentListings")),
+            "stock_rank_score": num("_stock_score"),
             "starting_price": num("CurrentStartingPrice"),
             "median_price": num("CurrentMedianPrice"),
             "highest_price": num("CurrentHighestPrice"),
@@ -10880,7 +10938,8 @@ def api_guided_discovery_stock_recommendations():
     """Write concise commercial advice from already-ranked Business evidence.
 
     Ranking remains deterministic and is supplied by `_guided_stock_opportunities`.
-    The model only synthesizes the hard market statistics into human advice.
+    Active island listings are treated as SELL-SIDE COMPETITION, not sourcing
+    inventory. The model only synthesizes the hard market statistics into advice.
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -10904,7 +10963,8 @@ def api_guided_discovery_stock_recommendations():
                 "model": str(item.get("model") or ""),
                 "category": str(item.get("category") or ""),
                 "year": item.get("year"),
-                "current_listings": item.get("current_listings"),
+                "active_competing_listings": item.get("current_listings"),
+                "competition_context_within_shortlist": item.get("competition_context"),
                 "starting_price_gbp": item.get("starting_price"),
                 "median_asking_price_gbp": item.get("median_price"),
                 "historical_distinct_listings": item.get("historical_distinct_listings"),
@@ -10912,7 +10972,6 @@ def api_guided_discovery_stock_recommendations():
                 "observed_share_no_longer_advertised_within_60_days": item.get("observed_exit_within_60_days_rate"),
                 "historical_asking_price_reduction_rate": item.get("historical_price_reduction_rate"),
                 "evidence_quality": item.get("evidence_quality"),
-                "acquisition_reasons": item.get("acquisition_reasons") or [],
             })
 
         language_name = {"EN": "English", "TR": "Turkish", "RU": "Russian"}[language]
@@ -10927,16 +10986,16 @@ Your job is to explain why each position is commercially defensible using ONLY t
 Writing rules:
 - Write like a sharp dealership adviser, not an analyst or a generic AI.
 - Rank 1-3: about 55-70 words. Ranks 4-5: about 35-50 words.
-- Give each candidate a short, distinct scan label such as "Best demand/supply balance", "Fastest turnover", "Scarce high-demand target", or "Deeper supply option" when supported.
-- Focus on demand/turnover first, then supply depth, then asking-price context. Mention only the 2-4 facts that materially explain the ranking.
+- Give each candidate a short, distinct scan label such as "Best demand/competition balance", "Fast turnover, low competition", "Strong demand, crowded market", or "Low-competition opportunity" when supported.
+- Focus on demand/turnover first, then ACTIVE LOCAL COMPETITION, then asking-price context. Mention only the 2-4 facts that materially explain the ranking.
 - `observed_share_no_longer_advertised_within_60_days` is NOT a verified sold percentage. It means that share of historically observed listings was no longer advertised within 60 days. You may state the percentage, but describe it exactly in that buyer-friendly way. NEVER call it sold rate, sales rate, confirmed sales, or probability of sale.
 - `median_observed_days_to_leave_market` is observed listing turnover, not confirmed days-to-sale. Say "median observed time to leave the market" or a natural equivalent.
-- Current supply matters commercially: deep supply gives more sourcing/comparison choice but can also mean more competition; thin supply can be attractive only when turnover is genuinely strong and the evidence is sufficient.
-- If current_listings is 1, never describe the asking price as a market median/typical price. Say the only current example is advertised at X if useful.
+- `active_competing_listings` means comparable vehicles already advertised on the island. These are competitors the dealer would have to sell against, NOT vehicles available for the dealer to source. Higher active supply therefore means more competition. Lower active supply is attractive only when historical turnover/demand is sufficiently strong; very low supply with weak historical evidence may simply indicate a niche market. NEVER describe active listings as sourcing choice, buying choice, procurement availability, or useful selection for the dealer.
+- If `active_competing_listings` is 1, never describe the asking price as a market median/typical price. Say the only current competing example is advertised at X if useful.
 - Explain the implication of the statistics rather than dumping numbers. For example, "72% were no longer advertised within 60 days and the median observed exit was 34 days, giving this one of the stronger turnover signals in the shortlist."
 - Use historical asking-price reductions only as a caution about price pressure; do not infer margin or wholesale acquisition cost.
 - Do not imply profit. The dealer's actual acquisition cost, preparation cost and margin are unknown.
-- Compare candidates to each other where useful. Tell the dealer when a lower-ranked option would make more sense than the one above it.
+- Compare candidates to each other where useful. Make the commercial trade-off explicit: strong turnover with low/moderate active competition is especially attractive; strong turnover with many active competitors can still work but is a more crowded opportunity. Tell the dealer when a lower-ranked option would make more sense than the one above it.
 - Avoid internal jargon such as OpportunityPercentile, AcquisitionSignal, confidence-adjusted index, evidence base or algorithm.
 - Avoid repeated stock phrases. Each recommendation should feel written for that vehicle.
 - Preserve each candidate key exactly.
