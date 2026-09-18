@@ -8122,13 +8122,6 @@ def _business_acquisition_candidates(message, limit=8):
     def eligible(frame):
         x = frame.copy()
 
-        if budget is not None:
-            # We do not know wholesale acquisition cost. CurrentStartingPrice is
-            # therefore only a live advertised-market affordability proxy.
-            x = x[
-                pd.to_numeric(x["CurrentStartingPrice"], errors="coerce").le(budget)
-            ].copy()
-
         x = x[
             x["AcquisitionSignal"].isin(
                 ["VERY_STRONG", "STRONG", "MODERATE", "WEAK", "CAUTION"]
@@ -8290,9 +8283,9 @@ def _business_acquisition_answer(message, language):
 
     if not candidates:
         fallback = {
-            "TR": "Bu bütçe ve araç tipi için yeterli kanıta sahip bir stok fırsatı bulamadım.",
-            "EN": "I couldn't find a stocking opportunity with sufficient evidence for that budget and vehicle type.",
-            "RU": "Я не нашёл достаточно подтверждённых вариантов для закупки в рамках этого бюджета и типа автомобиля.",
+            "TR": "Bu araç tipi için yeterli kanıta sahip bir stok fırsatı bulamadım.",
+            "EN": "I couldn't find a stocking opportunity with sufficient evidence for that vehicle type.",
+            "RU": "Я не нашёл достаточно подтверждённых вариантов для закупки по этому типу автомобиля.",
         }
         return fallback.get(language, fallback["TR"]), result
 
@@ -8390,34 +8383,22 @@ def _business_acquisition_answer(message, language):
             )
 
     if language == "EN":
-        intro = (
-            f"Using current advertised-market levels"
-            + (f" within roughly a {_business_money(budget)} ceiling" if budget else "")
-            + ", these are the strongest evidence-backed stocking opportunities I can identify:"
-        )
+        intro = "Using current advertised-market evidence, these are the strongest evidence-backed stocking opportunities I can identify:"
         note = (
             "This is a market-opportunity ranking, not a wholesale purchase-price or profit prediction. "
-            "I do not yet know your actual acquisition cost, so current asking prices are being used only as a market-level affordability reference."
+            "Actual dealer acquisition cost is unknown, so advertised asking prices are used only as resale-market and competition context and are not compared with a stock-purchase budget."
         )
     elif language == "RU":
-        intro = (
-            "По текущим рыночным объявлениям"
-            + (f" и ориентиру примерно до {_business_money(budget)}" if budget else "")
-            + " наиболее сильные подтверждённые варианты для закупки выглядят так:"
-        )
+        intro = "По текущим рыночным объявлениям наиболее сильные подтверждённые варианты для закупки выглядят так:"
         note = (
             "Это рейтинг рыночной привлекательности, а не прогноз закупочной цены или прибыли. "
-            "Фактическая закупочная стоимость мне пока неизвестна, поэтому текущие цены объявлений используются только как ориентир."
+            "Фактическая закупочная стоимость неизвестна, поэтому цены объявлений используются только как контекст розничного рынка и конкуренции и не сравниваются с бюджетом на закупку."
         )
     else:
-        intro = (
-            "Güncel ilan piyasasını"
-            + (f" ve yaklaşık {_business_money(budget)} bütçe tavanını" if budget else "")
-            + " dikkate aldığımda, verinin en güçlü desteklediği stok seçenekleri şunlar:"
-        )
+        intro = "Güncel ilan piyasası verilerine göre, verinin en güçlü desteklediği stok seçenekleri şunlar:"
         note = (
             "Bu bir piyasa fırsatı sıralamasıdır; alış maliyeti veya kâr tahmini değildir. "
-            "Gerçek alış maliyetinizi henüz bilmediğim için güncel ilan fiyatlarını yalnızca piyasa/bütçe referansı olarak kullanıyorum."
+            "Gerçek galeri alış maliyeti bilinmediği için ilan fiyatları yalnızca perakende piyasa ve rekabet bağlamı olarak kullanılır; stok alım bütçesiyle karşılaştırılmaz."
         )
 
     return intro + "\n\n" + "\n\n".join(lines) + "\n\n" + note, result
@@ -10216,11 +10197,12 @@ def _guided_apply_category_keys(rows, category_keys):
 
 
 
-def _guided_stock_opportunities(rows, max_budget=None, limit=5):
+def _guided_stock_opportunities(rows, limit=5):
     """Rank stock opportunities within the EXACT guided-selection universe.
 
-    The hard selector (vehicle type, year, brand, model, category, budget) is
-    resolved first against the guided listing index. Business intelligence is
+    The hard selector (vehicle type, year, brand, model and category) is
+    resolved first against the guided listing index. A dealer's acquisition
+    budget is deliberately not treated as a retail asking-price ceiling. Business intelligence is
     then joined only to those surviving Brand/Model/Category/Year combinations,
     so a Business report cannot re-introduce a motorcycle, ATV or other vehicle
     that the guided type classifier excluded.
@@ -10257,18 +10239,6 @@ def _guided_stock_opportunities(rows, max_budget=None, limit=5):
     ) & work["_granularity"].eq("MODEL_YEAR")
 
     matched = pd.concat([work.loc[category_mask], work.loc[model_mask]], axis=0)
-    if matched.empty:
-        return []
-
-    # Current starting ask is only an advertised-market affordability proxy; it
-    # is not assumed to equal a dealer's eventual acquisition cost.
-    if max_budget not in [None, ""]:
-        try:
-            ceiling = float(max_budget)
-            starting = pd.to_numeric(matched["CurrentStartingPrice"], errors="coerce")
-            matched = matched[starting.le(ceiling)].copy()
-        except (TypeError, ValueError):
-            pass
     if matched.empty:
         return []
 
@@ -10426,13 +10396,18 @@ def api_guided_discovery_result():
         else:
             max_budget = float(max_budget)
 
+        # Personal buying budget can cap retail asking prices. A dealership's
+        # stock-purchase budget cannot: advertised prices describe the resale
+        # market, not the gallery's eventual acquisition cost.
+        listing_budget_ceiling = None if task == "STOCK_PURCHASE" else max_budget
+
         rows = _guided_index_filter(
             index,
             min_year=min_year,
             vehicle_types=vehicle_types,
             brands=brands,
             model_keys=model_keys,
-            max_budget=max_budget,
+            max_budget=listing_budget_ceiling,
         )
         rows = _guided_apply_category_keys(rows, category_keys)
 
@@ -10667,7 +10642,7 @@ def api_guided_discovery_result():
                 "link": str(row.get("Link") or ""),
             })
 
-        stock_opportunities = _guided_stock_opportunities(rows, max_budget=max_budget, limit=5) if task == "STOCK_PURCHASE" else []
+        stock_opportunities = _guided_stock_opportunities(rows, limit=5) if task == "STOCK_PURCHASE" else []
         return jsonify({
             "success": True,
             "count": int(len(rows)),
@@ -10994,6 +10969,7 @@ Writing rules:
 - If `active_competing_listings` is 1, never describe the asking price as a market median/typical price. Say the only current competing example is advertised at X if useful.
 - Explain the implication of the statistics rather than dumping numbers. For example, "72% were no longer advertised within 60 days and the median observed exit was 34 days, giving this one of the stronger turnover signals in the shortlist."
 - Use historical asking-price reductions only as a caution about price pressure; do not infer margin or wholesale acquisition cost.
+- Advertised asking prices are retail-market context only. NEVER compare them with the dealer's stock-purchase budget, never say a candidate is near/within/outside budget, and never infer acquisition affordability from an advertised price.
 - Do not imply profit. The dealer's actual acquisition cost, preparation cost and margin are unknown.
 - Compare candidates to each other where useful. Make the commercial trade-off explicit: strong turnover with low/moderate active competition is especially attractive; strong turnover with many active competitors can still work but is a more crowded opportunity. Tell the dealer when a lower-ranked option would make more sense than the one above it.
 - Avoid internal jargon such as OpportunityPercentile, AcquisitionSignal, confidence-adjusted index, evidence base or algorithm.
@@ -11002,9 +10978,9 @@ Writing rules:
 """.strip()
 
         payload = {
-            "dealer_constraints": {
-                "budget_gbp": data.get("budget"),
+            "selection_context": {
                 "minimum_year": data.get("min_year"),
+                "asking_price_note": "Advertised asking prices are retail-market/competition context, not dealer acquisition cost.",
             },
             "ranked_stock_candidates": clean_candidates,
         }
