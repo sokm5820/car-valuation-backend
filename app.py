@@ -9728,11 +9728,36 @@ def _business_inventory_pricing_recommendations(company, limit=500):
             and price_position not in {"", "UNKNOWN", "UNAVAILABLE", "NONE"}
         )
 
-        if not has_market_benchmark:
+        p25_raw = public.get("comparable_p25_price")
+        p75_raw = public.get("comparable_p75_price")
+        public["display_comparable_median_price"] = _round_business_benchmark(median_numeric, 50)
+        public["display_comparable_p25_price"] = _round_business_benchmark(p25_raw, 50)
+        public["display_comparable_p75_price"] = _round_business_benchmark(p75_raw, 50)
+
+        asking = public.get("asking_price")
+        try:
+            asking_numeric = float(asking) if asking is not None else None
+            if asking_numeric is not None and not math.isfinite(asking_numeric):
+                asking_numeric = None
+        except (TypeError, ValueError):
+            asking_numeric = None
+
+        # Treat small deviations from the comparable median as normal market
+        # noise, not as a pricing opportunity.  In particular, a vehicle should
+        # not be labelled "potentially under-priced" merely because it is £1 or
+        # £50 below the median.  The gap must be commercially material in both
+        # percentage and cash terms.
+        materiality_threshold = None
+        price_gap_to_median = None
+        if has_market_benchmark and asking_numeric is not None:
+            price_gap_to_median = asking_numeric - median_numeric
+            materiality_threshold = max(500.0, median_numeric * 0.05)
+
+        if not has_market_benchmark or asking_numeric is None:
             bucket = "NO_MARKET_COMPARABLES"
-        elif price_position in {"HIGH", "HIGH_MID"}:
+        elif price_gap_to_median is not None and price_gap_to_median >= materiality_threshold:
             bucket = "PRICE_REVIEW"
-        elif price_position in {"LOW", "LOW_MID"}:
+        elif price_gap_to_median is not None and price_gap_to_median <= -materiality_threshold:
             bucket = "POTENTIALLY_UNDER_PRICED"
         else:
             bucket = "COMPETITIVELY_POSITIONED"
@@ -9744,24 +9769,29 @@ def _business_inventory_pricing_recommendations(company, limit=500):
             or comp_conf not in {"HIGH", "MEDIUM"}
             or comp_count < 2
         )
+        public["pricing_materiality_threshold"] = _round_business_benchmark(materiality_threshold, 50) if materiality_threshold is not None else None
+        public["price_gap_to_median"] = price_gap_to_median
 
-        p25_raw = public.get("comparable_p25_price")
-        p75_raw = public.get("comparable_p75_price")
-        public["display_comparable_median_price"] = _round_business_benchmark(median_numeric, 50)
-        public["display_comparable_p25_price"] = _round_business_benchmark(p25_raw, 50)
-        public["display_comparable_p75_price"] = _round_business_benchmark(p75_raw, 50)
-
-        asking = public.get("asking_price")
         median_target = _round_business_benchmark(median_numeric, 250)
         lower_target = _round_business_benchmark(p25_raw, 250)
         if (
             bucket == "PRICE_REVIEW"
-            and asking is not None
+            and asking_numeric is not None
             and median_target is not None
-            and abs(float(median_target)) < float(asking)
+            and abs(float(median_target)) < asking_numeric
         ):
             high_target = abs(int(median_target))
             low_target = abs(int(lower_target)) if lower_target is not None else None
+            public["suggested_market_position_high"] = high_target
+            public["suggested_market_position_low"] = low_target if low_target is not None and low_target < high_target else None
+        elif bucket == "POTENTIALLY_UNDER_PRICED" and median_target is not None:
+            # For a low-priced vehicle, show the user where the current market
+            # sits rather than merely flagging the gap.  Use the lower quartile
+            # to median as a cautious market-alignment range when available.
+            high_target = abs(int(median_target))
+            low_target = abs(int(lower_target)) if lower_target is not None else None
+            if low_target is not None and asking_numeric is not None and low_target <= asking_numeric:
+                low_target = None
             public["suggested_market_position_high"] = high_target
             public["suggested_market_position_low"] = low_target if low_target is not None and low_target < high_target else None
         else:
