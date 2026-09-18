@@ -12619,182 +12619,269 @@ def _guided_stock_current_market_fallback(rows, limit=5, listing_price_ranges=No
     return selected
 
 def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None, max_listing_price=None):
-    """Rank exact Year + Brand + Model + Category stock opportunities.
+    """Rank exact Year + Brand + Model + Category stock opportunities quickly.
 
-    The maximum desired advertised listing price is only an eligibility ceiling for
-    which exact combinations can enter the shortlist. Once a combination qualifies,
-    CURRENT supply/pricing is measured across every active listing for that exact
-    Year + Brand + Model + Category, regardless of price. HISTORICAL statistics are
-    rebuilt from every available listing history at that exact grain, again with no
-    price-ceiling restriction. Only when the exact turnover sample is genuinely
-    insufficient do we broaden one step to same-year Brand + Model across categories;
-    we never pool different years.
+    IMPORTANT ARCHITECTURE:
+    - `rows` is the exact live candidate universe produced by the guided selector.
+      The maximum advertised listing price is only an eligibility ceiling.
+    - CURRENT competition/pricing is always recalculated from the full live market
+      for the exact Year + Brand + Model + Category, across all asking prices.
+    - HISTORICAL turnover comes from the precomputed Business Market Intelligence
+      table.  That table is generated offline from the daily history and already
+      contains CATEGORY_YEAR and MODEL_YEAR statistics, so a customer request never
+      needs to duplicate/normalise the full raw daily-history dataframe in memory.
+    - Exact CATEGORY_YEAR evidence is preferred.  Only if it is too thin do we use
+      same-year Brand + Model evidence across categories.  Different years are never
+      pooled.
+
+    This restores the fast, deterministic architecture the stock task originally
+    used while retaining the stricter evidence-grain rules added later.
     """
     if rows is None or rows.empty:
         return []
 
-    exact_rows = rows.copy()
-    exact_rows["_brand_key"] = exact_rows["Brand"].fillna("").astype(str).str.strip().str.casefold()
-    exact_rows["_model_key2"] = exact_rows["Model"].fillna("").astype(str).str.strip().str.casefold()
-    exact_rows["_category_key"] = exact_rows["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold()
-    exact_rows["_year_key"] = pd.to_numeric(exact_rows["Year"], errors="coerce").astype("Int64")
-    exact_rows = exact_rows[
-        exact_rows["_brand_key"].ne("")
-        & exact_rows["_model_key2"].ne("")
-        & exact_rows["_category_key"].ne("")
-        & ~exact_rows["_category_key"].isin({"-", "nan", "none"})
-        & exact_rows["_year_key"].notna()
-    ].copy()
-    if exact_rows.empty:
+    required = {"Brand", "Model", "CategoryDetail", "Year", "Price"}
+    if not required.issubset(rows.columns):
         return []
 
-    # `rows` is filtered to the dealer's desired listing-price segment. Use it to
-    # decide which combinations qualify, but measure ACTIVE COMPETITION against the
-    # full live market for that exact Year + Brand + Model + Category. Otherwise a
-    # £0–10K selection could misleadingly say "2 active competitors" when several
-    # more examples of the same exact vehicle are advertised just outside that band.
-    full_market = _guided_market_index()
-    full_exact = full_market.copy() if full_market is not None else pd.DataFrame()
-    if not full_exact.empty:
-        full_exact["_brand_key"] = full_exact["Brand"].fillna("").astype(str).str.strip().str.casefold()
-        full_exact["_model_key2"] = full_exact["Model"].fillna("").astype(str).str.strip().str.casefold()
-        full_exact["_category_key"] = full_exact["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold()
-        full_exact["_year_key"] = pd.to_numeric(full_exact["Year"], errors="coerce").astype("Int64")
-        if "Link" in full_exact.columns:
-            full_exact["_link_key"] = full_exact["Link"].fillna("").astype(str).str.strip()
+    qualifying = rows.copy()
+    qualifying["_brand_key"] = qualifying["Brand"].fillna("").astype(str).str.strip().str.casefold()
+    qualifying["_model_key2"] = qualifying["Model"].fillna("").astype(str).str.strip().str.casefold()
+    qualifying["_category_key"] = qualifying["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold()
+    qualifying["_year_key"] = pd.to_numeric(qualifying["Year"], errors="coerce").astype("Int64")
+    qualifying = qualifying[
+        qualifying["_brand_key"].ne("")
+        & qualifying["_model_key2"].ne("")
+        & qualifying["_category_key"].ne("")
+        & ~qualifying["_category_key"].isin({"-", "nan", "none"})
+        & qualifying["_year_key"].notna()
+    ].copy()
+    if qualifying.empty:
+        return []
 
-    current_groups = []
-    for (brand_key, model_key, category_key, year_key), qualifying_group in exact_rows.groupby(
-        ["_brand_key", "_model_key2", "_category_key", "_year_key"], dropna=False
-    ):
-        qualifying_group = qualifying_group.copy()
-        if "Link" in qualifying_group.columns:
-            qualifying_group["_link_key"] = qualifying_group["Link"].fillna("").astype(str).str.strip()
-            qualifying_group = qualifying_group[qualifying_group["_link_key"].ne("")].drop_duplicates("_link_key", keep="last")
-        if qualifying_group.empty:
+    # Full live market for competition/pricing.  The user's listing-price ceiling
+    # must not change the meaning of these statistics after a vehicle qualifies.
+    live = _guided_market_index()
+    live = live.copy() if isinstance(live, pd.DataFrame) and not live.empty else qualifying.copy()
+    live["_brand_key"] = live["Brand"].fillna("").astype(str).str.strip().str.casefold()
+    live["_model_key2"] = live["Model"].fillna("").astype(str).str.strip().str.casefold()
+    live["_category_key"] = live["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold()
+    live["_year_key"] = pd.to_numeric(live["Year"], errors="coerce").astype("Int64")
+    if "Link" in live.columns:
+        live["_link_key"] = live["Link"].fillna("").astype(str).str.strip()
+
+    candidate_keys = []
+    candidate_meta = {}
+    for key, group in qualifying.groupby(["_brand_key", "_model_key2", "_category_key", "_year_key"], dropna=False, sort=False):
+        brand_key, model_key, category_key, year_key = key
+        if pd.isna(year_key) or group.empty:
             continue
-        first = qualifying_group.iloc[0]
-
-        market_group = full_exact[
-            full_exact["_brand_key"].eq(brand_key)
-            & full_exact["_model_key2"].eq(model_key)
-            & full_exact["_category_key"].eq(category_key)
-            & full_exact["_year_key"].eq(int(year_key))
-        ].copy() if not full_exact.empty else qualifying_group.copy()
-        if "_link_key" in market_group.columns:
-            market_group = market_group[market_group["_link_key"].ne("")].drop_duplicates("_link_key", keep="last")
-        if market_group.empty:
-            market_group = qualifying_group.copy()
-
-        prices = pd.to_numeric(market_group.get("Price"), errors="coerce").dropna()
-        current_groups.append({
-            "brand_key": brand_key,
-            "model_key": model_key,
-            "category_key": category_key,
-            "year": int(year_key),
+        year_int = int(year_key)
+        first = group.iloc[0]
+        q = group.copy()
+        if "Link" in q.columns:
+            q["_link_key"] = q["Link"].fillna("").astype(str).str.strip()
+            q = q[q["_link_key"].ne("")].drop_duplicates("_link_key", keep="last")
+        if q.empty:
+            continue
+        q_prices = pd.to_numeric(q["Price"], errors="coerce").dropna()
+        exact_key = (str(brand_key), str(model_key), str(category_key), year_int)
+        candidate_keys.append(exact_key)
+        candidate_meta[exact_key] = {
             "brand": _guided_safe_text(first.get("Brand")),
             "model": _guided_safe_text(first.get("Model")),
             "category": _guided_safe_text(first.get("CategoryDetail")),
             "vehicle_type": _guided_safe_text(first.get("VehicleType")),
-            "current_listings": int(len(market_group)),
+            "desired_listing_range_listings": int(len(q_prices)),
+            "desired_listing_range_starting_price": float(q_prices.min()) if not q_prices.empty else None,
+        }
+    if not candidate_keys:
+        return []
+
+    # Recalculate all current exact-market statistics in one grouped pass.
+    candidate_model_year = {(b, m, y) for b, m, _c, y in candidate_keys}
+    live_model_index = pd.MultiIndex.from_arrays(
+        [live["_brand_key"], live["_model_key2"], live["_year_key"]],
+        names=["brand", "model", "year"],
+    )
+    wanted_model_index = pd.MultiIndex.from_tuples(list(candidate_model_year), names=["brand", "model", "year"])
+    live_subset = live.loc[live_model_index.isin(wanted_model_index)].copy()
+    if "_link_key" in live_subset.columns:
+        live_subset = live_subset[live_subset["_link_key"].ne("")].drop_duplicates("_link_key", keep="last")
+    live_subset["_price_numeric"] = pd.to_numeric(live_subset.get("Price"), errors="coerce")
+
+    current_lookup = {}
+    for key, group in live_subset.groupby(["_brand_key", "_model_key2", "_category_key", "_year_key"], dropna=False, sort=False):
+        b, m, c, y = key
+        if pd.isna(y):
+            continue
+        exact_key = (str(b), str(m), str(c), int(y))
+        if exact_key not in candidate_meta:
+            continue
+        prices = group["_price_numeric"].dropna()
+        current_lookup[exact_key] = {
+            "current_listings": int(len(group)),
             "starting_price": float(prices.min()) if not prices.empty else None,
             "median_price": float(prices.median()) if not prices.empty else None,
             "highest_price": float(prices.max()) if not prices.empty else None,
-        })
-    if not current_groups:
-        return []
+        }
 
-    # Prefill all exact and same-year historical metrics in one pass. Without this,
-    # broad selections repeatedly scan/group the full daily-history dataframe for
-    # every candidate and can leave the browser waiting for a minute or more.
-    _stock_history_started = time.perf_counter()
-    try:
-        _guided_stock_history_metrics_bulk(current_groups)
-    except Exception as exc:
-        print("GUIDED STOCK BULK HISTORY PREFILL FAILED:", repr(exc), flush=True)
-    finally:
-        print(
-            f"GUIDED STOCK HISTORY PREFILL: {len(current_groups)} candidates in "
-            f"{time.perf_counter() - _stock_history_started:.3f}s",
-            flush=True,
-        )
+    # Build a compact lookup from the precomputed Business market table ONCE.
+    exact_history = {}
+    model_year_history = {}
+    if BUSINESS_INTELLIGENCE_READY and isinstance(business_market_df, pd.DataFrame) and not business_market_df.empty:
+        hist = business_market_df.copy()
+        needed = {"BusinessGranularity", "Brand", "Model", "Year"}
+        if needed.issubset(hist.columns):
+            hist["_brand_key"] = hist["Brand"].fillna("").astype(str).str.strip().str.casefold()
+            hist["_model_key"] = hist["Model"].fillna("").astype(str).str.strip().str.casefold()
+            hist["_category_key"] = hist.get("CategoryDetail", pd.Series("", index=hist.index)).fillna("").astype(str).str.strip().str.casefold()
+            hist["_year_key"] = pd.to_numeric(hist["Year"], errors="coerce").astype("Int64")
+            hist["_granularity"] = hist["BusinessGranularity"].fillna("").astype(str).str.strip().str.upper()
+
+            hist_model_index = pd.MultiIndex.from_arrays(
+                [hist["_brand_key"], hist["_model_key"], hist["_year_key"]],
+                names=["brand", "model", "year"],
+            )
+            hist = hist.loc[hist_model_index.isin(wanted_model_index)].copy()
+
+            def _num(row, name):
+                value = pd.to_numeric(pd.Series([row.get(name)]), errors="coerce").iloc[0]
+                return None if pd.isna(value) else float(value)
+
+            def _row_metrics(row):
+                rate = _num(row, "ObservedExitWithin60DaysRate")
+                if rate is not None and 1.0 < rate <= 100.0:
+                    rate /= 100.0
+                reduction = _num(row, "PriceReductionRate")
+                if reduction is not None and 1.0 < reduction <= 100.0:
+                    reduction /= 100.0
+                hist_distinct = _num(row, "HistoricalDistinctListings")
+                sample = _num(row, "Exit60EligibleListings")
+                if sample is None:
+                    sample = hist_distinct
+                exits = _num(row, "HistoricalObservedMarketExits")
+                median_exit = _num(row, "MedianObservedDaysToExit")
+                quality = _guided_safe_text(row.get("EvidenceQuality")).upper() or "LOW"
+                sample_i = int(sample or 0)
+                exits_i = int(exits or 0)
+                sufficient = bool(sample_i >= 5 and exits_i >= 3 and rate is not None and median_exit is not None)
+                return {
+                    "historical_distinct_listings": int(hist_distinct) if hist_distinct is not None else None,
+                    "turnover_sample_size": sample_i,
+                    "observed_exit_count": exits_i if exits is not None else None,
+                    "median_observed_days_to_exit": median_exit,
+                    "observed_exit_within_60_days_rate": rate,
+                    "historical_price_reduction_rate": reduction,
+                    "evidence_quality": quality,
+                    "turnover_sufficient": sufficient,
+                    "evidence_source": "PRECOMPUTED_BUSINESS_MARKET",
+                }
+
+            # Prefer the row with the deepest usable sample if a builder emitted duplicates.
+            if "Exit60EligibleListings" in hist.columns:
+                sample_rank = pd.to_numeric(hist["Exit60EligibleListings"], errors="coerce")
+            else:
+                sample_rank = pd.Series(float("nan"), index=hist.index, dtype="float64")
+            if "HistoricalDistinctListings" in hist.columns:
+                distinct_rank = pd.to_numeric(hist["HistoricalDistinctListings"], errors="coerce")
+            else:
+                distinct_rank = pd.Series(0.0, index=hist.index, dtype="float64")
+            hist["_sample_rank"] = sample_rank.fillna(distinct_rank).fillna(0)
+            quality_rank = {"HIGH": 4, "MEDIUM": 3, "LOW": 2, "INSUFFICIENT": 0}
+            hist["_quality_rank"] = hist.get("EvidenceQuality", pd.Series("", index=hist.index)).fillna("").astype(str).str.upper().map(quality_rank).fillna(1)
+            hist = hist.sort_values(["_quality_rank", "_sample_rank"], ascending=[False, False])
+
+            for row in hist.to_dict("records"):
+                b = str(row.get("_brand_key") or "")
+                m = str(row.get("_model_key") or "")
+                y = row.get("_year_key")
+                if y is None or pd.isna(y):
+                    continue
+                y = int(y)
+                granularity = str(row.get("_granularity") or "").upper()
+                if granularity == "CATEGORY_YEAR":
+                    c = str(row.get("_category_key") or "")
+                    key = (b, m, c, y)
+                    if key in candidate_meta and key not in exact_history:
+                        exact_history[key] = _row_metrics(row)
+                elif granularity == "MODEL_YEAR":
+                    key = (b, m, y)
+                    if key in candidate_model_year and key not in model_year_history:
+                        model_year_history[key] = _row_metrics(row)
 
     candidate_records = []
-    for current in current_groups:
-        raw_exact = _guided_stock_history_metrics(
-            current["brand"], current["model"], current["year"], current["category"]
-        )
-        precomputed_exact = None
-        if raw_exact is None:
-            precomputed_exact = _guided_precomputed_stock_history_metrics(
-                current["brand"], current["model"], current["year"], current["category"]
-            )
+    for key in candidate_keys:
+        b, m, c, y = key
+        meta = candidate_meta[key]
+        current = current_lookup.get(key)
+        if current is None:
+            # A candidate existed under the selector ceiling, so this should be rare;
+            # retain it from qualifying rows rather than fail the whole report.
+            q = qualifying[
+                qualifying["_brand_key"].eq(b)
+                & qualifying["_model_key2"].eq(m)
+                & qualifying["_category_key"].eq(c)
+                & qualifying["_year_key"].eq(y)
+            ]
+            prices = pd.to_numeric(q.get("Price"), errors="coerce").dropna()
+            current = {
+                "current_listings": int(len(q)),
+                "starting_price": float(prices.min()) if not prices.empty else None,
+                "median_price": float(prices.median()) if not prices.empty else None,
+                "highest_price": float(prices.max()) if not prices.empty else None,
+            }
 
-        exact_history = raw_exact or precomputed_exact
-        evidence = exact_history
-        evidence_scope = "EXACT_CATEGORY_YEAR"
+        exact = exact_history.get(key)
+        broader = model_year_history.get((b, m, y))
+        evidence = exact
+        scope = "EXACT_CATEGORY_YEAR"
         fallback_context = None
 
-        exact_sufficient = bool(exact_history and exact_history.get("turnover_sufficient"))
-        if not exact_sufficient:
-            raw_model_year = _guided_stock_history_metrics(
-                current["brand"], current["model"], current["year"], category=None
-            )
-            model_year_history = raw_model_year
-            if not _guided_stock_metrics_usable(model_year_history, minimum_sample=3):
-                precomputed_model_year = _guided_precomputed_stock_history_metrics(
-                    current["brand"], current["model"], current["year"], category=None
-                )
-                if _guided_stock_metrics_usable(precomputed_model_year, minimum_sample=3):
-                    model_year_history = precomputed_model_year
-
-            if _guided_stock_metrics_usable(model_year_history, minimum_sample=3):
-                evidence = model_year_history
-                evidence_scope = "MODEL_YEAR_FALLBACK"
+        if not (exact and exact.get("turnover_sufficient")):
+            if _guided_stock_metrics_usable(broader, minimum_sample=3):
+                evidence = broader
+                scope = "MODEL_YEAR_FALLBACK"
                 fallback_context = {
-                    "scope": "MODEL_YEAR_FALLBACK",
-                    "exact_historical_distinct_listings": exact_history.get("historical_distinct_listings") if exact_history else None,
-                    "exact_turnover_sample_size": exact_history.get("turnover_sample_size") if exact_history else None,
-                    "fallback_historical_distinct_listings": model_year_history.get("historical_distinct_listings"),
-                    "fallback_turnover_sample_size": model_year_history.get("turnover_sample_size"),
-                    "fallback_source": model_year_history.get("evidence_source") or "RAW_DAILY_HISTORY",
+                    "scope": scope,
+                    "exact_historical_distinct_listings": exact.get("historical_distinct_listings") if exact else None,
+                    "exact_turnover_sample_size": exact.get("turnover_sample_size") if exact else None,
+                    "fallback_historical_distinct_listings": broader.get("historical_distinct_listings"),
+                    "fallback_turnover_sample_size": broader.get("turnover_sample_size"),
+                    "fallback_source": "PRECOMPUTED_BUSINESS_MARKET",
                 }
-            elif _guided_stock_metrics_usable(exact_history, minimum_sample=2):
-                # If no same-year model fallback exists, retain the exact signal but
-                # flag it as thin rather than deleting the opportunity entirely.
-                evidence = exact_history
-                evidence_scope = "EXACT_THIN"
+            elif _guided_stock_metrics_usable(exact, minimum_sample=2):
+                evidence = exact
+                scope = "EXACT_THIN"
                 fallback_context = {
-                    "scope": "EXACT_THIN",
-                    "exact_historical_distinct_listings": exact_history.get("historical_distinct_listings"),
-                    "exact_turnover_sample_size": exact_history.get("turnover_sample_size"),
+                    "scope": scope,
+                    "exact_historical_distinct_listings": exact.get("historical_distinct_listings"),
+                    "exact_turnover_sample_size": exact.get("turnover_sample_size"),
                 }
             else:
-                # Historical turnover can occasionally be unavailable during a raw
-                # history refresh.  Preserve the exact current-market opportunity so
-                # the paid report remains useful, but do not invent liquidity metrics.
-                evidence = exact_history or {}
-                evidence_scope = "CURRENT_MARKET_ONLY"
+                evidence = exact or {}
+                scope = "CURRENT_MARKET_ONLY"
                 fallback_context = {
-                    "scope": "CURRENT_MARKET_ONLY",
-                    "exact_historical_distinct_listings": exact_history.get("historical_distinct_listings") if exact_history else None,
-                    "exact_turnover_sample_size": exact_history.get("turnover_sample_size") if exact_history else None,
+                    "scope": scope,
+                    "exact_historical_distinct_listings": exact.get("historical_distinct_listings") if exact else None,
+                    "exact_turnover_sample_size": exact.get("turnover_sample_size") if exact else None,
                 }
 
         candidate_records.append({
+            "brand_key": b,
+            "model_key": m,
+            "category_key": c,
+            "year": y,
+            **meta,
             **current,
-            # Historical-listing count remains exact to the visible category/year.
-            # Broader same-year evidence is used only for turnover metrics.
-            "historical_distinct_listings": exact_history.get("historical_distinct_listings") if exact_history else None,
+            "historical_distinct_listings": exact.get("historical_distinct_listings") if exact else None,
             "turnover_sample_size": evidence.get("turnover_sample_size") if evidence else None,
             "median_observed_days_to_exit": evidence.get("median_observed_days_to_exit") if evidence else None,
             "observed_exit_within_60_days_rate": evidence.get("observed_exit_within_60_days_rate") if evidence else None,
             "historical_price_reduction_rate": evidence.get("historical_price_reduction_rate") if evidence else None,
-            "evidence_quality": (evidence.get("evidence_quality") if evidence else None) or ("INSUFFICIENT" if evidence_scope == "CURRENT_MARKET_ONLY" else "LOW"),
-            "evidence_scope": evidence_scope,
+            "evidence_quality": (evidence.get("evidence_quality") if evidence else None) or ("INSUFFICIENT" if scope == "CURRENT_MARKET_ONLY" else "LOW"),
+            "evidence_scope": scope,
             "fallback_context": fallback_context,
-            "history_start_date": exact_history.get("history_start_date") if exact_history else None,
-            "history_end_date": exact_history.get("history_end_date") if exact_history else None,
         })
 
     if not candidate_records:
@@ -12820,13 +12907,11 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None, max_li
         "CURRENT_MARKET_ONLY": 0.28,
     }).fillna(0.4)
     ranked["_evidence_score"] = ranked["evidence_quality"].map({"HIGH": 1.0, "MEDIUM": 0.70, "LOW": 0.38}).fillna(0.25)
-
-    ranked["_turnover_score"] = _pct_rank(ranked["_turnover"], higher_is_better=True).fillna(0.25)
-    ranked["_speed_score"] = _pct_rank(ranked["_median_exit_days"], higher_is_better=False).fillna(0.25)
-    ranked["_competition_score"] = _pct_rank(ranked["_current_supply"], higher_is_better=False).fillna(0.35)
-    ranked["_history_score"] = _pct_rank(ranked["_history_depth"], higher_is_better=True).fillna(0.20)
-    ranked["_price_pressure_score"] = _pct_rank(ranked["_price_reduction"], higher_is_better=False).fillna(0.50)
-
+    ranked["_turnover_score"] = _pct_rank(ranked["_turnover"], True).fillna(0.25)
+    ranked["_speed_score"] = _pct_rank(ranked["_median_exit_days"], False).fillna(0.25)
+    ranked["_competition_score"] = _pct_rank(ranked["_current_supply"], False).fillna(0.35)
+    ranked["_history_score"] = _pct_rank(ranked["_history_depth"], True).fillna(0.20)
+    ranked["_price_pressure_score"] = _pct_rank(ranked["_price_reduction"], False).fillna(0.50)
     ranked["_stock_score"] = (
         0.31 * ranked["_turnover_score"]
         + 0.22 * ranked["_speed_score"]
@@ -12853,7 +12938,6 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None, max_li
         if len(selected) >= int(limit):
             break
 
-    selected_listing_price_ranges = _guided_normalize_listing_price_ranges(listing_price_ranges)
     valid_supply = pd.Series([item.get("current_listings") for item in selected], dtype="float64").dropna()
     supply_low = float(valid_supply.quantile(0.33)) if len(valid_supply) >= 3 else None
     supply_high = float(valid_supply.quantile(0.67)) if len(valid_supply) >= 3 else None
@@ -12876,26 +12960,6 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None, max_li
 
     result = []
     for row in selected:
-        selected_range_stats = {"count": None, "min": None, "median": None, "max": None}
-        if selected_listing_price_ranges or max_listing_price is not None:
-            exact = exact_rows[
-                exact_rows["_brand_key"].eq(str(row.get("brand_key") or ""))
-                & exact_rows["_model_key2"].eq(str(row.get("model_key") or ""))
-                & exact_rows["_category_key"].eq(str(row.get("category_key") or ""))
-                & exact_rows["_year_key"].eq(int(row.get("year")))
-            ].copy()
-            if "Link" in exact.columns:
-                exact["_link_key"] = exact["Link"].fillna("").astype(str).str.strip()
-                exact = exact[exact["_link_key"].ne("")].drop_duplicates("_link_key", keep="last")
-            prices = pd.to_numeric(exact.get("Price"), errors="coerce").dropna()
-            if not prices.empty:
-                selected_range_stats = {
-                    "count": int(len(prices)),
-                    "min": float(prices.min()),
-                    "median": float(prices.median()),
-                    "max": float(prices.max()),
-                }
-
         result.append({
             "vehicle_type": str(row.get("vehicle_type") or "").strip(),
             "brand": str(row.get("brand") or "").strip(),
@@ -12905,29 +12969,206 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None, max_li
             "current_listings": int(row.get("current_listings") or 0),
             "competition_context": _competition_context(row.get("current_listings")),
             "stock_rank_score": float(row.get("_stock_score")) if row.get("_stock_score") is not None and not pd.isna(row.get("_stock_score")) else None,
-            "starting_price": row.get("starting_price"),
-            "median_price": row.get("median_price"),
-            "highest_price": row.get("highest_price"),
-            "selected_price_ranges": list(selected_listing_price_ranges),
-            "selected_price_range_listings": selected_range_stats["count"],
-            "selected_price_range_starting_price": selected_range_stats["min"],
-            "selected_price_range_median_price": selected_range_stats["median"],
-            "selected_price_range_highest_price": selected_range_stats["max"],
-            "desired_listing_range_listings": selected_range_stats["count"],
-            "desired_listing_range_starting_price": selected_range_stats["min"],
+            "starting_price": float(row.get("starting_price")) if row.get("starting_price") is not None and not pd.isna(row.get("starting_price")) else None,
+            "median_price": float(row.get("median_price")) if row.get("median_price") is not None and not pd.isna(row.get("median_price")) else None,
+            "highest_price": float(row.get("highest_price")) if row.get("highest_price") is not None and not pd.isna(row.get("highest_price")) else None,
+            "selected_price_ranges": [],
+            "selected_price_range_listings": int(row.get("desired_listing_range_listings") or 0),
+            "selected_price_range_starting_price": row.get("desired_listing_range_starting_price"),
+            "selected_price_range_median_price": None,
+            "selected_price_range_highest_price": None,
+            "desired_listing_range_listings": int(row.get("desired_listing_range_listings") or 0),
+            "desired_listing_range_starting_price": row.get("desired_listing_range_starting_price"),
             "maximum_desired_listing_price": float(max_listing_price) if max_listing_price is not None else None,
-            "historical_distinct_listings": row.get("historical_distinct_listings"),
-            "turnover_sample_size": row.get("turnover_sample_size"),
-            "median_observed_days_to_exit": row.get("median_observed_days_to_exit"),
-            "observed_exit_within_60_days_rate": row.get("observed_exit_within_60_days_rate"),
-            "historical_price_reduction_rate": row.get("historical_price_reduction_rate"),
+            "historical_distinct_listings": int(row.get("historical_distinct_listings")) if row.get("historical_distinct_listings") is not None and not pd.isna(row.get("historical_distinct_listings")) else None,
+            "turnover_sample_size": int(row.get("turnover_sample_size")) if row.get("turnover_sample_size") is not None and not pd.isna(row.get("turnover_sample_size")) else None,
+            "median_observed_days_to_exit": float(row.get("median_observed_days_to_exit")) if row.get("median_observed_days_to_exit") is not None and not pd.isna(row.get("median_observed_days_to_exit")) else None,
+            "observed_exit_within_60_days_rate": float(row.get("observed_exit_within_60_days_rate")) if row.get("observed_exit_within_60_days_rate") is not None and not pd.isna(row.get("observed_exit_within_60_days_rate")) else None,
+            "historical_price_reduction_rate": float(row.get("historical_price_reduction_rate")) if row.get("historical_price_reduction_rate") is not None and not pd.isna(row.get("historical_price_reduction_rate")) else None,
             "evidence_quality": str(row.get("evidence_quality") or "").strip(),
             "evidence_scope": str(row.get("evidence_scope") or "").strip(),
             "fallback_context": row.get("fallback_context"),
-            "history_start_date": row.get("history_start_date"),
-            "history_end_date": row.get("history_end_date"),
+            "history_start_date": None,
+            "history_end_date": None,
         })
     return result
+
+
+@app.route("/api/guided/discovery/stock-result", methods=["POST"])
+def api_guided_stock_result():
+    """Fast, isolated evidence endpoint for the paid Stock Purchase task.
+
+    Stock Purchase used to share the generic discovery-result path and later began
+    rebuilding raw daily history during that request.  That made one of the most
+    important Business workflows depend on unrelated report work and on a large
+    historical dataframe.  This endpoint intentionally does only four things:
+
+    1. reproduce the selector's exact live-market filters;
+    2. rank exact Year + Brand + Model + Category opportunities using the small
+       precomputed Business market-intelligence table;
+    3. return one qualifying live example for every recommendation; and
+    4. never call OpenAI or load/rebuild the raw daily listing history.
+
+    The maximum budget field here means maximum desired *advertised listing price*.
+    It is an eligibility ceiling only; once a combination qualifies, competition,
+    pricing and turnover statistics use the full exact market for that vehicle.
+    """
+    started = time.perf_counter()
+    try:
+        data = request.get_json(silent=True) or {}
+        task = str(data.get("task") or "STOCK_PURCHASE").strip().upper()
+        if task != "STOCK_PURCHASE":
+            return jsonify({"success": False, "error": "INVALID_STOCK_TASK"}), 400
+
+        answers = data.get("answers") if isinstance(data.get("answers"), dict) else {}
+        vehicle_types = [str(v) for v in (answers.get("vehicleTypes") or []) if str(v) != "__ALL__"]
+        brands = [str(v) for v in (answers.get("brands") or []) if str(v) != "__ALL__"]
+        model_keys = [str(v) for v in (answers.get("models") or []) if str(v) != "__ALL__"]
+        category_keys = [str(v) for v in (answers.get("categories") or []) if str(v)]
+
+        min_year = answers.get("minYear")
+        if min_year in [None, "", "__ALL__", "ALL"]:
+            min_year = None
+        else:
+            min_year = int(float(min_year))
+
+        no_maximum = bool(answers.get("stockBudgetNoMaximum"))
+        max_listing_price = None if no_maximum else answers.get("budget")
+        if max_listing_price in [None, ""]:
+            max_listing_price = None
+        else:
+            max_listing_price = float(max_listing_price)
+            if not math.isfinite(max_listing_price) or max_listing_price <= 0:
+                return jsonify({"success": False, "error": "INVALID_MAX_LISTING_PRICE"}), 400
+
+        index = _guided_market_index()
+        if index is None or index.empty:
+            return jsonify({"success": False, "error": "GUIDED_OPTIONS_NOT_READY"}), 503
+
+        rows = _guided_index_filter(
+            index,
+            min_year=min_year,
+            vehicle_types=vehicle_types,
+            brands=brands,
+            model_keys=model_keys,
+            max_budget=max_listing_price,
+            price_ranges=None,
+        )
+        rows = _guided_apply_category_keys(rows, category_keys)
+        filter_elapsed = time.perf_counter() - started
+
+        if rows is None or rows.empty:
+            print(
+                f"GUIDED STOCK RESULT: 0 exact qualifying live rows after filters in {filter_elapsed:.3f}s",
+                flush=True,
+            )
+            return jsonify({
+                "success": True,
+                "count": 0,
+                "groups": [],
+                "year_options": [],
+                "results": [],
+                "stock_opportunities": [],
+                "no_matches": True,
+                "timing_ms": {"filter": int(filter_elapsed * 1000)},
+            })
+
+        rank_started = time.perf_counter()
+        try:
+            opportunities = _guided_stock_opportunities(
+                rows,
+                limit=5,
+                listing_price_ranges=None,
+                max_listing_price=max_listing_price,
+            )
+        except Exception as exc:
+            print("GUIDED STOCK FAST RANKING FAILED:", repr(exc), flush=True)
+            traceback.print_exc()
+            opportunities = _guided_stock_current_market_fallback(
+                rows,
+                limit=5,
+                listing_price_ranges=None,
+                max_listing_price=max_listing_price,
+            )
+        if not opportunities:
+            opportunities = _guided_stock_current_market_fallback(
+                rows,
+                limit=5,
+                listing_price_ranges=None,
+                max_listing_price=max_listing_price,
+            )
+        rank_elapsed = time.perf_counter() - rank_started
+
+        # One live example for each exact recommendation.  Prefer a listing inside
+        # the user's desired listing-price ceiling because that is what made the
+        # opportunity eligible.  All statistics on the recommendation itself still
+        # describe the full exact market.
+        result_cols = [
+            c for c in (
+                "Brand", "Model", "CategoryDetail", "Year", "Price", "KM",
+                "Company", "Color", "Transmission", "Location", "Image", "Link"
+            ) if c in rows.columns
+        ]
+        examples = []
+        if opportunities and result_cols:
+            candidate_rows = rows.copy()
+            if "Link" in candidate_rows.columns:
+                candidate_rows = candidate_rows[
+                    candidate_rows["Link"].fillna("").astype(str).str.strip().ne("")
+                ]
+            for opportunity in opportunities:
+                mask = (
+                    candidate_rows["Brand"].fillna("").astype(str).str.strip().str.casefold().eq(str(opportunity.get("brand") or "").strip().casefold())
+                    & candidate_rows["Model"].fillna("").astype(str).str.strip().str.casefold().eq(str(opportunity.get("model") or "").strip().casefold())
+                    & candidate_rows["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold().eq(str(opportunity.get("category") or "").strip().casefold())
+                    & pd.to_numeric(candidate_rows["Year"], errors="coerce").eq(opportunity.get("year"))
+                )
+                matches = candidate_rows.loc[mask].sort_values("Price", ascending=True).head(1)
+                if matches.empty:
+                    continue
+                row = matches.iloc[0]
+                examples.append({
+                    "brand": _guided_safe_text(row.get("Brand")),
+                    "model": _guided_safe_text(row.get("Model")),
+                    "category": _guided_safe_text(row.get("CategoryDetail")),
+                    "year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
+                    "price": float(row["Price"]) if pd.notna(row.get("Price")) else None,
+                    "km": float(row["KM"]) if "KM" in matches.columns and pd.notna(row.get("KM")) else None,
+                    "company": _guided_safe_text(row.get("Company")),
+                    "color": _guided_safe_text(row.get("Color")),
+                    "transmission": _guided_safe_text(row.get("Transmission")),
+                    "location": _guided_safe_text(row.get("Location")),
+                    "image": _guided_safe_text(row.get("Image")),
+                    "link": _guided_safe_text(row.get("Link")),
+                })
+
+        total_elapsed = time.perf_counter() - started
+        print(
+            f"GUIDED STOCK RESULT: {len(opportunities)} recommendations from {len(rows)} qualifying live rows "
+            f"(filter={filter_elapsed:.3f}s rank={rank_elapsed:.3f}s total={total_elapsed:.3f}s)",
+            flush=True,
+        )
+        return jsonify({
+            "success": True,
+            "count": int(len(rows)),
+            "groups": [],
+            "year_options": [],
+            "results": examples,
+            "stock_opportunities": opportunities,
+            "no_matches": False,
+            "timing_ms": {
+                "filter": int(filter_elapsed * 1000),
+                "rank": int(rank_elapsed * 1000),
+                "total": int(total_elapsed * 1000),
+            },
+        })
+    except (TypeError, ValueError) as exc:
+        print("GUIDED STOCK RESULT INVALID REQUEST:", repr(exc), flush=True)
+        return jsonify({"success": False, "error": "INVALID_GUIDED_STOCK_RESULT"}), 400
+    except Exception as exc:
+        print("GUIDED STOCK RESULT FAILED:", repr(exc), flush=True)
+        traceback.print_exc()
+        return jsonify({"success": False, "error": "GUIDED_STOCK_RESULT_UNAVAILABLE"}), 503
 
 
 @app.route("/api/guided/discovery/result", methods=["POST"])
@@ -12944,6 +13185,14 @@ def api_guided_discovery_result():
     try:
         data = request.get_json(silent=True) or {}
         task = str(data.get("task") or "").strip().upper()
+
+        # Backwards-compatible fast path: older cached frontends still POST Stock
+        # Purchase to the generic discovery endpoint. Route those requests through
+        # the isolated stock-result implementation so they never fall back onto the
+        # expensive historical/generic report path.
+        if task == "STOCK_PURCHASE":
+            return api_guided_stock_result()
+
         answers = data.get("answers") if isinstance(data.get("answers"), dict) else {}
         vehicle_types = [str(v) for v in (answers.get("vehicleTypes") or []) if str(v) != "__ALL__"]
         brands = [str(v) for v in (answers.get("brands") or []) if str(v) != "__ALL__"]
