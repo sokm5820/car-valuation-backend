@@ -11214,21 +11214,201 @@ def _guided_apply_category_keys(rows, category_keys):
 
 
 
+def _guided_stock_history_frame():
+    """Prepare a compact, normalized listing-history frame for stock analysis.
+
+    Stock recommendations need historical evidence at exactly the same grain as the
+    visible recommendation.  The offline Business intelligence tables may carry a
+    broader historical benchmark behind a category/year row, so this helper rebuilds
+    the history directly from the listing observations instead of assuming that a
+    precomputed row's historical fields are year/category-specific.
+    """
+    global _GUIDED_STOCK_HISTORY_CACHE
+
+    if df is None or df.empty:
+        return None
+
+    lower = {str(col).strip().casefold(): col for col in df.columns}
+    def col(*names):
+        for name in names:
+            if name in df.columns:
+                return name
+            found = lower.get(str(name).strip().casefold())
+            if found:
+                return found
+        return None
+
+    date_col = col("DATE", "Date")
+    link_col = col("Link", "URL", "Url")
+    brand_col = col("Brand")
+    model_col = col("Model")
+    category_col = col("Category", "CategoryDetail")
+    year_col = col("Year")
+    price_col = col("Price", "CurrentAskingPrice")
+    if not all([date_col, link_col, brand_col, model_col, category_col, year_col]):
+        return None
+
+    dates = pd.to_datetime(df[date_col], errors="coerce")
+    latest = dates.max()
+    earliest = dates.min()
+    if pd.isna(latest) or pd.isna(earliest):
+        return None
+
+    stamp = (len(df), str(pd.Timestamp(latest)), str(pd.Timestamp(earliest)))
+    cached = globals().get("_GUIDED_STOCK_HISTORY_CACHE")
+    if isinstance(cached, dict) and cached.get("stamp") == stamp:
+        return cached.get("payload")
+
+    columns = [date_col, link_col, brand_col, model_col, category_col, year_col]
+    if price_col:
+        columns.append(price_col)
+    work = df[columns].copy()
+    work["_date"] = pd.to_datetime(work[date_col], errors="coerce").dt.normalize()
+    work["_link"] = work[link_col].fillna("").astype(str).str.strip()
+    work["_brand"] = work[brand_col].fillna("").astype(str).str.strip().str.casefold()
+    work["_model"] = work[model_col].fillna("").astype(str).str.strip().str.casefold()
+    work["_category"] = work[category_col].fillna("").astype(str).str.strip().str.casefold()
+    work["_year"] = pd.to_numeric(work[year_col], errors="coerce").astype("Int64")
+    work["_price"] = pd.to_numeric(work[price_col], errors="coerce") if price_col else float("nan")
+    work = work[
+        work["_date"].notna()
+        & work["_link"].ne("")
+        & work["_brand"].ne("")
+        & work["_model"].ne("")
+        & work["_year"].notna()
+    ][["_date", "_link", "_brand", "_model", "_category", "_year", "_price"]].copy()
+
+    payload = {
+        "frame": work,
+        "earliest": pd.Timestamp(earliest).normalize(),
+        "latest": pd.Timestamp(latest).normalize(),
+        "metrics": {},
+    }
+    _GUIDED_STOCK_HISTORY_CACHE = {"stamp": stamp, "payload": payload}
+    return payload
+
+
+def _guided_stock_history_metrics(brand, model, year, category=None):
+    """Compute observed turnover statistics from distinct listing histories.
+
+    When category is supplied the sample is exact Year + Brand + Model + Category.
+    With category=None it is the same-year Brand + Model fallback across categories.
+    No cross-year fallback is used: model behaviour can change materially by year.
+    """
+    prepared = _guided_stock_history_frame()
+    if not prepared:
+        return None
+
+    brand_key = str(brand or "").strip().casefold()
+    model_key = str(model or "").strip().casefold()
+    category_key = str(category or "").strip().casefold() if category not in [None, ""] else None
+    try:
+        year_key = int(float(year))
+    except (TypeError, ValueError):
+        return None
+
+    cache_key = (brand_key, model_key, category_key or "__MODEL_YEAR__", year_key)
+    if cache_key in prepared["metrics"]:
+        return prepared["metrics"][cache_key]
+
+    work = prepared["frame"]
+    subset = work[
+        work["_brand"].eq(brand_key)
+        & work["_model"].eq(model_key)
+        & work["_year"].eq(year_key)
+    ]
+    if category_key is not None:
+        subset = subset[subset["_category"].eq(category_key)]
+    if subset.empty:
+        prepared["metrics"][cache_key] = None
+        return None
+
+    dataset_first = prepared["earliest"]
+    dataset_last = prepared["latest"]
+    distinct_listings = 0
+    exited_durations = []
+    exit60_eligible = 0
+    exit60_success = 0
+    price_pressure_eligible = 0
+    reduced_listings = 0
+
+    for _link, group in subset.groupby("_link", sort=False):
+        ordered = group.sort_values("_date", kind="stable").drop_duplicates(subset=["_date"], keep="last")
+        if ordered.empty:
+            continue
+        distinct_listings += 1
+        first_seen = pd.Timestamp(ordered.iloc[0]["_date"]).normalize()
+        last_seen = pd.Timestamp(ordered.iloc[-1]["_date"]).normalize()
+        left_censored = first_seen <= dataset_first
+        exited = last_seen < dataset_last
+        observed_days = max(1, int((last_seen - first_seen).days) + 1)
+
+        # Turnover statistics exclude listings already present on the first day of
+        # the tracking window because their true starting age is unknown.
+        if not left_censored:
+            if exited:
+                exited_durations.append(observed_days)
+                exit60_eligible += 1
+                if observed_days <= 60:
+                    exit60_success += 1
+            else:
+                current_observed_age = max(1, int((dataset_last - first_seen).days) + 1)
+                if current_observed_age >= 60:
+                    exit60_eligible += 1
+
+        prices = pd.to_numeric(ordered["_price"], errors="coerce").dropna().tolist()
+        if len(prices) >= 2:
+            price_pressure_eligible += 1
+            if any(float(prices[i]) < float(prices[i - 1]) - 0.5 for i in range(1, len(prices))):
+                reduced_listings += 1
+
+    median_exit = float(pd.Series(exited_durations, dtype="float64").median()) if exited_durations else None
+    exit60_rate = (float(exit60_success) / float(exit60_eligible)) if exit60_eligible else None
+    reduction_rate = (float(reduced_listings) / float(price_pressure_eligible)) if price_pressure_eligible else None
+
+    # A fallback is needed only when the exact category-year turnover sample is
+    # genuinely too small to support a useful liquidity read. Keep the threshold
+    # deliberately modest so exact year/variant evidence is preferred whenever it
+    # can reasonably stand on its own.
+    turnover_sufficient = bool(
+        exit60_eligible >= 8
+        and len(exited_durations) >= 5
+        and exit60_rate is not None
+        and median_exit is not None
+    )
+    evidence_quality = (
+        "HIGH" if exit60_eligible >= 30 and len(exited_durations) >= 20
+        else "MEDIUM" if exit60_eligible >= 15 and len(exited_durations) >= 10
+        else "LOW" if turnover_sufficient
+        else "INSUFFICIENT"
+    )
+
+    result = {
+        "historical_distinct_listings": int(distinct_listings),
+        "turnover_sample_size": int(exit60_eligible),
+        "observed_exit_count": int(len(exited_durations)),
+        "median_observed_days_to_exit": median_exit,
+        "observed_exit_within_60_days_rate": exit60_rate,
+        "historical_price_reduction_rate": reduction_rate,
+        "price_pressure_sample_size": int(price_pressure_eligible),
+        "evidence_quality": evidence_quality,
+        "turnover_sufficient": turnover_sufficient,
+        "history_start_date": dataset_first.date().isoformat(),
+        "history_end_date": dataset_last.date().isoformat(),
+    }
+    prepared["metrics"][cache_key] = result
+    return result
+
+
 def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
     """Rank exact Year + Brand + Model + Category stock opportunities.
 
-    Every visible recommendation is anchored to one exact current-market combination.
-    Current supply/pricing statistics always come from that exact combination. Historical
-    Business intelligence is also exact CATEGORY_YEAR evidence when available. If that
-    exact historical layer is unavailable, the recommendation may use same-year MODEL_YEAR
-    history as explicitly-labelled fallback context; it must never silently present broader
-    model evidence as category-specific evidence.
+    Current supply/pricing always comes from the exact live combination. Historical
+    turnover is rebuilt from raw listing histories at that same exact grain. Only
+    when the exact turnover sample is genuinely insufficient do we broaden one step
+    to same-year Brand + Model across categories; we never pool different years.
     """
-    if (
-        rows is None or rows.empty
-        or not BUSINESS_INTELLIGENCE_READY
-        or business_market_df is None or business_market_df.empty
-    ):
+    if rows is None or rows.empty:
         return []
 
     exact_rows = rows.copy()
@@ -11246,18 +11426,45 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
     if exact_rows.empty:
         return []
 
-    # Build the candidate universe from the exact current combinations that survived
-    # the user's guided selections. This guarantees a category on every recommendation.
+    # `rows` is filtered to the dealer's desired listing-price segment. Use it to
+    # decide which combinations qualify, but measure ACTIVE COMPETITION against the
+    # full live market for that exact Year + Brand + Model + Category. Otherwise a
+    # £0–10K selection could misleadingly say "2 active competitors" when several
+    # more examples of the same exact vehicle are advertised just outside that band.
+    full_market = _guided_market_index()
+    full_exact = full_market.copy() if full_market is not None else pd.DataFrame()
+    if not full_exact.empty:
+        full_exact["_brand_key"] = full_exact["Brand"].fillna("").astype(str).str.strip().str.casefold()
+        full_exact["_model_key2"] = full_exact["Model"].fillna("").astype(str).str.strip().str.casefold()
+        full_exact["_category_key"] = full_exact["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold()
+        full_exact["_year_key"] = pd.to_numeric(full_exact["Year"], errors="coerce").astype("Int64")
+        if "Link" in full_exact.columns:
+            full_exact["_link_key"] = full_exact["Link"].fillna("").astype(str).str.strip()
+
     current_groups = []
-    for (brand_key, model_key, category_key, year_key), group in exact_rows.groupby(
+    for (brand_key, model_key, category_key, year_key), qualifying_group in exact_rows.groupby(
         ["_brand_key", "_model_key2", "_category_key", "_year_key"], dropna=False
     ):
-        if "Link" in group.columns:
-            linked = group["Link"].fillna("").astype(str).str.strip().ne("")
-            if not bool(linked.any()):
-                continue
-        first = group.iloc[0]
-        prices = pd.to_numeric(group.get("Price"), errors="coerce").dropna()
+        qualifying_group = qualifying_group.copy()
+        if "Link" in qualifying_group.columns:
+            qualifying_group["_link_key"] = qualifying_group["Link"].fillna("").astype(str).str.strip()
+            qualifying_group = qualifying_group[qualifying_group["_link_key"].ne("")].drop_duplicates("_link_key", keep="last")
+        if qualifying_group.empty:
+            continue
+        first = qualifying_group.iloc[0]
+
+        market_group = full_exact[
+            full_exact["_brand_key"].eq(brand_key)
+            & full_exact["_model_key2"].eq(model_key)
+            & full_exact["_category_key"].eq(category_key)
+            & full_exact["_year_key"].eq(int(year_key))
+        ].copy() if not full_exact.empty else qualifying_group.copy()
+        if "_link_key" in market_group.columns:
+            market_group = market_group[market_group["_link_key"].ne("")].drop_duplicates("_link_key", keep="last")
+        if market_group.empty:
+            market_group = qualifying_group.copy()
+
+        prices = pd.to_numeric(market_group.get("Price"), errors="coerce").dropna()
         current_groups.append({
             "brand_key": brand_key,
             "model_key": model_key,
@@ -11267,7 +11474,7 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
             "model": str(first.get("Model") or "").strip(),
             "category": str(first.get("CategoryDetail") or "").strip(),
             "vehicle_type": str(first.get("VehicleType") or "").strip(),
-            "current_listings": int(len(group)),
+            "current_listings": int(len(market_group)),
             "starting_price": float(prices.min()) if not prices.empty else None,
             "median_price": float(prices.median()) if not prices.empty else None,
             "highest_price": float(prices.max()) if not prices.empty else None,
@@ -11275,90 +11482,50 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
     if not current_groups:
         return []
 
-    work = business_market_df.copy()
-    work["_brand_key"] = work["Brand"].fillna("").astype(str).str.strip().str.casefold()
-    work["_model_key2"] = work["Model"].fillna("").astype(str).str.strip().str.casefold()
-    work["_category_key"] = work.get("CategoryDetail", "").fillna("").astype(str).str.strip().str.casefold()
-    work["_year_key"] = pd.to_numeric(work["Year"], errors="coerce").astype("Int64")
-    work["_granularity"] = work.get("BusinessGranularity", "").fillna("").astype(str).str.strip().str.upper()
-
-    category_lookup = {}
-    model_year_lookup = {}
-    for row in work.to_dict("records"):
-        year = row.get("_year_key")
-        if year is None or pd.isna(year):
-            continue
-        if str(row.get("_granularity") or "").upper() == "CATEGORY_YEAR":
-            key = (row.get("_brand_key"), row.get("_model_key2"), row.get("_category_key"), int(year))
-            # Keep the first row deterministically; source should already be unique.
-            category_lookup.setdefault(key, row)
-        elif str(row.get("_granularity") or "").upper() == "MODEL_YEAR":
-            key = (row.get("_brand_key"), row.get("_model_key2"), int(year))
-            model_year_lookup.setdefault(key, row)
-
-    def _num(row, name):
-        if not row:
-            return None
-        value = row.get(name)
-        if value is None or pd.isna(value):
-            return None
-        try:
-            number = float(value)
-            return number if math.isfinite(number) else None
-        except (TypeError, ValueError):
-            return None
-
     candidate_records = []
     for current in current_groups:
-        exact_key = (
-            current["brand_key"], current["model_key"], current["category_key"], current["year"]
+        exact_history = _guided_stock_history_metrics(
+            current["brand"], current["model"], current["year"], current["category"]
         )
-        model_key = (current["brand_key"], current["model_key"], current["year"])
-        exact_evidence = category_lookup.get(exact_key)
-        model_year_evidence = model_year_lookup.get(model_key)
-
-        if exact_evidence:
-            evidence = exact_evidence
-            evidence_scope = "EXACT_CATEGORY_YEAR"
-        elif model_year_evidence:
-            evidence = model_year_evidence
-            evidence_scope = "MODEL_YEAR_FALLBACK"
-        else:
-            # We can show a live listing but cannot defend a stock recommendation
-            # without any historical turnover evidence for the same model-year.
+        if not exact_history:
             continue
 
-        historical_depth = _num(evidence, "HistoricalDistinctListings")
-        exact_depth = _num(exact_evidence, "HistoricalDistinctListings") if exact_evidence else None
-        broader_depth = _num(model_year_evidence, "HistoricalDistinctListings") if model_year_evidence else None
+        evidence = exact_history
+        evidence_scope = "EXACT_CATEGORY_YEAR"
+        fallback_context = None
 
-        # If exact category-year history exists but is thin, keep every headline
-        # metric exact and attach the broader model-year layer only as labelled context.
-        broader_context = None
-        if (
-            exact_evidence
-            and model_year_evidence
-            and (exact_depth is None or exact_depth < 25)
-            and (broader_depth or 0) > (exact_depth or 0)
-        ):
-            broader_context = {
-                "scope": "MODEL_YEAR_CONTEXT",
-                "historical_distinct_listings": int(round(broader_depth)) if broader_depth is not None else None,
-                "median_observed_days_to_exit": _num(model_year_evidence, "MedianObservedDaysToExit"),
-                "observed_exit_within_60_days_rate": _num(model_year_evidence, "ObservedExitWithin60DaysRate"),
-                "historical_price_reduction_rate": _num(model_year_evidence, "PriceReductionRate"),
+        if not bool(exact_history.get("turnover_sufficient")):
+            model_year_history = _guided_stock_history_metrics(
+                current["brand"], current["model"], current["year"], category=None
+            )
+            if not model_year_history or not bool(model_year_history.get("turnover_sufficient")):
+                # Do not silently pool different years. If neither the exact variant-year
+                # nor the same-year model can support turnover statistics, skip it.
+                continue
+            evidence = model_year_history
+            evidence_scope = "MODEL_YEAR_FALLBACK"
+            fallback_context = {
+                "scope": "MODEL_YEAR_FALLBACK",
+                "exact_historical_distinct_listings": exact_history.get("historical_distinct_listings"),
+                "exact_turnover_sample_size": exact_history.get("turnover_sample_size"),
+                "fallback_historical_distinct_listings": model_year_history.get("historical_distinct_listings"),
+                "fallback_turnover_sample_size": model_year_history.get("turnover_sample_size"),
             }
 
         candidate_records.append({
             **current,
-            "evidence_row": evidence,
+            # Historical-listing count remains exact to the visible category/year even
+            # when liquidity statistics need a same-year model fallback.
+            "historical_distinct_listings": exact_history.get("historical_distinct_listings"),
+            "turnover_sample_size": evidence.get("turnover_sample_size"),
+            "median_observed_days_to_exit": evidence.get("median_observed_days_to_exit"),
+            "observed_exit_within_60_days_rate": evidence.get("observed_exit_within_60_days_rate"),
+            "historical_price_reduction_rate": evidence.get("historical_price_reduction_rate"),
+            "evidence_quality": evidence.get("evidence_quality"),
             "evidence_scope": evidence_scope,
-            "historical_distinct_listings": int(round(historical_depth)) if historical_depth is not None else None,
-            "median_observed_days_to_exit": _num(evidence, "MedianObservedDaysToExit"),
-            "observed_exit_within_60_days_rate": _num(evidence, "ObservedExitWithin60DaysRate"),
-            "historical_price_reduction_rate": _num(evidence, "PriceReductionRate"),
-            "evidence_quality": str(evidence.get("EvidenceQuality") or "").strip(),
-            "broader_context": broader_context,
+            "fallback_context": fallback_context,
+            "history_start_date": exact_history.get("history_start_date"),
+            "history_end_date": exact_history.get("history_end_date"),
         })
 
     if not candidate_records:
@@ -11375,15 +11542,15 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
     ranked["_turnover"] = pd.to_numeric(ranked["observed_exit_within_60_days_rate"], errors="coerce")
     ranked["_median_exit_days"] = pd.to_numeric(ranked["median_observed_days_to_exit"], errors="coerce")
     ranked["_current_supply"] = pd.to_numeric(ranked["current_listings"], errors="coerce")
-    ranked["_historical_depth"] = pd.to_numeric(ranked["historical_distinct_listings"], errors="coerce")
+    ranked["_history_depth"] = pd.to_numeric(ranked["turnover_sample_size"], errors="coerce")
     ranked["_price_reduction"] = pd.to_numeric(ranked["historical_price_reduction_rate"], errors="coerce")
-    ranked["_scope_score"] = ranked["evidence_scope"].map({"EXACT_CATEGORY_YEAR": 1.0, "MODEL_YEAR_FALLBACK": 0.55}).fillna(0.4)
-    ranked["_evidence_score"] = ranked["evidence_quality"].map({"HIGH": 1.0, "MEDIUM": 0.65, "LOW": 0.30}).fillna(0.45)
+    ranked["_scope_score"] = ranked["evidence_scope"].map({"EXACT_CATEGORY_YEAR": 1.0, "MODEL_YEAR_FALLBACK": 0.58}).fillna(0.4)
+    ranked["_evidence_score"] = ranked["evidence_quality"].map({"HIGH": 1.0, "MEDIUM": 0.70, "LOW": 0.38}).fillna(0.25)
 
     ranked["_turnover_score"] = _pct_rank(ranked["_turnover"], higher_is_better=True).fillna(0.25)
     ranked["_speed_score"] = _pct_rank(ranked["_median_exit_days"], higher_is_better=False).fillna(0.25)
     ranked["_competition_score"] = _pct_rank(ranked["_current_supply"], higher_is_better=False).fillna(0.35)
-    ranked["_history_score"] = _pct_rank(ranked["_historical_depth"], higher_is_better=True).fillna(0.20)
+    ranked["_history_score"] = _pct_rank(ranked["_history_depth"], higher_is_better=True).fillna(0.20)
     ranked["_price_pressure_score"] = _pct_rank(ranked["_price_reduction"], higher_is_better=False).fillna(0.50)
 
     ranked["_stock_score"] = (
@@ -11396,13 +11563,11 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
         + 0.08 * ranked["_scope_score"]
     )
     ranked = ranked.sort_values(
-        ["_stock_score", "_scope_score", "_turnover", "_median_exit_days", "_current_supply", "_historical_depth"],
+        ["_stock_score", "_scope_score", "_turnover", "_median_exit_days", "_current_supply", "_history_depth"],
         ascending=[False, False, False, True, True, False],
         na_position="last",
     )
 
-    # Keep the shortlist commercially diverse, but every retained item remains an
-    # exact Year + Brand + Model + Category recommendation.
     selected = []
     seen_families = set()
     for row in ranked.to_dict("records"):
@@ -11415,7 +11580,6 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
             break
 
     selected_listing_price_ranges = _guided_normalize_listing_price_ranges(listing_price_ranges)
-
     valid_supply = pd.Series([item.get("current_listings") for item in selected], dtype="float64").dropna()
     supply_low = float(valid_supply.quantile(0.33)) if len(valid_supply) >= 3 else None
     supply_high = float(valid_supply.quantile(0.67)) if len(valid_supply) >= 3 else None
@@ -11445,7 +11609,10 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
                 & exact_rows["_model_key2"].eq(str(row.get("model_key") or ""))
                 & exact_rows["_category_key"].eq(str(row.get("category_key") or ""))
                 & exact_rows["_year_key"].eq(int(row.get("year")))
-            ]
+            ].copy()
+            if "Link" in exact.columns:
+                exact["_link_key"] = exact["Link"].fillna("").astype(str).str.strip()
+                exact = exact[exact["_link_key"].ne("")].drop_duplicates("_link_key", keep="last")
             prices = pd.to_numeric(exact.get("Price"), errors="coerce").dropna()
             if not prices.empty:
                 selected_range_stats = {
@@ -11473,12 +11640,15 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
             "selected_price_range_median_price": selected_range_stats["median"],
             "selected_price_range_highest_price": selected_range_stats["max"],
             "historical_distinct_listings": row.get("historical_distinct_listings"),
+            "turnover_sample_size": row.get("turnover_sample_size"),
             "median_observed_days_to_exit": row.get("median_observed_days_to_exit"),
             "observed_exit_within_60_days_rate": row.get("observed_exit_within_60_days_rate"),
             "historical_price_reduction_rate": row.get("historical_price_reduction_rate"),
             "evidence_quality": str(row.get("evidence_quality") or "").strip(),
             "evidence_scope": str(row.get("evidence_scope") or "").strip(),
-            "broader_context": row.get("broader_context"),
+            "fallback_context": row.get("fallback_context"),
+            "history_start_date": row.get("history_start_date"),
+            "history_end_date": row.get("history_end_date"),
         })
     return result
 
@@ -12086,13 +12256,14 @@ def api_guided_discovery_stock_recommendations():
                 "selected_price_range_starting_price_gbp": item.get("selected_price_range_starting_price"),
                 "selected_price_range_median_price_gbp": item.get("selected_price_range_median_price"),
                 "selected_price_range_highest_price_gbp": item.get("selected_price_range_highest_price"),
-                "historical_distinct_listings": item.get("historical_distinct_listings"),
+                "exact_historical_distinct_listings": item.get("historical_distinct_listings"),
+                "turnover_sample_size": item.get("turnover_sample_size"),
                 "median_observed_days_to_leave_market": item.get("median_observed_days_to_exit"),
                 "observed_share_no_longer_advertised_within_60_days": item.get("observed_exit_within_60_days_rate"),
                 "historical_asking_price_reduction_rate": item.get("historical_price_reduction_rate"),
                 "evidence_quality": item.get("evidence_quality"),
                 "evidence_scope": item.get("evidence_scope"),
-                "broader_model_year_context": item.get("broader_context"),
+                "fallback_context": item.get("fallback_context"),
             })
 
         language_name = {"EN": "English", "TR": "Turkish", "RU": "Russian"}[language]
@@ -12110,8 +12281,11 @@ Writing rules:
 - Give each candidate a short, distinct scan label such as "Best demand/competition balance", "Fast turnover, low competition", "Strong demand, crowded market", or "Low-competition opportunity" when supported.
 - Every recommendation is an exact YEAR + BRAND + MODEL + CATEGORY opportunity. Always name all four components; never collapse a candidate to brand-model or model-year only.
 - `active_competing_listings`, `starting_price_gbp`, `median_asking_price_gbp`, and selected-price-range current examples are ALWAYS exact current-market statistics for that displayed Year + Brand + Model + Category.
-- `evidence_scope` tells you the scope of the HISTORICAL turnover statistics. `EXACT_CATEGORY_YEAR` means the historical sample is also exact for the displayed Year + Brand + Model + Category. `MODEL_YEAR_FALLBACK` means category-specific historical intelligence was unavailable, so the turnover statistics are same-year Brand + Model evidence pooled across categories. In that case you MUST state this limitation naturally and MUST NOT present the historical sample as category-specific.
-- When `broader_model_year_context` is present, the exact category-year history exists but is thin. Keep the headline turnover statistics exact; you may mention the broader same-year model context only as clearly-labelled secondary context, never merge its counts/rates into the exact evidence.
+- `evidence_scope` tells you the scope of the HISTORICAL TURNOVER statistics. `EXACT_CATEGORY_YEAR` means they were rebuilt directly from distinct listing histories for the displayed Year + Brand + Model + Category. In this exact case, DO NOT waste words explaining the evidence level or saying that the statistics are exact; simply use the statistics naturally.
+- `MODEL_YEAR_FALLBACK` is used only when the exact category-year turnover sample is too small to support a useful liquidity read. In that case the turnover statistics use the SAME YEAR + BRAND + MODEL across categories. You MUST state this limitation once, naturally and concisely. Never imply that fallback turnover figures are category-specific, and never pool different years.
+- `exact_historical_distinct_listings` is the number of distinct listing histories observed for the exact displayed Year + Brand + Model + Category. `turnover_sample_size` is the eligible sample supporting the 60-day turnover statistic and may be smaller because censored histories are excluded. Do not conflate these two numbers. Prefer the turnover sample when explaining the reliability of a turnover percentage.
+- Usually leave `exact_historical_distinct_listings` to the evidence strip rather than quoting it in the prose. If you discuss how well-supported a turnover percentage is, use `turnover_sample_size`; never write as though every historical listing was necessarily eligible for the 60-day statistic.
+- When `fallback_context` is present, it gives the exact category-year sample and the broader same-year model sample that justified the fallback. Mention it only to explain why a fallback was necessary; do not turn it into a second block of statistics.
 - Focus on demand/turnover first, then ACTIVE LOCAL COMPETITION, then asking-price context. Mention only the 2-4 facts that materially explain the ranking.
 - `observed_share_no_longer_advertised_within_60_days` is NOT a verified sold percentage. It means that share of historically observed listings was no longer advertised within 60 days. You may state the percentage, but describe it exactly in that buyer-friendly way. NEVER call it sold rate, sales rate, confirmed sales, or probability of sale.
 - `median_observed_days_to_leave_market` is observed listing turnover, not confirmed days-to-sale. Say "median observed time to leave the market" or a natural equivalent.
