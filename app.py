@@ -10836,15 +10836,14 @@ def _guided_apply_category_keys(rows, category_keys):
 
 
 def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
-    """Rank stock opportunities within the EXACT guided-selection universe.
+    """Rank exact Year + Brand + Model + Category stock opportunities.
 
-    The hard selector (listing-price range, vehicle type, year, brand, model and
-    category) is resolved first against the guided listing index. Listing-price
-    ranges describe the retail market segment the dealer wants to target; they
-    are not an estimate of dealer acquisition cost. Business intelligence is
-    then joined only to those surviving Brand/Model/Category/Year combinations,
-    so a Business report cannot re-introduce a motorcycle, ATV or other vehicle
-    that the guided type classifier excluded.
+    Every visible recommendation is anchored to one exact current-market combination.
+    Current supply/pricing statistics always come from that exact combination. Historical
+    Business intelligence is also exact CATEGORY_YEAR evidence when available. If that
+    exact historical layer is unavailable, the recommendation may use same-year MODEL_YEAR
+    history as explicitly-labelled fallback context; it must never silently present broader
+    model evidence as category-specific evidence.
     """
     if (
         rows is None or rows.empty
@@ -10853,91 +10852,192 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
     ):
         return []
 
-    allowed = rows[["Brand", "Model", "CategoryDetail", "Year"]].drop_duplicates().copy()
-    allowed["_brand"] = allowed["Brand"].fillna("").astype(str).str.strip().str.casefold()
-    allowed["_model"] = allowed["Model"].fillna("").astype(str).str.strip().str.casefold()
-    allowed["_category"] = allowed["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold()
-    allowed["_year"] = pd.to_numeric(allowed["Year"], errors="coerce").astype("Int64")
-    allowed_category_keys = set(zip(allowed["_brand"], allowed["_model"], allowed["_category"], allowed["_year"]))
-    allowed_model_keys = set(zip(allowed["_brand"], allowed["_model"], allowed["_year"]))
-
-    work = business_market_df.copy()
-    work["_brand"] = work["Brand"].fillna("").astype(str).str.strip().str.casefold()
-    work["_model"] = work["Model"].fillna("").astype(str).str.strip().str.casefold()
-    work["_category"] = work.get("CategoryDetail", "").fillna("").astype(str).str.strip().str.casefold()
-    work["_year"] = pd.to_numeric(work["Year"], errors="coerce").astype("Int64")
-    work["_granularity"] = work.get("BusinessGranularity", "").fillna("").astype(str).str.strip().str.upper()
-
-    category_mask = work.apply(
-        lambda row: (row["_brand"], row["_model"], row["_category"], row["_year"]) in allowed_category_keys,
-        axis=1,
-    ) & work["_granularity"].eq("CATEGORY_YEAR")
-    model_mask = work.apply(
-        lambda row: (row["_brand"], row["_model"], row["_year"]) in allowed_model_keys,
-        axis=1,
-    ) & work["_granularity"].eq("MODEL_YEAR")
-
-    matched = pd.concat([work.loc[category_mask], work.loc[model_mask]], axis=0)
-    if matched.empty:
+    exact_rows = rows.copy()
+    exact_rows["_brand_key"] = exact_rows["Brand"].fillna("").astype(str).str.strip().str.casefold()
+    exact_rows["_model_key2"] = exact_rows["Model"].fillna("").astype(str).str.strip().str.casefold()
+    exact_rows["_category_key"] = exact_rows["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold()
+    exact_rows["_year_key"] = pd.to_numeric(exact_rows["Year"], errors="coerce").astype("Int64")
+    exact_rows = exact_rows[
+        exact_rows["_brand_key"].ne("")
+        & exact_rows["_model_key2"].ne("")
+        & exact_rows["_category_key"].ne("")
+        & ~exact_rows["_category_key"].isin({"-", "nan", "none"})
+        & exact_rows["_year_key"].notna()
+    ].copy()
+    if exact_rows.empty:
         return []
 
-    signal_rank = {"VERY_STRONG": 0, "STRONG": 1, "MODERATE": 2, "WEAK": 3, "CAUTION": 4}
-    evidence_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-    matched["_signal_rank"] = matched["AcquisitionSignal"].map(signal_rank).fillna(9)
-    matched["_evidence_rank"] = matched["EvidenceQuality"].map(evidence_rank).fillna(9)
-    matched["_confidence_index"] = pd.to_numeric(matched.get("ConfidenceAdjustedOpportunityIndex"), errors="coerce")
-    matched["_opportunity_percentile"] = pd.to_numeric(matched.get("OpportunityPercentile"), errors="coerce")
-    matched["_turnover"] = pd.to_numeric(matched.get("ObservedExitWithin60DaysRate"), errors="coerce")
-    matched["_median_exit_days"] = pd.to_numeric(matched.get("MedianObservedDaysToExit"), errors="coerce")
-    matched["_current_supply"] = pd.to_numeric(matched.get("CurrentListings"), errors="coerce")
-    matched["_historical_depth"] = pd.to_numeric(matched.get("HistoricalDistinctListings"), errors="coerce")
-    matched["_price_reduction"] = pd.to_numeric(matched.get("PriceReductionRate"), errors="coerce")
-    matched["_specificity"] = matched["_granularity"].map({"CATEGORY_YEAR": 0, "MODEL_YEAR": 1}).fillna(2)
+    # Build the candidate universe from the exact current combinations that survived
+    # the user's guided selections. This guarantees a category on every recommendation.
+    current_groups = []
+    for (brand_key, model_key, category_key, year_key), group in exact_rows.groupby(
+        ["_brand_key", "_model_key2", "_category_key", "_year_key"], dropna=False
+    ):
+        if "Link" in group.columns:
+            linked = group["Link"].fillna("").astype(str).str.strip().ne("")
+            if not bool(linked.any()):
+                continue
+        first = group.iloc[0]
+        prices = pd.to_numeric(group.get("Price"), errors="coerce").dropna()
+        current_groups.append({
+            "brand_key": brand_key,
+            "model_key": model_key,
+            "category_key": category_key,
+            "year": int(year_key),
+            "brand": str(first.get("Brand") or "").strip(),
+            "model": str(first.get("Model") or "").strip(),
+            "category": str(first.get("CategoryDetail") or "").strip(),
+            "vehicle_type": str(first.get("VehicleType") or "").strip(),
+            "current_listings": int(len(group)),
+            "starting_price": float(prices.min()) if not prices.empty else None,
+            "median_price": float(prices.median()) if not prices.empty else None,
+            "highest_price": float(prices.max()) if not prices.empty else None,
+        })
+    if not current_groups:
+        return []
 
-    # For a dealer who normally imports stock, active local listings are not
-    # sourcing inventory: they are the vehicles the dealer will compete against
-    # after the imported vehicle reaches the island.  Rank therefore rewards
-    # observed turnover and faster market exit, while *lower* active supply is a
-    # positive competition signal. Historical depth and evidence quality prevent
-    # a one-off/niche vehicle with very little history from winning simply because
-    # there happens to be little current competition.
+    work = business_market_df.copy()
+    work["_brand_key"] = work["Brand"].fillna("").astype(str).str.strip().str.casefold()
+    work["_model_key2"] = work["Model"].fillna("").astype(str).str.strip().str.casefold()
+    work["_category_key"] = work.get("CategoryDetail", "").fillna("").astype(str).str.strip().str.casefold()
+    work["_year_key"] = pd.to_numeric(work["Year"], errors="coerce").astype("Int64")
+    work["_granularity"] = work.get("BusinessGranularity", "").fillna("").astype(str).str.strip().str.upper()
+
+    category_lookup = {}
+    model_year_lookup = {}
+    for row in work.to_dict("records"):
+        year = row.get("_year_key")
+        if year is None or pd.isna(year):
+            continue
+        if str(row.get("_granularity") or "").upper() == "CATEGORY_YEAR":
+            key = (row.get("_brand_key"), row.get("_model_key2"), row.get("_category_key"), int(year))
+            # Keep the first row deterministically; source should already be unique.
+            category_lookup.setdefault(key, row)
+        elif str(row.get("_granularity") or "").upper() == "MODEL_YEAR":
+            key = (row.get("_brand_key"), row.get("_model_key2"), int(year))
+            model_year_lookup.setdefault(key, row)
+
+    def _num(row, name):
+        if not row:
+            return None
+        value = row.get(name)
+        if value is None or pd.isna(value):
+            return None
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else None
+        except (TypeError, ValueError):
+            return None
+
+    candidate_records = []
+    for current in current_groups:
+        exact_key = (
+            current["brand_key"], current["model_key"], current["category_key"], current["year"]
+        )
+        model_key = (current["brand_key"], current["model_key"], current["year"])
+        exact_evidence = category_lookup.get(exact_key)
+        model_year_evidence = model_year_lookup.get(model_key)
+
+        if exact_evidence:
+            evidence = exact_evidence
+            evidence_scope = "EXACT_CATEGORY_YEAR"
+        elif model_year_evidence:
+            evidence = model_year_evidence
+            evidence_scope = "MODEL_YEAR_FALLBACK"
+        else:
+            # We can show a live listing but cannot defend a stock recommendation
+            # without any historical turnover evidence for the same model-year.
+            continue
+
+        historical_depth = _num(evidence, "HistoricalDistinctListings")
+        exact_depth = _num(exact_evidence, "HistoricalDistinctListings") if exact_evidence else None
+        broader_depth = _num(model_year_evidence, "HistoricalDistinctListings") if model_year_evidence else None
+
+        # If exact category-year history exists but is thin, keep every headline
+        # metric exact and attach the broader model-year layer only as labelled context.
+        broader_context = None
+        if (
+            exact_evidence
+            and model_year_evidence
+            and (exact_depth is None or exact_depth < 25)
+            and (broader_depth or 0) > (exact_depth or 0)
+        ):
+            broader_context = {
+                "scope": "MODEL_YEAR_CONTEXT",
+                "historical_distinct_listings": int(round(broader_depth)) if broader_depth is not None else None,
+                "median_observed_days_to_exit": _num(model_year_evidence, "MedianObservedDaysToExit"),
+                "observed_exit_within_60_days_rate": _num(model_year_evidence, "ObservedExitWithin60DaysRate"),
+                "historical_price_reduction_rate": _num(model_year_evidence, "PriceReductionRate"),
+            }
+
+        candidate_records.append({
+            **current,
+            "evidence_row": evidence,
+            "evidence_scope": evidence_scope,
+            "historical_distinct_listings": int(round(historical_depth)) if historical_depth is not None else None,
+            "median_observed_days_to_exit": _num(evidence, "MedianObservedDaysToExit"),
+            "observed_exit_within_60_days_rate": _num(evidence, "ObservedExitWithin60DaysRate"),
+            "historical_price_reduction_rate": _num(evidence, "PriceReductionRate"),
+            "evidence_quality": str(evidence.get("EvidenceQuality") or "").strip(),
+            "broader_context": broader_context,
+        })
+
+    if not candidate_records:
+        return []
+
+    ranked = pd.DataFrame(candidate_records)
+
     def _pct_rank(series, higher_is_better=True):
         numeric = pd.to_numeric(series, errors="coerce")
         if numeric.notna().sum() <= 1:
             return pd.Series(0.5, index=numeric.index, dtype="float64")
         return numeric.rank(ascending=higher_is_better, pct=True, method="average")
 
-    matched["_turnover_score"] = _pct_rank(matched["_turnover"], higher_is_better=True)
-    matched["_speed_score"] = _pct_rank(matched["_median_exit_days"], higher_is_better=False)
-    matched["_competition_score"] = _pct_rank(matched["_current_supply"], higher_is_better=False)
-    matched["_history_score"] = _pct_rank(matched["_historical_depth"], higher_is_better=True)
-    matched["_price_pressure_score"] = _pct_rank(matched["_price_reduction"], higher_is_better=False)
-    matched["_evidence_score"] = matched["EvidenceQuality"].map({"HIGH": 1.0, "MEDIUM": 0.65, "LOW": 0.30}).fillna(0.45)
+    ranked["_turnover"] = pd.to_numeric(ranked["observed_exit_within_60_days_rate"], errors="coerce")
+    ranked["_median_exit_days"] = pd.to_numeric(ranked["median_observed_days_to_exit"], errors="coerce")
+    ranked["_current_supply"] = pd.to_numeric(ranked["current_listings"], errors="coerce")
+    ranked["_historical_depth"] = pd.to_numeric(ranked["historical_distinct_listings"], errors="coerce")
+    ranked["_price_reduction"] = pd.to_numeric(ranked["historical_price_reduction_rate"], errors="coerce")
+    ranked["_scope_score"] = ranked["evidence_scope"].map({"EXACT_CATEGORY_YEAR": 1.0, "MODEL_YEAR_FALLBACK": 0.55}).fillna(0.4)
+    ranked["_evidence_score"] = ranked["evidence_quality"].map({"HIGH": 1.0, "MEDIUM": 0.65, "LOW": 0.30}).fillna(0.45)
 
-    matched["_turnover_score"] = matched["_turnover_score"].fillna(0.25)
-    matched["_speed_score"] = matched["_speed_score"].fillna(0.25)
-    matched["_competition_score"] = matched["_competition_score"].fillna(0.35)
-    matched["_history_score"] = matched["_history_score"].fillna(0.20)
-    matched["_price_pressure_score"] = matched["_price_pressure_score"].fillna(0.50)
+    ranked["_turnover_score"] = _pct_rank(ranked["_turnover"], higher_is_better=True).fillna(0.25)
+    ranked["_speed_score"] = _pct_rank(ranked["_median_exit_days"], higher_is_better=False).fillna(0.25)
+    ranked["_competition_score"] = _pct_rank(ranked["_current_supply"], higher_is_better=False).fillna(0.35)
+    ranked["_history_score"] = _pct_rank(ranked["_historical_depth"], higher_is_better=True).fillna(0.20)
+    ranked["_price_pressure_score"] = _pct_rank(ranked["_price_reduction"], higher_is_better=False).fillna(0.50)
 
-    matched["_stock_score"] = (
-        0.34 * matched["_turnover_score"]
-        + 0.24 * matched["_speed_score"]
-        + 0.20 * matched["_competition_score"]
-        + 0.10 * matched["_history_score"]
-        + 0.08 * matched["_evidence_score"]
-        + 0.04 * matched["_price_pressure_score"]
+    ranked["_stock_score"] = (
+        0.31 * ranked["_turnover_score"]
+        + 0.22 * ranked["_speed_score"]
+        + 0.18 * ranked["_competition_score"]
+        + 0.10 * ranked["_history_score"]
+        + 0.07 * ranked["_evidence_score"]
+        + 0.04 * ranked["_price_pressure_score"]
+        + 0.08 * ranked["_scope_score"]
     )
-
-    # Give category-year evidence a tiny deterministic preference when all of
-    # the commercial evidence is otherwise effectively equal.
-    matched = matched.sort_values(
-        ["_stock_score", "_specificity", "_turnover", "_median_exit_days", "_current_supply", "_historical_depth"],
-        ascending=[False, True, False, True, True, False],
+    ranked = ranked.sort_values(
+        ["_stock_score", "_scope_score", "_turnover", "_median_exit_days", "_current_supply", "_historical_depth"],
+        ascending=[False, False, False, True, True, False],
         na_position="last",
     )
 
-    valid_supply = matched["_current_supply"].dropna()
+    # Keep the shortlist commercially diverse, but every retained item remains an
+    # exact Year + Brand + Model + Category recommendation.
+    selected = []
+    seen_families = set()
+    for row in ranked.to_dict("records"):
+        family = (str(row.get("brand_key") or ""), str(row.get("model_key") or ""))
+        if family in seen_families:
+            continue
+        seen_families.add(family)
+        selected.append(row)
+        if len(selected) >= int(limit):
+            break
+
+    selected_listing_price_ranges = _guided_normalize_listing_price_ranges(listing_price_ranges)
+
+    valid_supply = pd.Series([item.get("current_listings") for item in selected], dtype="float64").dropna()
     supply_low = float(valid_supply.quantile(0.33)) if len(valid_supply) >= 3 else None
     supply_high = float(valid_supply.quantile(0.67)) if len(valid_supply) >= 3 else None
 
@@ -10957,79 +11057,49 @@ def _guided_stock_opportunities(rows, limit=5, listing_price_ranges=None):
             return "MODERATE"
         return "HIGH"
 
-    selected = []
-    seen_models = set()
-    for row in matched.to_dict("records"):
-        family = (str(row.get("Brand") or "").casefold(), str(row.get("Model") or "").casefold())
-        if family in seen_models:
-            continue
-        seen_models.add(family)
-        selected.append(row)
-        if len(selected) >= int(limit):
-            break
-
-    selected_listing_price_ranges = _guided_normalize_listing_price_ranges(listing_price_ranges)
-
     result = []
     for row in selected:
-        def num(name, integer=False):
-            value = row.get(name)
-            if value is None or pd.isna(value):
-                return None
-            return int(value) if integer else float(value)
-
-        selected_range_stats = {
-            "count": None,
-            "min": None,
-            "median": None,
-            "max": None,
-        }
+        selected_range_stats = {"count": None, "min": None, "median": None, "max": None}
         if selected_listing_price_ranges:
-            exact = rows.copy()
-            exact = exact[
-                exact["_brand_cf"].eq(str(row.get("Brand") or "").strip().casefold())
-                & exact["_model_cf"].eq(str(row.get("Model") or "").strip().casefold())
-                & pd.to_numeric(exact["Year"], errors="coerce").eq(pd.to_numeric(pd.Series([row.get("Year")]), errors="coerce").iloc[0])
+            exact = exact_rows[
+                exact_rows["_brand_key"].eq(str(row.get("brand_key") or ""))
+                & exact_rows["_model_key2"].eq(str(row.get("model_key") or ""))
+                & exact_rows["_category_key"].eq(str(row.get("category_key") or ""))
+                & exact_rows["_year_key"].eq(int(row.get("year")))
             ]
-            if str(row.get("_granularity") or "").upper() == "CATEGORY_YEAR":
-                exact = exact[exact["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold().eq(str(row.get("CategoryDetail") or "").strip().casefold())]
-            exact_prices = pd.to_numeric(exact.get("Price"), errors="coerce").dropna()
-            if not exact_prices.empty:
+            prices = pd.to_numeric(exact.get("Price"), errors="coerce").dropna()
+            if not prices.empty:
                 selected_range_stats = {
-                    "count": int(len(exact_prices)),
-                    "min": float(exact_prices.min()),
-                    "median": float(exact_prices.median()),
-                    "max": float(exact_prices.max()),
+                    "count": int(len(prices)),
+                    "min": float(prices.min()),
+                    "median": float(prices.median()),
+                    "max": float(prices.max()),
                 }
 
         result.append({
-            "vehicle_type": str(row.get("VehicleType") or "").strip(),
-            "brand": str(row.get("Brand") or "").strip(),
-            "model": str(row.get("Model") or "").strip(),
-            "category": str(row.get("CategoryDetail") or "").strip(),
-            "year": num("Year", integer=True),
-            "current_listings": num("CurrentListings", integer=True),
-            "competition_context": _competition_context(row.get("CurrentListings")),
-            "stock_rank_score": num("_stock_score"),
-            "starting_price": num("CurrentStartingPrice"),
-            "median_price": num("CurrentMedianPrice"),
-            "highest_price": num("CurrentHighestPrice"),
+            "vehicle_type": str(row.get("vehicle_type") or "").strip(),
+            "brand": str(row.get("brand") or "").strip(),
+            "model": str(row.get("model") or "").strip(),
+            "category": str(row.get("category") or "").strip(),
+            "year": int(row.get("year")),
+            "current_listings": int(row.get("current_listings") or 0),
+            "competition_context": _competition_context(row.get("current_listings")),
+            "stock_rank_score": float(row.get("_stock_score")) if row.get("_stock_score") is not None and not pd.isna(row.get("_stock_score")) else None,
+            "starting_price": row.get("starting_price"),
+            "median_price": row.get("median_price"),
+            "highest_price": row.get("highest_price"),
             "selected_price_ranges": list(selected_listing_price_ranges),
             "selected_price_range_listings": selected_range_stats["count"],
             "selected_price_range_starting_price": selected_range_stats["min"],
             "selected_price_range_median_price": selected_range_stats["median"],
             "selected_price_range_highest_price": selected_range_stats["max"],
-            "gallery_listings": num("GalleryListings", integer=True),
-            "private_listings": num("PrivateListings", integer=True),
-            "distinct_companies": num("DistinctCompanies", integer=True),
-            "historical_distinct_listings": num("HistoricalDistinctListings", integer=True),
-            "median_observed_days_to_exit": num("MedianObservedDaysToExit"),
-            "observed_exit_within_60_days_rate": num("ObservedExitWithin60DaysRate"),
-            "historical_price_reduction_rate": num("PriceReductionRate"),
-            "evidence_quality": str(row.get("EvidenceQuality") or "").strip(),
-            "opportunity_percentile": num("OpportunityPercentile"),
-            "acquisition_signal": str(row.get("AcquisitionSignal") or "").strip(),
-            "acquisition_reasons": [x.strip() for x in str(row.get("AcquisitionReasons") or "").split("|") if x.strip()],
+            "historical_distinct_listings": row.get("historical_distinct_listings"),
+            "median_observed_days_to_exit": row.get("median_observed_days_to_exit"),
+            "observed_exit_within_60_days_rate": row.get("observed_exit_within_60_days_rate"),
+            "historical_price_reduction_rate": row.get("historical_price_reduction_rate"),
+            "evidence_quality": str(row.get("evidence_quality") or "").strip(),
+            "evidence_scope": str(row.get("evidence_scope") or "").strip(),
+            "broader_context": row.get("broader_context"),
         })
     return result
 
@@ -11256,6 +11326,8 @@ def api_guided_discovery_result():
             item["newest_year_max_price"] = exact.get("max_price")
             item["newest_year_median_km"] = exact.get("median_km")
 
+        stock_opportunities = _guided_stock_opportunities(rows, limit=5, listing_price_ranges=listing_price_ranges) if task == "STOCK_PURCHASE" else []
+
         result_cols = [c for c in ("Brand", "Model", "CategoryDetail", "Year", "Price", "KM", "_guided_km_reliable", "Company", "Color", "Transmission", "Location", "Image", "Link") if c in rows.columns]
         posted_rows = rows
         if "Link" in posted_rows.columns:
@@ -11289,9 +11361,24 @@ def api_guided_discovery_result():
                     if matches:
                         selected_model_indices.append(matches[0])
 
+            # For Stock Purchase, reserve one linked live example for every exact
+            # Year + Brand + Model + Category recommendation before any generic fill.
+            stock_example_indices = []
+            if stock_opportunities and {"Brand", "Model", "CategoryDetail", "Year"}.issubset(ordered_posted.columns):
+                for opportunity in stock_opportunities:
+                    mask = (
+                        ordered_posted["Brand"].fillna("").astype(str).str.strip().str.casefold().eq(str(opportunity.get("brand") or "").strip().casefold())
+                        & ordered_posted["Model"].fillna("").astype(str).str.strip().str.casefold().eq(str(opportunity.get("model") or "").strip().casefold())
+                        & ordered_posted["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold().eq(str(opportunity.get("category") or "").strip().casefold())
+                        & pd.to_numeric(ordered_posted["Year"], errors="coerce").eq(opportunity.get("year"))
+                    )
+                    matches = ordered_posted.index[mask].tolist()
+                    if matches:
+                        stock_example_indices.append(matches[0])
+
             selected_model_rows = ordered_posted.loc[selected_model_indices] if selected_model_indices else ordered_posted.iloc[0:0]
             diverse = ordered_posted.drop_duplicates(subset=identity_cols, keep="first")
-            combined_indices = list(dict.fromkeys(list(selected_model_rows.index) + list(diverse.index)))
+            combined_indices = list(dict.fromkeys(stock_example_indices + list(selected_model_rows.index) + list(diverse.index)))
             covered = ordered_posted.loc[combined_indices] if combined_indices else ordered_posted.iloc[0:0]
             remainder = ordered_posted.loc[~ordered_posted.index.isin(combined_indices)]
             result_rows = pd.concat([covered, remainder], axis=0)[result_cols].head(80)
@@ -11315,7 +11402,6 @@ def api_guided_discovery_result():
                 "link": str(row.get("Link") or ""),
             })
 
-        stock_opportunities = _guided_stock_opportunities(rows, limit=5, listing_price_ranges=listing_price_ranges) if task == "STOCK_PURCHASE" else []
         return jsonify({
             "success": True,
             "count": int(len(rows)),
@@ -11626,6 +11712,8 @@ def api_guided_discovery_stock_recommendations():
                 "observed_share_no_longer_advertised_within_60_days": item.get("observed_exit_within_60_days_rate"),
                 "historical_asking_price_reduction_rate": item.get("historical_price_reduction_rate"),
                 "evidence_quality": item.get("evidence_quality"),
+                "evidence_scope": item.get("evidence_scope"),
+                "broader_model_year_context": item.get("broader_context"),
             })
 
         language_name = {"EN": "English", "TR": "Turkish", "RU": "Russian"}[language]
@@ -11641,6 +11729,10 @@ Writing rules:
 - Write like a sharp dealership adviser, not an analyst or a generic AI.
 - Rank 1-3: about 55-70 words. Ranks 4-5: about 35-50 words.
 - Give each candidate a short, distinct scan label such as "Best demand/competition balance", "Fast turnover, low competition", "Strong demand, crowded market", or "Low-competition opportunity" when supported.
+- Every recommendation is an exact YEAR + BRAND + MODEL + CATEGORY opportunity. Always name all four components; never collapse a candidate to brand-model or model-year only.
+- `active_competing_listings`, `starting_price_gbp`, `median_asking_price_gbp`, and selected-price-range current examples are ALWAYS exact current-market statistics for that displayed Year + Brand + Model + Category.
+- `evidence_scope` tells you the scope of the HISTORICAL turnover statistics. `EXACT_CATEGORY_YEAR` means the historical sample is also exact for the displayed Year + Brand + Model + Category. `MODEL_YEAR_FALLBACK` means category-specific historical intelligence was unavailable, so the turnover statistics are same-year Brand + Model evidence pooled across categories. In that case you MUST state this limitation naturally and MUST NOT present the historical sample as category-specific.
+- When `broader_model_year_context` is present, the exact category-year history exists but is thin. Keep the headline turnover statistics exact; you may mention the broader same-year model context only as clearly-labelled secondary context, never merge its counts/rates into the exact evidence.
 - Focus on demand/turnover first, then ACTIVE LOCAL COMPETITION, then asking-price context. Mention only the 2-4 facts that materially explain the ranking.
 - `observed_share_no_longer_advertised_within_60_days` is NOT a verified sold percentage. It means that share of historically observed listings was no longer advertised within 60 days. You may state the percentage, but describe it exactly in that buyer-friendly way. NEVER call it sold rate, sales rate, confirmed sales, or probability of sale.
 - `median_observed_days_to_leave_market` is observed listing turnover, not confirmed days-to-sale. Say "median observed time to leave the market" or a natural equivalent.
