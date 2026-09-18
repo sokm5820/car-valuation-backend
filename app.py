@@ -6970,7 +6970,19 @@ def _business_manage_row_public(row):
         "comparable_median_price": float(row["ComparableMedianPrice"]) if pd.notna(row.get("ComparableMedianPrice")) else None,
         "comparable_p25_price": float(row["ComparableP25Price"]) if pd.notna(row.get("ComparableP25Price")) else None,
         "comparable_p75_price": float(row["ComparableP75Price"]) if pd.notna(row.get("ComparableP75Price")) else None,
-        "price_vs_median_pct": float(row["PriceVsMedianPct"]) if pd.notna(row.get("PriceVsMedianPct")) else None,
+        # Do not trust the upstream PriceVsMedianPct scale here.  Some rows in
+        # historical exports encode it as a ratio while others encode a percent,
+        # which can make a £17k ask vs a £6.25k median appear as ~2% above.
+        # The asking price and comparable median are the authoritative inputs, so
+        # derive the percentage directly from those values whenever possible.
+        "price_vs_median_pct": (
+            ((float(row["CurrentAskingPrice"]) - float(row["ComparableMedianPrice"]))
+             / float(row["ComparableMedianPrice"]) * 100.0)
+            if pd.notna(row.get("CurrentAskingPrice"))
+            and pd.notna(row.get("ComparableMedianPrice"))
+            and float(row["ComparableMedianPrice"]) > 0
+            else (float(row["PriceVsMedianPct"]) if pd.notna(row.get("PriceVsMedianPct")) else None)
+        ),
         "has_reduced_price": bool(row.get("HasReducedPrice", False)),
         "price_change_pct": float(row["PriceChangePct"]) if pd.notna(row.get("PriceChangePct")) else None,
         "attention_level": str(row.get("AttentionLevel") or "").strip(),
