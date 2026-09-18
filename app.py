@@ -9689,6 +9689,250 @@ def _business_advertising_recommendations(company, limit=5):
 
 
 
+def _business_activity_period_summary(company, period="30D", custom_from=None, custom_to=None):
+    """Build a deterministic period-over-period activity pulse for one gallery.
+
+    The source is business_company_activity_daily.csv.  It records observed listing
+    movement and asking-price actions by company/day; observed exits are explicitly
+    not treated as confirmed sales.
+    """
+    if not company or business_activity_df is None or business_activity_df.empty:
+        return {"data_available": False, "summary": {}, "daily": [], "top_days": []}
+
+    work = business_activity_df[
+        business_activity_df["Company"].fillna("").astype(str).str.casefold()
+        == str(company).casefold()
+    ].copy()
+    if work.empty:
+        return {"data_available": False, "summary": {}, "daily": [], "top_days": []}
+
+    work = work.sort_values("Date").copy()
+    available_start = pd.Timestamp(work["Date"].min()).normalize()
+    available_end = pd.Timestamp(work["Date"].max()).normalize()
+    period_key = str(period or "30D").strip().upper()
+
+    if period_key == "CUSTOM":
+        start = pd.to_datetime(custom_from, errors="coerce")
+        end = pd.to_datetime(custom_to, errors="coerce")
+        if pd.isna(start) or pd.isna(end):
+            return {"data_available": False, "summary": {}, "daily": [], "top_days": [], "error": "INVALID_CUSTOM_PERIOD"}
+        start = pd.Timestamp(start).normalize()
+        end = pd.Timestamp(end).normalize()
+        if start > end:
+            start, end = end, start
+        # Never imply coverage beyond the intelligence snapshot actually loaded.
+        start = max(start, available_start)
+        end = min(end, available_end)
+    else:
+        days = {"7D": 7, "30D": 30, "90D": 90}.get(period_key, 30)
+        end = available_end
+        start = max(available_start, end - pd.Timedelta(days=days - 1))
+
+    if start > end:
+        return {
+            "data_available": False,
+            "summary": {},
+            "daily": [],
+            "top_days": [],
+            "available_from": available_start.date().isoformat(),
+            "available_to": available_end.date().isoformat(),
+        }
+
+    period_days = max(1, int((end - start).days) + 1)
+    previous_end = start - pd.Timedelta(days=1)
+    previous_start = previous_end - pd.Timedelta(days=period_days - 1)
+
+    current = work[(work["Date"] >= start) & (work["Date"] <= end)].copy()
+    previous = work[(work["Date"] >= previous_start) & (work["Date"] <= previous_end)].copy()
+
+    if current.empty:
+        return {
+            "data_available": False,
+            "summary": {},
+            "daily": [],
+            "top_days": [],
+            "period_start": start.date().isoformat(),
+            "period_end": end.date().isoformat(),
+            "available_from": available_start.date().isoformat(),
+            "available_to": available_end.date().isoformat(),
+        }
+
+    metric_columns = {
+        "new_listings": "NewlyObservedListings",
+        "observed_exits": "ObservedMarketExits",
+        "price_reductions": "AskingPriceReductions",
+        "price_increases": "AskingPriceIncreases",
+    }
+
+    def _sum(frame, column):
+        if frame is None or frame.empty or column not in frame.columns:
+            return 0
+        values = pd.to_numeric(frame[column], errors="coerce").fillna(0)
+        return int(round(float(values.sum())))
+
+    def _first_number(frame, column):
+        if frame is None or frame.empty or column not in frame.columns:
+            return None
+        values = pd.to_numeric(frame[column], errors="coerce").dropna()
+        return int(round(float(values.iloc[0]))) if not values.empty else None
+
+    def _last_number(frame, column):
+        if frame is None or frame.empty or column not in frame.columns:
+            return None
+        values = pd.to_numeric(frame[column], errors="coerce").dropna()
+        return int(round(float(values.iloc[-1]))) if not values.empty else None
+
+    def _aggregate(frame):
+        result = {name: _sum(frame, column) for name, column in metric_columns.items()}
+        result["price_changes"] = result["price_reductions"] + result["price_increases"]
+        result["total_activity"] = result["new_listings"] + result["observed_exits"] + result["price_changes"]
+        opening = _first_number(frame, "OpeningObservedStockCount")
+        closing = _last_number(frame, "ClosingObservedStockCount")
+        if opening is not None and closing is not None:
+            net = closing - opening
+        else:
+            net = _sum(frame, "NetObservedStockChange")
+        result["opening_stock"] = opening
+        result["closing_stock"] = closing
+        result["net_stock_change"] = int(net)
+        if frame is None or frame.empty:
+            result["active_days"] = 0
+        else:
+            event_total = sum(
+                pd.to_numeric(frame[column], errors="coerce").fillna(0)
+                for column in metric_columns.values()
+            )
+            result["active_days"] = int((event_total > 0).sum())
+        return result
+
+    current_metrics = _aggregate(current)
+    previous_metrics = _aggregate(previous)
+
+    comparisons = {}
+    for key in ["new_listings", "observed_exits", "price_reductions", "price_increases", "price_changes", "total_activity"]:
+        now = int(current_metrics.get(key) or 0)
+        before = int(previous_metrics.get(key) or 0)
+        delta = now - before
+        if before > 0:
+            delta_pct = round((delta / before) * 100.0, 1)
+        else:
+            delta_pct = None
+        comparisons[key] = {
+            "current": now,
+            "previous": before,
+            "delta": delta,
+            "delta_pct": delta_pct,
+            "trend": "UP" if delta > 0 else "DOWN" if delta < 0 else "FLAT",
+        }
+
+    daily = []
+    for row in current.sort_values("Date").to_dict("records"):
+        new_listings = int(round(float(row.get("NewlyObservedListings") or 0))) if pd.notna(row.get("NewlyObservedListings")) else 0
+        exits = int(round(float(row.get("ObservedMarketExits") or 0))) if pd.notna(row.get("ObservedMarketExits")) else 0
+        reductions = int(round(float(row.get("AskingPriceReductions") or 0))) if pd.notna(row.get("AskingPriceReductions")) else 0
+        increases = int(round(float(row.get("AskingPriceIncreases") or 0))) if pd.notna(row.get("AskingPriceIncreases")) else 0
+        daily.append({
+            "date": pd.Timestamp(row.get("Date")).date().isoformat(),
+            "new_listings": new_listings,
+            "observed_exits": exits,
+            "price_reductions": reductions,
+            "price_increases": increases,
+            "net_stock_change": int(round(float(row.get("NetObservedStockChange") or 0))) if pd.notna(row.get("NetObservedStockChange")) else 0,
+            "closing_stock": int(round(float(row.get("ClosingObservedStockCount")))) if pd.notna(row.get("ClosingObservedStockCount")) else None,
+            "total_activity": new_listings + exits + reductions + increases,
+        })
+
+    top_days = sorted(
+        [item for item in daily if item.get("total_activity", 0) > 0],
+        key=lambda item: (item.get("total_activity", 0), item.get("date", "")),
+        reverse=True,
+    )[:3]
+
+    reductions = int(current_metrics.get("price_reductions") or 0)
+    increases = int(current_metrics.get("price_increases") or 0)
+    price_changes = reductions + increases
+    reduction_share = round((reductions / price_changes) * 100.0, 1) if price_changes else None
+    exits = int(current_metrics.get("observed_exits") or 0)
+    new_listings = int(current_metrics.get("new_listings") or 0)
+    inflow_per_exit = round(new_listings / exits, 2) if exits > 0 else None
+
+    summary = {
+        **current_metrics,
+        "period_days": period_days,
+        "period_start": start.date().isoformat(),
+        "period_end": end.date().isoformat(),
+        "previous_period_start": previous_start.date().isoformat(),
+        "previous_period_end": previous_end.date().isoformat(),
+        "previous_period_available": bool(previous_start >= available_start and not previous.empty),
+        "comparisons": comparisons,
+        "reduction_share_pct": reduction_share,
+        "inflow_per_exit": inflow_per_exit,
+        "average_daily_activity": round((current_metrics.get("total_activity") or 0) / period_days, 2),
+        "available_from": available_start.date().isoformat(),
+        "available_to": available_end.date().isoformat(),
+    }
+
+    return {
+        "data_available": True,
+        "summary": summary,
+        "daily": daily,
+        "top_days": top_days,
+    }
+
+
+@app.route("/api/guided/business/activity-summary", methods=["POST"])
+def api_guided_business_activity_summary():
+    """Return a period-over-period operating pulse for the selected gallery."""
+    try:
+        data = request.get_json(silent=True) or {}
+        manager = get_access_manager()
+        context = _request_access_context(data)
+        g.otodeger_access_context = context
+        requested_business = _normalize_access_tier(data.get("access_tier") or data.get("tier")) == "BUSINESS"
+
+        if manager.enforcement_enabled:
+            if not requested_business or not context.business_entitled:
+                raise BusinessAccessRequired("An authorised Business account is required")
+            manager.activate_business_device(context)
+            company = str(context.org_name or "").strip()
+        elif context.business_entitled and requested_business and context.org_name:
+            company = str(context.org_name).strip()
+        else:
+            company = _resolve_business_company(
+                "",
+                requested_company=str(data.get("business_company") or "").strip() or None,
+            )
+
+        if not company:
+            return jsonify({"success": False, "error": "BUSINESS_COMPANY_REQUIRED"}), 400
+
+        payload = _business_activity_period_summary(
+            company,
+            period=data.get("period") or "30D",
+            custom_from=data.get("custom_from"),
+            custom_to=data.get("custom_to"),
+        )
+        return jsonify({
+            "success": True,
+            "company": company,
+            **payload,
+        })
+    except AccessControlError as exc:
+        return _access_control_error_response(exc)
+    except Exception as exc:
+        print("BUSINESS ACTIVITY SUMMARY FAILED:", repr(exc), flush=True)
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": "BUSINESS_ACTIVITY_SUMMARY_UNAVAILABLE",
+            "data_available": False,
+            "summary": {},
+            "daily": [],
+            "top_days": [],
+        }), 503
+
+
+
 @app.route("/api/guided/business/inventory-pricing", methods=["POST"])
 def api_guided_business_inventory_pricing():
     """Return structured pricing priorities for the selected gallery's own stock."""
