@@ -9560,17 +9560,107 @@ def _round_business_benchmark(value, step=50):
     return int(math.floor((numeric / step) + 0.5) * step)
 
 
+def _business_inventory_price_history(company, links):
+    """Return observed asking-price history for active inventory links.
+
+    This is the vehicle's own advertised-price history, not a market benchmark.
+    It is used to make Inventory Pricing explanations specific and operational:
+    when a price moved, by how much, and whether earlier repricing has already
+    changed the vehicle's position.  Missing raw daily history is represented as
+    unavailable rather than inferred from aggregate flags.
+    """
+    link_set = {str(value or "").strip() for value in (links or []) if str(value or "").strip()}
+    if not link_set:
+        return {}
+
+    source = business_activity_history_df if BUSINESS_ACTIVITY_HISTORY_READY and business_activity_history_df is not None else pd.DataFrame()
+    if source is None or source.empty:
+        return {}
+
+    lower = {str(col).strip().casefold(): col for col in source.columns}
+    date_col = lower.get("date") or lower.get("tarih")
+    company_col = lower.get("company") or lower.get("seller") or lower.get("dealer") or lower.get("firma")
+    link_col = lower.get("link") or lower.get("url")
+    price_col = lower.get("price") or lower.get("currentaskingprice") or lower.get("fiyat")
+    if not all([date_col, company_col, link_col, price_col]):
+        return {}
+
+    work = source[[date_col, company_col, link_col, price_col]].copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+    work[price_col] = pd.to_numeric(work[price_col], errors="coerce")
+    work[company_col] = work[company_col].fillna("").astype(str).str.strip()
+    work[link_col] = work[link_col].fillna("").astype(str).str.strip()
+    target_company = _normalize_company_name(company)
+    work = work[
+        work[date_col].notna()
+        & work[price_col].notna()
+        & work[link_col].isin(link_set)
+        & (work[company_col].map(_normalize_company_name) == target_company)
+    ].copy()
+    if work.empty:
+        return {}
+
+    history = {}
+    for link, group in work.groupby(link_col, sort=False):
+        ordered = group.sort_values(date_col, kind="stable").copy()
+        ordered["_day"] = ordered[date_col].dt.normalize()
+        ordered = ordered.drop_duplicates(subset=["_day"], keep="last")
+        if ordered.empty:
+            continue
+
+        first_price = float(ordered.iloc[0][price_col])
+        latest_price = float(ordered.iloc[-1][price_col])
+        changes = []
+        previous_price = first_price
+        for _, row in ordered.iloc[1:].iterrows():
+            current_price = float(row[price_col])
+            if abs(current_price - previous_price) < 0.5:
+                previous_price = current_price
+                continue
+            amount = current_price - previous_price
+            changes.append({
+                "date": pd.Timestamp(row[date_col]).date().isoformat(),
+                "previous_price": previous_price,
+                "new_price": current_price,
+                "change_amount": amount,
+                "change_pct": round((amount / previous_price) * 100.0, 2) if previous_price else None,
+                "direction": "INCREASE" if amount > 0 else "REDUCTION",
+            })
+            previous_price = current_price
+
+        reductions = sum(1 for item in changes if item["direction"] == "REDUCTION")
+        increases = sum(1 for item in changes if item["direction"] == "INCREASE")
+        net_amount = latest_price - first_price
+        history[str(link)] = {
+            "price_history_available": True,
+            "first_observed_price": first_price,
+            "first_observed_date": pd.Timestamp(ordered.iloc[0][date_col]).date().isoformat(),
+            "latest_observed_price": latest_price,
+            "latest_observed_date": pd.Timestamp(ordered.iloc[-1][date_col]).date().isoformat(),
+            "price_change_count": len(changes),
+            "price_reduction_count": reductions,
+            "price_increase_count": increases,
+            "price_history_net_change": net_amount,
+            "price_history_net_change_pct": round((net_amount / first_price) * 100.0, 2) if first_price else None,
+            # Most recent changes first for the UI; retain enough context without
+            # turning each inventory card into a transaction log.
+            "price_history": list(reversed(changes[-6:])),
+        }
+    return history
+
+
 def _business_inventory_pricing_recommendations(company, limit=500):
     """Return a complete, price-focused view of a gallery's active inventory.
 
     Every active vehicle is assigned to exactly one pricing bucket:
       * PRICE_REVIEW               — asking position is high vs current comparables
-      * COMPETITIVELY_POSITIONED   — broadly market-aligned / no clear price gap
+      * COMPETITIVELY_POSITIONED   — broadly market-aligned
       * POTENTIALLY_UNDER_PRICED   — asking position is low vs current comparables
+      * NO_MARKET_COMPARABLES      — no defensible current benchmark can be formed
 
-    Stock age is deliberately not used to classify these buckets. Ageing analysis
-    belongs to Business Activity; this endpoint answers the narrower pricing
-    question so the three pricing states remain mutually exclusive.
+    Stock age is deliberately excluded.  A vehicle without a usable market-price
+    benchmark is never silently placed in a conclusion-bearing bucket merely to
+    make the category counts add up.
     """
     if not company or business_stock_df is None or business_stock_df.empty:
         return {"recommendations": [], "summary": {}}
@@ -9582,29 +9672,65 @@ def _business_inventory_pricing_recommendations(company, limit=500):
     if work.empty:
         return {"recommendations": [], "summary": {}}
 
+    links = work["Link"].dropna().astype(str).str.strip().tolist() if "Link" in work.columns else []
+    price_history_by_link = _business_inventory_price_history(company, links)
+
     bucket_rank = {
         "PRICE_REVIEW": 0,
         "POTENTIALLY_UNDER_PRICED": 1,
         "COMPETITIVELY_POSITIONED": 2,
+        "NO_MARKET_COMPARABLES": 3,
     }
     counts = {
         "PRICE_REVIEW": 0,
         "COMPETITIVELY_POSITIONED": 0,
         "POTENTIALLY_UNDER_PRICED": 0,
+        "NO_MARKET_COMPARABLES": 0,
     }
     rows = []
 
     for raw in work.to_dict("records"):
         public = _business_manage_row_public(raw)
+        link = str(public.get("link") or "").strip()
+        if link in price_history_by_link:
+            public.update(price_history_by_link[link])
+        else:
+            public["price_history_available"] = False
+            public["price_history"] = []
+            public["price_change_count"] = None
+            public["price_reduction_count"] = None
+            public["price_increase_count"] = None
+
         price_position = str(public.get("price_position") or "").strip().upper()
         comp_conf = str(public.get("comparable_confidence") or "").strip().upper()
-        comp_count = public.get("comparable_count")
+        comp_count_raw = public.get("comparable_count")
+        try:
+            comp_count = int(comp_count_raw) if comp_count_raw is not None else 0
+        except (TypeError, ValueError):
+            comp_count = 0
 
-        # PricePositionBand is produced from the current comparable market and is
-        # the clearest deterministic source for this price-only segmentation.
-        # Unknown/neutral rows sit in the middle bucket rather than being labelled
-        # overpriced or underpriced without evidence.
-        if price_position in {"HIGH", "HIGH_MID"}:
+        median_raw = public.get("comparable_median_price")
+        try:
+            median_numeric = float(median_raw) if median_raw is not None else None
+            if median_numeric is not None and not math.isfinite(median_numeric):
+                median_numeric = None
+        except (TypeError, ValueError):
+            median_numeric = None
+
+        # Pricing conclusions require an actual current-market benchmark.  A row
+        # with no median / no comparable set belongs in its own explicit bucket;
+        # the vehicle's own price history can add context but cannot substitute
+        # for a market comparison.
+        has_market_benchmark = (
+            median_numeric is not None
+            and median_numeric > 0
+            and comp_count > 0
+            and price_position not in {"", "UNKNOWN", "UNAVAILABLE", "NONE"}
+        )
+
+        if not has_market_benchmark:
+            bucket = "NO_MARKET_COMPARABLES"
+        elif price_position in {"HIGH", "HIGH_MID"}:
             bucket = "PRICE_REVIEW"
         elif price_position in {"LOW", "LOW_MID"}:
             bucket = "POTENTIALLY_UNDER_PRICED"
@@ -9613,20 +9739,20 @@ def _business_inventory_pricing_recommendations(company, limit=500):
 
         counts[bucket] += 1
         public["pricing_bucket"] = bucket
-        public["pricing_evidence_limited"] = comp_conf not in {"HIGH", "MEDIUM"} or not comp_count or int(comp_count) < 2
+        public["pricing_evidence_limited"] = (
+            bucket == "NO_MARKET_COMPARABLES"
+            or comp_conf not in {"HIGH", "MEDIUM"}
+            or comp_count < 2
+        )
 
-        median_raw = public.get("comparable_median_price")
         p25_raw = public.get("comparable_p25_price")
         p75_raw = public.get("comparable_p75_price")
-        public["display_comparable_median_price"] = _round_business_benchmark(median_raw, 50)
+        public["display_comparable_median_price"] = _round_business_benchmark(median_numeric, 50)
         public["display_comparable_p25_price"] = _round_business_benchmark(p25_raw, 50)
         public["display_comparable_p75_price"] = _round_business_benchmark(p75_raw, 50)
 
-        # Market-position guidance is shown only for stock clearly above the
-        # current comparable market. It must always be a positive currency value,
-        # never a signed delta that could render as "-£14,000".
         asking = public.get("asking_price")
-        median_target = _round_business_benchmark(median_raw, 250)
+        median_target = _round_business_benchmark(median_numeric, 250)
         lower_target = _round_business_benchmark(p25_raw, 250)
         if (
             bucket == "PRICE_REVIEW"
@@ -9642,8 +9768,6 @@ def _business_inventory_pricing_recommendations(company, limit=500):
             public["suggested_market_position_low"] = None
             public["suggested_market_position_high"] = None
 
-        # Sort within each bucket by the size of the current price gap; stronger
-        # evidence then wins ties. This affects presentation only, not bucket membership.
         raw_delta = public.get("price_vs_median_pct")
         try:
             delta = float(raw_delta) if raw_delta is not None else 0.0
@@ -9655,6 +9779,8 @@ def _business_inventory_pricing_recommendations(company, limit=500):
             sort_pressure = delta
         elif bucket == "POTENTIALLY_UNDER_PRICED":
             sort_pressure = abs(min(delta, 0.0))
+        elif bucket == "NO_MARKET_COMPARABLES":
+            sort_pressure = 0.0
         else:
             sort_pressure = -abs(delta)
 
@@ -9694,9 +9820,9 @@ def _business_inventory_pricing_recommendations(company, limit=500):
         "price_review_count": int(counts["PRICE_REVIEW"]),
         "competitively_positioned_count": int(counts["COMPETITIVELY_POSITIONED"]),
         "potentially_underpriced_count": int(counts["POTENTIALLY_UNDER_PRICED"]),
+        "no_market_comparables_count": int(counts["NO_MARKET_COMPARABLES"]),
     }
     return {"recommendations": public_rows, "summary": summary}
-
 
 def _business_advertising_recommendations(company, limit=5):
     """Rank current dealership stock by where paid visibility is most defensible.
