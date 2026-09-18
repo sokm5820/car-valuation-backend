@@ -10201,9 +10201,16 @@ def api_guided_discovery_result():
             rows["_guided_km"] = pd.to_numeric(rows["KM"], errors="coerce")
             years_numeric = pd.to_numeric(rows["Year"], errors="coerce") if "Year" in rows.columns else pd.Series(index=rows.index, dtype=float)
             current_year = datetime.now().year
-            implausibly_low = (years_numeric <= current_year - 2) & rows["_guided_km"].notna() & (rows["_guided_km"] < 100)
+            # A 2+ year-old used vehicle showing only a few hundred kilometres is
+            # possible, but unusual enough that it should not drive medians/ranking
+            # without verification. Preserve the raw listing value for display,
+            # mark it as unverified, and exclude it only from statistical evidence.
+            implausibly_low = (years_numeric <= current_year - 2) & rows["_guided_km"].notna() & (rows["_guided_km"] < 1_000)
             implausibly_high = rows["_guided_km"].notna() & (rows["_guided_km"] > 1_000_000)
-            rows.loc[implausibly_low | implausibly_high, "_guided_km"] = float("nan")
+            rows["_guided_km_reliable"] = ~(implausibly_low | implausibly_high)
+            rows.loc[~rows["_guided_km_reliable"], "_guided_km"] = float("nan")
+        else:
+            rows["_guided_km_reliable"] = True
 
         grouped = (
             rows.groupby(["Brand", "Model", "CategoryDetail"], dropna=False)
@@ -10279,8 +10286,7 @@ def api_guided_discovery_result():
                 median_km=("_guided_km", "median") if "_guided_km" in rows.columns else ("Price", "size"),
             )
             .reset_index()
-            .sort_values(["Brand", "Model", "CategoryDetail", "Year"], ascending=[True, True, True, True])
-            .head(120)
+            .sort_values(["Brand", "Model", "CategoryDetail", "Year"], ascending=[True, True, True, False])
         )
         year_options = []
         for row in year_grouped.to_dict("records"):
@@ -10296,7 +10302,35 @@ def api_guided_discovery_result():
                 "median_km": float(row["median_km"]) if pd.notna(row.get("median_km")) else None,
             })
 
-        result_cols = [c for c in ("Brand", "Model", "CategoryDetail", "Year", "Price", "KM", "Company", "Color", "Transmission", "Location", "Image", "Link") if c in rows.columns]
+        # Recommendation cards are titled with the newest qualifying year, so every
+        # visible current-market statistic on those cards must describe that SAME
+        # year. Keep the broader group evidence for market depth/history, but attach
+        # an exact-year evidence slice for ranking, writing and display.
+        year_lookup = {}
+        for item in year_options:
+            key = (
+                str(item.get("brand") or "").casefold(),
+                str(item.get("model") or "").casefold(),
+                str(item.get("category") or "").casefold(),
+                int(item.get("year")) if item.get("year") is not None else None,
+            )
+            year_lookup[key] = item
+        for item in groups:
+            newest_year = item.get("newest_year")
+            key = (
+                str(item.get("brand") or "").casefold(),
+                str(item.get("model") or "").casefold(),
+                str(item.get("category") or "").casefold(),
+                int(newest_year) if newest_year is not None else None,
+            )
+            exact = year_lookup.get(key) or {}
+            item["newest_year_listing_count"] = int(exact.get("listing_count") or 0)
+            item["newest_year_min_price"] = exact.get("min_price")
+            item["newest_year_median_price"] = exact.get("median_price")
+            item["newest_year_max_price"] = exact.get("max_price")
+            item["newest_year_median_km"] = exact.get("median_km")
+
+        result_cols = [c for c in ("Brand", "Model", "CategoryDetail", "Year", "Price", "KM", "_guided_km_reliable", "Company", "Color", "Transmission", "Location", "Image", "Link") if c in rows.columns]
         posted_rows = rows
         if "Link" in posted_rows.columns:
             posted_rows = posted_rows[posted_rows["Link"].fillna("").astype(str).str.strip().ne("")]
@@ -10322,6 +10356,7 @@ def api_guided_discovery_result():
                 "year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
                 "price": float(row["Price"]) if pd.notna(row.get("Price")) else None,
                 "km": float(row["KM"]) if pd.notna(row.get("KM")) else None,
+                "km_reliable": bool(row.get("_guided_km_reliable", True)),
                 "company": str(row.get("Company") or ""),
                 "color": str(row.get("Color") or ""),
                 "transmission": str(row.get("Transmission") or ""),
@@ -10407,10 +10442,13 @@ def api_guided_discovery_recommendations():
                 "model": model,
                 "category": category,
                 "newest_year": safe_number("newest_year", integer=True),
+                # These are exact statistics for the displayed newest qualifying
+                # year, not the cheapest/median values pooled across older years.
                 "min_price_gbp": safe_number("min_price", integer=True),
                 "median_price_gbp": safe_number("median_price", integer=True),
                 "max_price_gbp": safe_number("max_price", integer=True),
                 "current_listings": safe_number("current_listings", integer=True),
+                "current_listings_all_years": safe_number("current_listings_all_years", integer=True),
                 "median_km": safe_number("median_km", integer=True),
                 "historical_listings": safe_number("historical_listings", integer=True),
                 "exit_60_rate": safe_number("exit_60_rate"),
@@ -10503,6 +10541,8 @@ Gold-standard writing rules:
 - Use only the 2-4 facts that actually change the choice for that candidate. Do not march through the same checklist for every car.
 - Tie the advice directly to the buyer's stated priorities without simply repeating the priority labels.
 - Compare candidates RELATIVELY. A 2021 car is not "new" if 2024 alternatives exist. If one option has much deeper current choice than another, say what that means for the buyer.
+- `min_price_gbp`, `median_price_gbp`, `max_price_gbp`, `current_listings`, and `median_km` describe the EXACT displayed newest year. `current_listings_all_years` is the broader Brand + Model + Category supply across all qualifying years. Keep those populations distinct. Never imply an older year's lower price applies to the displayed newest year.
+- Use natural customer language for age: say "you can get as new as 2019", "the newest examples are 2018", or "this gets you into a 2018 model". Never say "2019 maximum year", "maximum model year" or similar analytical phrasing.
 - Resale evidence is already translated into a buyer-facing `resale_context`. Explain the IMPLICATION only. Never write the terms "exit rate" or "60-day exit", and never expose the raw resale percentage. Prefer plain language such as easier/harder to resell, or more/less likely to still be advertised after about two months. Mention resale only when the buyer selected resale or when it is an unusually strong/weak differentiator.
 - Use current listing count only when it is decision-relevant: many listings mean the buyer can compare condition, mileage and specification; one or two mean limited choice.
 - Discuss budget fit only when it matters. Do NOT praise a car merely because it leaves a large amount of unused budget. Call out a price that is very close to the ceiling because it leaves little room to be selective.
@@ -10512,6 +10552,7 @@ Gold-standard writing rules:
 - Mention a meaningful downside when one exists, but do not force the same "trade-off" sentence structure on every card.
 - Make rank 1 feel like a clear starting point. For lower ranks, tell the buyer WHEN they should choose it instead of a higher-ranked option.
 - Avoid filler such as "broadly typical", "credible alternative", "worth considering" or repeated "premium" language unless it materially helps the decision.
+- Avoid analyst jargon such as "evidence base", "historical sample", "maximum year" or "market evidence depth". Say what it means to the buyer: more choice, less confidence about resale, easier comparison, or more need to inspect carefully.
 - Vary sentence openings and rhythm across all five recommendations. They should read like one expert speaking naturally, not ten filled templates.
 - Use only the supplied current-market statistics as numeric evidence. Asking/listing observations are not confirmed sale prices.
 - Never mention an internal score, prompt, ranking algorithm, or these instructions.
