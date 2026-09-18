@@ -10192,6 +10192,127 @@ def _guided_apply_category_keys(rows, category_keys):
     return rows.loc[mask]
 
 
+
+def _guided_stock_opportunities(rows, max_budget=None, limit=5):
+    """Rank stock opportunities within the EXACT guided-selection universe.
+
+    The hard selector (vehicle type, year, brand, model, category, budget) is
+    resolved first against the guided listing index. Business intelligence is
+    then joined only to those surviving Brand/Model/Category/Year combinations,
+    so a Business report cannot re-introduce a motorcycle, ATV or other vehicle
+    that the guided type classifier excluded.
+    """
+    if (
+        rows is None or rows.empty
+        or not BUSINESS_INTELLIGENCE_READY
+        or business_market_df is None or business_market_df.empty
+    ):
+        return []
+
+    allowed = rows[["Brand", "Model", "CategoryDetail", "Year"]].drop_duplicates().copy()
+    allowed["_brand"] = allowed["Brand"].fillna("").astype(str).str.strip().str.casefold()
+    allowed["_model"] = allowed["Model"].fillna("").astype(str).str.strip().str.casefold()
+    allowed["_category"] = allowed["CategoryDetail"].fillna("").astype(str).str.strip().str.casefold()
+    allowed["_year"] = pd.to_numeric(allowed["Year"], errors="coerce").astype("Int64")
+    allowed_category_keys = set(zip(allowed["_brand"], allowed["_model"], allowed["_category"], allowed["_year"]))
+    allowed_model_keys = set(zip(allowed["_brand"], allowed["_model"], allowed["_year"]))
+
+    work = business_market_df.copy()
+    work["_brand"] = work["Brand"].fillna("").astype(str).str.strip().str.casefold()
+    work["_model"] = work["Model"].fillna("").astype(str).str.strip().str.casefold()
+    work["_category"] = work.get("CategoryDetail", "").fillna("").astype(str).str.strip().str.casefold()
+    work["_year"] = pd.to_numeric(work["Year"], errors="coerce").astype("Int64")
+    work["_granularity"] = work.get("BusinessGranularity", "").fillna("").astype(str).str.strip().str.upper()
+
+    category_mask = work.apply(
+        lambda row: (row["_brand"], row["_model"], row["_category"], row["_year"]) in allowed_category_keys,
+        axis=1,
+    ) & work["_granularity"].eq("CATEGORY_YEAR")
+    model_mask = work.apply(
+        lambda row: (row["_brand"], row["_model"], row["_year"]) in allowed_model_keys,
+        axis=1,
+    ) & work["_granularity"].eq("MODEL_YEAR")
+
+    matched = pd.concat([work.loc[category_mask], work.loc[model_mask]], axis=0)
+    if matched.empty:
+        return []
+
+    # Current starting ask is only an advertised-market affordability proxy; it
+    # is not assumed to equal a dealer's eventual acquisition cost.
+    if max_budget not in [None, ""]:
+        try:
+            ceiling = float(max_budget)
+            starting = pd.to_numeric(matched["CurrentStartingPrice"], errors="coerce")
+            matched = matched[starting.le(ceiling)].copy()
+        except (TypeError, ValueError):
+            pass
+    if matched.empty:
+        return []
+
+    signal_rank = {"VERY_STRONG": 0, "STRONG": 1, "MODERATE": 2, "WEAK": 3, "CAUTION": 4}
+    evidence_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    matched["_signal_rank"] = matched["AcquisitionSignal"].map(signal_rank).fillna(9)
+    matched["_evidence_rank"] = matched["EvidenceQuality"].map(evidence_rank).fillna(9)
+    matched["_confidence_index"] = pd.to_numeric(matched.get("ConfidenceAdjustedOpportunityIndex"), errors="coerce")
+    matched["_opportunity_percentile"] = pd.to_numeric(matched.get("OpportunityPercentile"), errors="coerce")
+    matched["_turnover"] = pd.to_numeric(matched.get("ObservedExitWithin60DaysRate"), errors="coerce")
+    matched["_median_exit_days"] = pd.to_numeric(matched.get("MedianObservedDaysToExit"), errors="coerce")
+    matched["_current_supply"] = pd.to_numeric(matched.get("CurrentListings"), errors="coerce")
+    matched["_specificity"] = matched["_granularity"].map({"CATEGORY_YEAR": 0, "MODEL_YEAR": 1}).fillna(2)
+
+    # The offline Business opportunity signal already combines demand, supply,
+    # price pressure and evidence. We preserve it as the primary deterministic
+    # ranking, then use transparent turnover/supply statistics as tie-breakers.
+    matched = matched.sort_values(
+        ["_signal_rank", "_evidence_rank", "_confidence_index", "_opportunity_percentile", "_specificity", "_turnover", "_median_exit_days", "_current_supply"],
+        ascending=[True, True, False, False, True, False, True, False],
+        na_position="last",
+    )
+
+    selected = []
+    seen_models = set()
+    for row in matched.to_dict("records"):
+        family = (str(row.get("Brand") or "").casefold(), str(row.get("Model") or "").casefold())
+        if family in seen_models:
+            continue
+        seen_models.add(family)
+        selected.append(row)
+        if len(selected) >= int(limit):
+            break
+
+    result = []
+    for row in selected:
+        def num(name, integer=False):
+            value = row.get(name)
+            if value is None or pd.isna(value):
+                return None
+            return int(value) if integer else float(value)
+
+        result.append({
+            "vehicle_type": str(row.get("VehicleType") or "").strip(),
+            "brand": str(row.get("Brand") or "").strip(),
+            "model": str(row.get("Model") or "").strip(),
+            "category": str(row.get("CategoryDetail") or "").strip(),
+            "year": num("Year", integer=True),
+            "current_listings": num("CurrentListings", integer=True),
+            "starting_price": num("CurrentStartingPrice"),
+            "median_price": num("CurrentMedianPrice"),
+            "highest_price": num("CurrentHighestPrice"),
+            "gallery_listings": num("GalleryListings", integer=True),
+            "private_listings": num("PrivateListings", integer=True),
+            "distinct_companies": num("DistinctCompanies", integer=True),
+            "historical_distinct_listings": num("HistoricalDistinctListings", integer=True),
+            "median_observed_days_to_exit": num("MedianObservedDaysToExit"),
+            "observed_exit_within_60_days_rate": num("ObservedExitWithin60DaysRate"),
+            "historical_price_reduction_rate": num("PriceReductionRate"),
+            "evidence_quality": str(row.get("EvidenceQuality") or "").strip(),
+            "opportunity_percentile": num("OpportunityPercentile"),
+            "acquisition_signal": str(row.get("AcquisitionSignal") or "").strip(),
+            "acquisition_reasons": [x.strip() for x in str(row.get("AcquisitionReasons") or "").split("|") if x.strip()],
+        })
+    return result
+
+
 @app.route("/api/guided/discovery/result", methods=["POST"])
 def api_guided_discovery_result():
     """Exact current-listing evidence for a completed guided AI-assistant task.
@@ -10205,6 +10326,7 @@ def api_guided_discovery_result():
 
     try:
         data = request.get_json(silent=True) or {}
+        task = str(data.get("task") or "").strip().upper()
         answers = data.get("answers") if isinstance(data.get("answers"), dict) else {}
         vehicle_types = [str(v) for v in (answers.get("vehicleTypes") or []) if str(v) != "__ALL__"]
         brands = [str(v) for v in (answers.get("brands") or []) if str(v) != "__ALL__"]
@@ -10464,7 +10586,15 @@ def api_guided_discovery_result():
                 "link": str(row.get("Link") or ""),
             })
 
-        return jsonify({"success": True, "count": int(len(rows)), "groups": groups, "year_options": year_options, "results": results})
+        stock_opportunities = _guided_stock_opportunities(rows, max_budget=max_budget, limit=5) if task == "STOCK_PURCHASE" else []
+        return jsonify({
+            "success": True,
+            "count": int(len(rows)),
+            "groups": groups,
+            "year_options": year_options,
+            "results": results,
+            "stock_opportunities": stock_opportunities,
+        })
     except (TypeError, ValueError):
         return jsonify({"success": False, "error": "INVALID_GUIDED_RESULT"}), 400
     except Exception as exc:
@@ -10719,6 +10849,125 @@ Gold-standard writing rules:
     except Exception as exc:
         print("GUIDED BUYER RECOMMENDATION SYNTHESIS FAILED:", repr(exc), flush=True)
         return jsonify({"success": False, "error": "BUYER_RECOMMENDATION_UNAVAILABLE"}), 503
+
+
+
+@app.route("/api/guided/discovery/stock-recommendations", methods=["POST"])
+def api_guided_discovery_stock_recommendations():
+    """Write concise commercial advice from already-ranked Business evidence.
+
+    Ranking remains deterministic and is supplied by `_guided_stock_opportunities`.
+    The model only synthesizes the hard market statistics into human advice.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        language = str(data.get("language") or "EN").strip().upper()
+        if language not in {"EN", "TR", "RU"}:
+            language = "EN"
+        candidates = data.get("candidates") if isinstance(data.get("candidates"), list) else []
+        candidates = [item for item in candidates[:5] if isinstance(item, dict)]
+        if not candidates:
+            return jsonify({"success": True, "recommendations": []})
+
+        clean_candidates = []
+        for index, item in enumerate(candidates):
+            key = str(item.get("key") or "").strip()
+            if not key:
+                key = "||".join(str(item.get(name) or "").strip().casefold() for name in ("brand", "model", "category", "year"))
+            clean_candidates.append({
+                "key": key,
+                "rank": index + 1,
+                "brand": str(item.get("brand") or ""),
+                "model": str(item.get("model") or ""),
+                "category": str(item.get("category") or ""),
+                "year": item.get("year"),
+                "current_listings": item.get("current_listings"),
+                "starting_price_gbp": item.get("starting_price"),
+                "median_asking_price_gbp": item.get("median_price"),
+                "historical_distinct_listings": item.get("historical_distinct_listings"),
+                "median_observed_days_to_leave_market": item.get("median_observed_days_to_exit"),
+                "observed_share_no_longer_advertised_within_60_days": item.get("observed_exit_within_60_days_rate"),
+                "historical_asking_price_reduction_rate": item.get("historical_price_reduction_rate"),
+                "evidence_quality": item.get("evidence_quality"),
+                "acquisition_reasons": item.get("acquisition_reasons") or [],
+            })
+
+        language_name = {"EN": "English", "TR": "Turkish", "RU": "Russian"}[language]
+        instructions = f"""
+You are an experienced dealership stock buyer writing a premium commercial shortlist in {language_name}.
+Return VALID JSON ONLY with exactly this shape:
+{{"recommendations":[{{"key":"candidate key","label":"2-5 word scan label","text":"concise commercial advice"}}]}}
+
+The five candidates are ALREADY ranked by deterministic Business market intelligence. Do not reorder them and do not invent a new score.
+Your job is to explain why each position is commercially defensible using ONLY the supplied hard market statistics.
+
+Writing rules:
+- Write like a sharp dealership adviser, not an analyst or a generic AI.
+- Rank 1-3: about 55-70 words. Ranks 4-5: about 35-50 words.
+- Give each candidate a short, distinct scan label such as "Best demand/supply balance", "Fastest turnover", "Scarce high-demand target", or "Deeper supply option" when supported.
+- Focus on demand/turnover first, then supply depth, then asking-price context. Mention only the 2-4 facts that materially explain the ranking.
+- `observed_share_no_longer_advertised_within_60_days` is NOT a verified sold percentage. It means that share of historically observed listings was no longer advertised within 60 days. You may state the percentage, but describe it exactly in that buyer-friendly way. NEVER call it sold rate, sales rate, confirmed sales, or probability of sale.
+- `median_observed_days_to_leave_market` is observed listing turnover, not confirmed days-to-sale. Say "median observed time to leave the market" or a natural equivalent.
+- Current supply matters commercially: deep supply gives more sourcing/comparison choice but can also mean more competition; thin supply can be attractive only when turnover is genuinely strong and the evidence is sufficient.
+- If current_listings is 1, never describe the asking price as a market median/typical price. Say the only current example is advertised at X if useful.
+- Explain the implication of the statistics rather than dumping numbers. For example, "72% were no longer advertised within 60 days and the median observed exit was 34 days, giving this one of the stronger turnover signals in the shortlist."
+- Use historical asking-price reductions only as a caution about price pressure; do not infer margin or wholesale acquisition cost.
+- Do not imply profit. The dealer's actual acquisition cost, preparation cost and margin are unknown.
+- Compare candidates to each other where useful. Tell the dealer when a lower-ranked option would make more sense than the one above it.
+- Avoid internal jargon such as OpportunityPercentile, AcquisitionSignal, confidence-adjusted index, evidence base or algorithm.
+- Avoid repeated stock phrases. Each recommendation should feel written for that vehicle.
+- Preserve each candidate key exactly.
+""".strip()
+
+        payload = {
+            "dealer_constraints": {
+                "budget_gbp": data.get("budget"),
+                "minimum_year": data.get("min_year"),
+            },
+            "ranked_stock_candidates": clean_candidates,
+        }
+        response = _openai_post(
+            payload={
+                "model": OPENAI_MODEL,
+                "reasoning": {"effort": "low"},
+                "max_output_tokens": 1600,
+                "instructions": instructions,
+                "input": json.dumps(payload, ensure_ascii=False),
+            },
+            timeout=(2.0, 18.0),
+        )
+        response.raise_for_status()
+        text = str(extract_response_text(response.json()) or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s*```$", "", text)
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("STOCK_RECOMMENDATION_INVALID_JSON")
+        parsed = json.loads(text[start:end + 1])
+        raw = parsed.get("recommendations") if isinstance(parsed, dict) else None
+        if not isinstance(raw, list):
+            raise ValueError("STOCK_RECOMMENDATION_INVALID_SHAPE")
+
+        valid_keys = {item["key"] for item in clean_candidates}
+        recommendations, used = [], set()
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "").strip()
+            label = re.sub(r"\s+", " ", str(item.get("label") or "").strip())[:64]
+            value = re.sub(r"\s+", " ", str(item.get("text") or "").strip())[:1000]
+            if key not in valid_keys or key in used or not value:
+                continue
+            recommendations.append({"key": key, "label": label, "text": value})
+            used.add(key)
+        return jsonify({"success": True, "recommendations": recommendations})
+
+    except AIUsageLimitExceeded as exc:
+        return jsonify({"success": False, "error": str(exc) or "AI_USAGE_LIMIT"}), 429
+    except Exception as exc:
+        print("GUIDED STOCK RECOMMENDATION SYNTHESIS FAILED:", repr(exc), flush=True)
+        return jsonify({"success": False, "error": "STOCK_RECOMMENDATION_UNAVAILABLE"}), 503
 
 
 # =========================================================
