@@ -9478,6 +9478,29 @@ def _request_access_context(data=None):
     )
 
 
+@app.route("/api/business/galleries", methods=["GET"])
+def api_business_gallery_options():
+    """Return gallery names that have Business intelligence coverage.
+
+    This is used only to bind the Business UI to a real gallery dataset so
+    inventory-specific reports cannot accidentally run without company context.
+    It does not modify or expose the standalone valuation engine.
+    """
+    try:
+        names = set()
+        for frame in (business_company_df, business_stock_df):
+            if frame is None or frame.empty or "Company" not in frame.columns:
+                continue
+            for value in frame["Company"].dropna().astype(str):
+                name = value.strip()
+                if name:
+                    names.add(name)
+        return jsonify({"success": True, "galleries": sorted(names, key=lambda value: value.casefold())})
+    except Exception as exc:
+        print("BUSINESS GALLERY OPTIONS FAILED:", repr(exc), flush=True)
+        return jsonify({"success": False, "galleries": [], "error": "BUSINESS_GALLERIES_UNAVAILABLE"}), 503
+
+
 @app.route("/api/access/status", methods=["GET"])
 def api_access_status():
     """Safe account/entitlement snapshot for the frontend.
