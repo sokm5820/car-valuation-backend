@@ -10268,7 +10268,38 @@ def api_guided_discovery_result():
             )
             .reset_index()
         )
-        grouped = grouped.sort_values(["listing_count", "median_price"], ascending=[False, True]).head(20)
+        grouped = grouped.sort_values(["listing_count", "median_price"], ascending=[False, True])
+
+        # Preserve explicit model selections before applying the compact 20-group
+        # report cap. Otherwise one selected model with many high-volume variants
+        # can crowd a second explicitly selected model out of the recommendation
+        # evidence on the first request.
+        if model_keys and not grouped.empty:
+            grouped = grouped.copy()
+            grouped["_guided_group_model_key"] = (
+                grouped["Brand"].fillna("").astype(str).str.strip()
+                + "||"
+                + grouped["Model"].fillna("").astype(str).str.strip()
+            ).str.casefold()
+            wanted_model_keys = []
+            seen_model_keys = set()
+            for value in model_keys:
+                key = str(value or "").strip().casefold()
+                if key and key not in seen_model_keys:
+                    wanted_model_keys.append(key)
+                    seen_model_keys.add(key)
+
+            coverage_indices = []
+            for key in wanted_model_keys:
+                matches = grouped.index[grouped["_guided_group_model_key"].eq(key)].tolist()
+                if matches:
+                    coverage_indices.append(matches[0])
+
+            coverage = grouped.loc[coverage_indices] if coverage_indices else grouped.iloc[0:0]
+            remainder = grouped.loc[~grouped.index.isin(coverage_indices)]
+            grouped = pd.concat([coverage, remainder], axis=0).head(20).drop(columns=["_guided_group_model_key"], errors="ignore")
+        else:
+            grouped = grouped.head(20)
         groups = []
         for row in grouped.to_dict("records"):
             groups.append({
@@ -10386,9 +10417,33 @@ def api_guided_discovery_result():
         ordered_posted = posted_rows.sort_values(["Year", "Price"], ascending=[False, True])
         identity_cols = [c for c in ("Brand", "Model", "CategoryDetail") if c in ordered_posted.columns]
         if identity_cols:
+            # First reserve one live listing for each explicitly selected model,
+            # then one for every Brand + Model + Category group, then fill the pool.
+            # This keeps all user-selected models visible in downstream Top Matches
+            # whenever a live linked listing exists for them.
+            selected_model_indices = []
+            if model_keys and {"Brand", "Model"}.issubset(ordered_posted.columns):
+                model_series = (
+                    ordered_posted["Brand"].fillna("").astype(str).str.strip()
+                    + "||"
+                    + ordered_posted["Model"].fillna("").astype(str).str.strip()
+                ).str.casefold()
+                seen = set()
+                for value in model_keys:
+                    key = str(value or "").strip().casefold()
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    matches = ordered_posted.index[model_series.eq(key)].tolist()
+                    if matches:
+                        selected_model_indices.append(matches[0])
+
+            selected_model_rows = ordered_posted.loc[selected_model_indices] if selected_model_indices else ordered_posted.iloc[0:0]
             diverse = ordered_posted.drop_duplicates(subset=identity_cols, keep="first")
-            remainder = ordered_posted.loc[~ordered_posted.index.isin(diverse.index)]
-            result_rows = pd.concat([diverse, remainder], axis=0)[result_cols].head(80)
+            combined_indices = list(dict.fromkeys(list(selected_model_rows.index) + list(diverse.index)))
+            covered = ordered_posted.loc[combined_indices] if combined_indices else ordered_posted.iloc[0:0]
+            remainder = ordered_posted.loc[~ordered_posted.index.isin(combined_indices)]
+            result_rows = pd.concat([covered, remainder], axis=0)[result_cols].head(80)
         else:
             result_rows = ordered_posted[result_cols].head(80)
         results = []
@@ -10591,6 +10646,7 @@ Gold-standard writing rules:
 - Use current listing count only when it is decision-relevant: many listings mean the buyer can compare condition, mileage and specification; one or two mean limited choice.
 - Discuss budget fit only when it matters. Do NOT praise a car merely because it leaves a large amount of unused budget. Call out a price that is very close to the ceiling because it leaves little room to be selective.
 - Use mileage only when it meaningfully separates the option from the rest. Ignore missing or implausible values rather than explaining them away.
+- `median_km` is supplied only when the exact displayed year has at least two current listings. If `current_listings` is 1 and `single_listing_km` is present, NEVER call that value a median, typical mileage, average, or market norm. Say "the only current listing is advertised at around X km" (or the natural equivalent in the output language).
 - Use general, widely established positioning (for example premium vs mainstream) cautiously. Do not invent precise MPG, maintenance costs, reliability claims, engine displacement or mechanical facts not present in the candidate facts.
 - Petrol/diesel alone is not proof of low running cost. Diesel may suit regular longer-distance use; do not automatically rank it as cheaper for urban driving.
 - Mention a meaningful downside when one exists, but do not force the same "trade-off" sentence structure on every card.
