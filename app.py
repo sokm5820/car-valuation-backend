@@ -10624,7 +10624,7 @@ def _business_activity_period_summary(company, period="30D", custom_from=None, c
         start = max(start, available_start)
         end = min(end, available_end)
     else:
-        days = {"7D": 7, "30D": 30, "90D": 90}.get(period_key, 30)
+        days = {"7D": 7, "30D": 30, "60D": 60, "90D": 90}.get(period_key, 30)
         end = available_end
         start = max(available_start, end - pd.Timedelta(days=days - 1))
 
