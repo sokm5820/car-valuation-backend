@@ -101,6 +101,7 @@ class AccessContext:
     org_role: str = "member"
     seat_limit: int = 0
     source: str = "anonymous"
+    gallery_verified: bool = False
 
     @property
     def business_entitled(self) -> bool:
@@ -115,6 +116,7 @@ class AccessContext:
             "authenticated": bool(self.authenticated),
             "tier": self.tier,
             "business_entitled": bool(self.business_entitled),
+            "gallery_verified": bool(self.business_entitled and self.gallery_verified),
             "business_company": self.org_name if self.business_entitled else None,
             "organisation_id": self.org_id if self.business_entitled else None,
             "organisation_role": self.org_role if self.business_entitled else None,
@@ -354,6 +356,7 @@ class CommercialAccessManager:
         )
         self.personal_plus_users = set(_env_csv("OTODEGER_PERSONAL_PLUS_USERS"))
         self.business_orgs = self._load_business_orgs(_env_json_object("OTODEGER_BUSINESS_ORGS_JSON"))
+        self.stripe_enforce_entitlements = str(os.getenv("STRIPE_ENFORCE_ENTITLEMENTS", "false")).strip().lower() in {"1", "true", "yes"}
 
         # Legacy signed sessions are retained only for local regression/migration.
         self.session_secret = str(os.getenv("OTODEGER_SESSION_SECRET") or "").strip()
@@ -542,6 +545,19 @@ class CommercialAccessManager:
         clerk_org_id = _safe_identifier(claims.get("org_id"))
         role = str(claims.get("org_role") or "member").strip().lower()[:40]
         business = self.business_orgs.get(clerk_org_id) if clerk_org_id else None
+        paid = None
+        if self.stripe_enforce_entitlements and self.enforcement_enabled:
+            # Stripe is the paid-access source; Clerk proves who the user is.
+            # Fail closed if the shared entitlement store becomes unavailable.
+            if not self.has_shared_backend:
+                raise SecurityConfigurationError("Shared Stripe entitlement store is required")
+            from otodeger_stripe_billing import read_paid_access
+            try:
+                paid = read_paid_access(self.backend.redis, user_id, clerk_org_id)
+            except Exception as exc:
+                raise SecurityConfigurationError("Stripe entitlement status unavailable") from exc
+            if business and paid["business_scope"] != "org":
+                business = None
 
         if business:
             return AccessContext(
@@ -554,9 +570,21 @@ class CommercialAccessManager:
                 org_role=role,
                 seat_limit=int(business["seat_limit"]),
                 source="clerk_session",
+                gallery_verified=True,
             )
 
-        tier = "PERSONAL_PLUS" if user_id in self.personal_plus_users else "PERSONAL"
+        if paid and paid["business_until"] and paid["business_scope"] == "user":
+            # Independent Business access has *no* right to select a gallery's
+            # private company-specific dataset. Gallery data requires a mapped,
+            # verified Clerk organisation above.
+            return AccessContext(
+                authenticated=True, user_id=user_id, tier="BUSINESS", device_id=device_id,
+                org_id=f"independent:{user_id}", org_name="Independent Business",
+                org_role="owner", seat_limit=1, source="stripe_subscription",
+                gallery_verified=False,
+            )
+
+        tier = "PERSONAL_PLUS" if user_id in self.personal_plus_users or (paid and paid["personal_plus_until"]) else "PERSONAL"
         return AccessContext(
             authenticated=True,
             user_id=user_id,
@@ -583,7 +611,7 @@ class CommercialAccessManager:
 
         # Controlled migration path: accept an OtoDeğer-signed token if present.
         # This is not the paid-launch browser auth path; Clerk is.
-        claims = self._decode_session_token(token)
+        claims = None if (self.enforcement_enabled and self.stripe_enforce_entitlements) else self._decode_session_token(token)
         if claims:
             tier = _normalise_tier(claims.get("tier"))
             user_id = _safe_identifier(claims.get("sub"))
@@ -779,7 +807,17 @@ class CommercialAccessManager:
             "security_mode": self.mode,
             "business_access": bool(context.business_entitled) if self.enforcement_enabled else True,
             "device_seat_enforced": bool(self.enforcement_enabled),
+            "stripe_payment_enforced": bool(self.enforcement_enabled and self.stripe_enforce_entitlements),
         })
+        if self.enforcement_enabled and self.stripe_enforce_entitlements and context.authenticated:
+            from otodeger_stripe_billing import read_paid_access
+            paid = read_paid_access(self.backend.redis, context.user_id,
+                                    context.org_id if context.gallery_verified else "")
+            payload["personal_paid_until"] = paid["personal_until"]
+            payload["personal_plus_paid_until"] = paid["personal_plus_until"]
+            payload["business_paid_until"] = paid["business_until"]
+            payload["business_subscription_active"] = bool(paid["business_until"])
+            payload["business_subscription_id"] = paid["business_subscription_id"]
         if context.business_entitled:
             devices = set(self.backend.smembers(self._org_devices_key(context.org_id)))
             payload["seats_used"] = len(devices)

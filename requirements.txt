@@ -7,3 +7,4 @@ google-auth>=2.29,<3
 gunicorn>=21.2,<24
 redis>=5.0,<7
 clerk-backend-api>=6.0.1,<7
+stripe>=12.0,<15

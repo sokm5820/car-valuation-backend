@@ -28,6 +28,7 @@ from otodeger_access_control import (
     get_access_manager,
 )
 from otodeger_fx import FXUnavailable, normalize_message_currency, conversion_note
+from otodeger_stripe_billing import billing as stripe_billing_blueprint
 
 # AI interpreter configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -38,6 +39,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
+app.register_blueprint(stripe_billing_blueprint)
 
 # Restrict browser origins and explicitly allow credentials/device identity.
 # CORS is not an authentication boundary, but a wildcard origin is unnecessary
@@ -11093,7 +11095,7 @@ def api_guided_business_activity_summary():
         requested_business = _normalize_access_tier(data.get("access_tier") or data.get("tier")) == "BUSINESS"
 
         if manager.enforcement_enabled:
-            if not requested_business or not context.business_entitled:
+            if not requested_business or not context.business_entitled or not context.gallery_verified:
                 raise BusinessAccessRequired("An authorised Business account is required")
             manager.activate_business_device(context)
             company = str(context.org_name or "").strip()
@@ -11146,7 +11148,7 @@ def api_guided_business_inventory_pricing():
         requested_business = _normalize_access_tier(data.get("access_tier") or data.get("tier")) == "BUSINESS"
 
         if manager.enforcement_enabled:
-            if not requested_business or not context.business_entitled:
+            if not requested_business or not context.business_entitled or not context.gallery_verified:
                 raise BusinessAccessRequired("An authorised Business account is required")
             manager.activate_business_device(context)
             company = str(context.org_name or "").strip()
@@ -11204,7 +11206,7 @@ def api_guided_business_ad_recommendations():
         requested_business = _normalize_access_tier(data.get("access_tier") or data.get("tier")) == "BUSINESS"
 
         if manager.enforcement_enabled:
-            if not requested_business or not context.business_entitled:
+            if not requested_business or not context.business_entitled or not context.gallery_verified:
                 raise BusinessAccessRequired("An authorised Business account is required")
             manager.activate_business_device(context)
             company = str(context.org_name or "").strip()
@@ -11250,7 +11252,7 @@ def api_guided_business_ad_commentary():
         g.otodeger_access_context = context
         business_mode = _normalize_access_tier(data.get("access_tier") or data.get("tier")) == "BUSINESS"
         if manager.enforcement_enabled:
-            if not business_mode or not context.business_entitled:
+            if not business_mode or not context.business_entitled or not context.gallery_verified:
                 raise BusinessAccessRequired("An authorised Business account is required")
             manager.activate_business_device(context)
             company = str(context.org_name or "").strip()
