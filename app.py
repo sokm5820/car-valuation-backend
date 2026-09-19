@@ -11312,17 +11312,56 @@ def api_guided_business_ad_commentary():
 
         lang_name = {"EN": "English", "TR": "Turkish", "RU": "Russian"}[language]
         instructions = f"""
-You advise a vehicle dealership on WHERE TO SPEND ITS NEXT ADVERTISING BUDGET.
-Write a concise, differentiated commercial interpretation of the ranked shortlist in {lang_name}.
-Return ONLY valid JSON: {{"recommendations":[{{"key":"ad-1","label":"2-5 word distinction","text":"2-3 concise sentences"}}]}}.
-Return one entry for EACH supplied candidate in existing rank order. Preserve every key. Do not rerank or invent a new score or advertising performance data.
+You help a car dealership decide where to spend its next advertising budget. Write in {lang_name}.
+Sound like a helpful, experienced colleague explaining the decision to a busy dealership owner:
+CLEAR, FRIENDLY, SPECIFIC, AND EASY TO READ. Use everyday language, not analyst or marketing jargon.
 
-IMPORTANT: The five evidence tiles underneath EACH paragraph already show asking price, listing age, asking-vs-market-median percentage, historical 60-day market-exit share and count of current comparables. Do not paraphrase these tiles one by one, recite all the figures, or use the same explanation for each car with changed numbers. Your task is INTERPRETATION and COMPARISON, not restatement.
-For each option, explain its SPECIFIC, distinctive case for promotion or for holding off. Compare it with at least one named SHORTLIST alternative when reliable data make a meaningful distinction. Translate each standout into an actionable advertising choice: promote a persuasive value proposition, test visibility on ageing but fairly priced stock, allow newer stock organic exposure first, target a niche audience when data are thin, or review a markedly high asking price before spending. A top rank does NOT mean that paid advertising necessarily helps; critically discuss if price, thin evidence or normal listing age makes a promotional campaign premature.
-When several vehicles share the SAME dominant signal (for example, all have been listed about three times their own historical market-exit window), do NOT repeat a near-identical ageing-stock paragraph. Deliberately inspect other useful differences: whether the car is in a higher or lower advertised-price tier, whether its observed ageing pressure is materially higher relative to its OWN history, whether its pricing benchmark is thin, or whether its historical exit share differs materially. Explain how those differences would affect campaign framing, audience choice or whether a paid test is warranted. If their evidence is genuinely similar, say that it does not justify allocating different budgets and suggest a concrete vehicle-specific creative test; do not invent differences, ad ROI, condition, margin or buyer demographics.
-Selectively cite one or two figures ONLY when they make a genuinely meaningful contrast (e.g. a 60-day exit share exceeds the next candidate by 12 percentage points, or stock age is 1.7 times the vehicle's own historical median). Make the actual comparison explicit. Do not exaggerate trivial differences or compare non-comparable measures; say nothing about a lead if the supporting figures are missing or thin. Historical market-exit metrics are NOT confirmed sales and do NOT measure ad performance, demand caused by promotion, or the probability of sale. Avoid sales promises, invented conversion/return-on-ad-spend predictions, and unsupported assumptions about vehicle condition or margins.
-`observed_listing_age_days` may be a lower bound: do not claim the true initial listing date. A small `current_comparable_listings` count means the pricing benchmark is thin, not necessarily scarce demand. For a vehicle priced materially ABOVE current comparables, consider whether price review should precede paid traffic. A vehicle BELOW the median may have an advertising-friendly price story, conditional on true comparability, but a low price alone does not establish a good purchase or sale. Do NOT assert advertising is better than repricing for every option.
-Write naturally like a perceptive dealership media adviser rather than a generic bot. Vary structure across five cards. Labels should describe each vehicle's REAL rationale (e.g. "Price story to promote", "Ageing stock: test reach", "Revisit price first", "Allow organic discovery", "Niche audience test") and not repeat "High priority" five times. Aim 35-65 words per paragraph. Use only the supplied evidence; no invented figures or other listings.
+Return ONLY valid JSON: {{"recommendations":[{{"key":"ad-1","label":"2-5 simple words","text":"2-3 short sentences"}}]}}.
+Return one entry for EACH candidate, in the same order and with the exact supplied keys.
+Do not change the ranking, invent information, or claim that an advertisement will produce a sale.
+
+Each card already shows the asking price, days advertised, price versus similar current listings,
+percentage of past listings that stopped being advertised within 60 days, and number of comparable listings.
+DO NOT read the five figures aloud again. Instead answer three practical questions naturally:
+(1) What is this PARTICULAR vehicle's main reason to advertise now—or to wait?
+(2) What genuinely sets it apart from the other vehicles on THIS shortlist, if anything?
+(3) What is a sensible next step for this vehicle's ad, price, or presentation?
+
+Mention a number only when it makes the explanation noticeably clearer. Give its meaning at the
+same time: e.g. 'It has been advertised for 83 days, whereas similar past listings typically
+stopped appearing after about 27 days. Its price is close to similar cars advertised now, so
+try a small ad showing its key features and see whether enquiries improve.' This is an example
+of PLAIN WORDING, not a fact about every candidate and not a template to copy across cards.
+If a vehicle's 60-day figure is meaningfully stronger than other shortlisted vehicles, you may
+say so and explain why that makes a small advertising test worth considering. If that figure
+is ordinary for this shortlist, leave it to the tiles. Compare to a named other vehicle ONLY
+when the difference matters to what the dealership should actually DO; don't force comparisons.
+When several vehicles are similarly slow to move, DO NOT give them all the same 'try a small ad'
+paragraph. Look for other meaningful differences in asking price, price relative to similar
+current ads, duration relative to each vehicle's own past listings, or the strength of the
+data. If there isn't a useful difference, say that simply rather than make one up.
+
+IMPORTANT: This must read naturally to someone who runs a dealership, not a data scientist.
+Avoid phrases such as 'historical median', 'liquidity confidence', 'exit share', 'turnover signal',
+'pricing benchmark', 'retail proposition', 'price premium', 'organic discovery', 'paid visibility',
+'campaign framing', 'creative test', 'hypothesis', 'defensible', 'stock-age pressure',
+'higher-value, thinner-evidence test', 'reach' as a noun, and 'the ask'.
+Say 'typical time similar listings stayed online' instead of 'historical median market exit';
+'similar cars currently advertised' instead of 'comparables' when that is clearer;
+'without an ad' instead of 'organically'; 'price' instead of 'the ask';
+'a short ad' or 'a small ad test' instead of 'visibility testing'.
+Use natural equivalents in Turkish or Russian, not literal translations of English jargon.
+Make labels plain and helpful, such as 'Try a small ad', 'Check the price first',
+'Give it more time', 'Focus on its price', or 'Show what makes it different'.
+
+Stick to 2-3 SHORT sentences per vehicle, ideally 35-55 words, with a straightforward
+recommendation rather than heavy qualifications or a stack of numbers. Vary the actual advice
+based on the evidence. Do not invent the vehicle's condition, equipment, audience, margin,
+interest from buyers, ad results, or future sales. A listing disappearing from the dataset
+is NOT proof it sold; past listing behaviour does NOT prove an advertisement will work.
+Where evidence is thin, say simply 'There aren't many similar listings to compare with'
+when relevant, rather than announcing a 'low-confidence liquidity signal'.
+Observed listing age may be a minimum, not a verified original listing date.
 """.strip()
         response = _openai_post(payload={
             "model": OPENAI_MODEL,
