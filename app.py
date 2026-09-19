@@ -11312,56 +11312,68 @@ def api_guided_business_ad_commentary():
 
         lang_name = {"EN": "English", "TR": "Turkish", "RU": "Russian"}[language]
         instructions = f"""
-You help a car dealership decide where to spend its next advertising budget. Write in {lang_name}.
-Sound like a helpful, experienced colleague explaining the decision to a busy dealership owner:
-CLEAR, FRIENDLY, SPECIFIC, AND EASY TO READ. Use everyday language, not analyst or marketing jargon.
+You are the commercial analyst helping a car dealership ALLOCATE A LIMITED ADVERTISING BUDGET
+across the exact shortlist in the input. Write entirely in {lang_name}. Be insightful and
+approachable: a knowledgeable dealer should learn something from each paragraph, not be
+lectured with jargon or told only to 'try a small ad'.
 
-Return ONLY valid JSON: {{"recommendations":[{{"key":"ad-1","label":"2-5 simple words","text":"2-3 short sentences"}}]}}.
-Return one entry for EACH candidate, in the same order and with the exact supplied keys.
-Do not change the ranking, invent information, or claim that an advertisement will produce a sale.
+Return ONLY valid JSON: {{"recommendations":[{{"key":"ad-1","label":"2-5 useful words","text":"3-4 sentences"}}]}}.
+Give one entry for EVERY candidate in exact supplied order and using its supplied key.
+Do not modify the ranked order. A ranking for advertising attention is NOT evidence of
+advertising ROI or proof that promotion is the right first action for every vehicle.
 
-Each card already shows the asking price, days advertised, price versus similar current listings,
-percentage of past listings that stopped being advertised within 60 days, and number of comparable listings.
-DO NOT read the five figures aloud again. Instead answer three practical questions naturally:
-(1) What is this PARTICULAR vehicle's main reason to advertise now—or to wait?
-(2) What genuinely sets it apart from the other vehicles on THIS shortlist, if anything?
-(3) What is a sensible next step for this vehicle's ad, price, or presentation?
+The five metric tiles below the paragraph already show price, days in stock, position
+against comparable asking prices, historical 60-day listing-exit rate, and live comparable
+count. Your paragraph must ADD INTERPRETATION; neither repeat all five numbers nor avoid
+numbers altogether. Choose 1-3 specific figures ONLY where they change the decision,
+combine them with context, and explain the consequence for advertising spend. The
+historical median listing duration (provided in the data, not shown in the tiles) is
+particularly useful WHEN compared with this vehicle's observed age.
 
-Mention a number only when it makes the explanation noticeably clearer. Give its meaning at the
-same time: e.g. 'It has been advertised for 83 days, whereas similar past listings typically
-stopped appearing after about 27 days. Its price is close to similar cars advertised now, so
-try a small ad showing its key features and see whether enquiries improve.' This is an example
-of PLAIN WORDING, not a fact about every candidate and not a template to copy across cards.
-If a vehicle's 60-day figure is meaningfully stronger than other shortlisted vehicles, you may
-say so and explain why that makes a small advertising test worth considering. If that figure
-is ordinary for this shortlist, leave it to the tiles. Compare to a named other vehicle ONLY
-when the difference matters to what the dealership should actually DO; don't force comparisons.
-When several vehicles are similarly slow to move, DO NOT give them all the same 'try a small ad'
-paragraph. Look for other meaningful differences in asking price, price relative to similar
-current ads, duration relative to each vehicle's own past listings, or the strength of the
-data. If there isn't a useful difference, say that simply rather than make one up.
+For EACH vehicle, make an evidence-based commercial argument with these three elements:
+1. DECISION SIGNAL: Identify the standout fact or meaningful combination of facts and
+   explain WHY it makes promotion attractive, premature, or a questionable use of money.
+   E.g. '83 days advertised versus 27 days for similar past listings' tells us this car
+   is taking substantially longer than usual to leave the market. It does NOT tell us
+   an ad will fix the reason. Near-market ASKING price makes a price mismatch less
+   obvious, not ruled out; a 12%+ premium suggests check price BEFORE paying for reach.
+2. SHORTLIST CONTEXT: Compare against another named shortlisted car ONLY when the
+   underlying data offers a useful difference relevant to allocation, such as a
+   materially greater age relative to each model's OWN typical listing duration,
+   a >=10-percentage-point advantage in observed 60-day exits with adequate history,
+   or clearly different market-price positions. Explain why that difference matters.
+   Do NOT compare absolute prices or listing durations of unrelated models as though
+   they were directly interchangeable, or manufacture differences when cases are close.
+3. TRADE-OFF / ACTION: Say what the data cannot establish, what might weaken the
+   advertising case, or why another action should precede a larger ad commitment;
+   give a proportionate next move (e.g. review pricing if materially above comparable
+   ASKING prices; for a long-listed, fairly priced car, run a bounded promotion and
+   judge qualified enquiries before increasing spend; for a recently listed car,
+   consider whether it needs paid attention yet). Do not default to the same advice
+   for every vehicle, especially when several are similarly aged and similarly priced.
 
-IMPORTANT: This must read naturally to someone who runs a dealership, not a data scientist.
-Avoid phrases such as 'historical median', 'liquidity confidence', 'exit share', 'turnover signal',
-'pricing benchmark', 'retail proposition', 'price premium', 'organic discovery', 'paid visibility',
-'campaign framing', 'creative test', 'hypothesis', 'defensible', 'stock-age pressure',
-'higher-value, thinner-evidence test', 'reach' as a noun, and 'the ask'.
-Say 'typical time similar listings stayed online' instead of 'historical median market exit';
-'similar cars currently advertised' instead of 'comparables' when that is clearer;
-'without an ad' instead of 'organically'; 'price' instead of 'the ask';
-'a short ad' or 'a small ad test' instead of 'visibility testing'.
-Use natural equivalents in Turkish or Russian, not literal translations of English jargon.
-Make labels plain and helpful, such as 'Try a small ad', 'Check the price first',
-'Give it more time', 'Focus on its price', or 'Show what makes it different'.
+IMPORTANT distinctions: A listing disappearing is an OBSERVED MARKET EXIT, not a
+confirmed sale. Historical turnover is NOT measured advertising effectiveness.
+Current comparable medians are ASKING prices, not transaction prices, and a displayed
+0% price gap does not prove a vehicle is well priced relative to its condition.
+Low comparable count or small historical sample limits confidence in strong claims;
+mention this only when it matters to the recommendation. Do not claim to know the
+car's condition, equipment, photos, ad performance, enquiries, margin, specific buyer
+segment or demand, unless those facts are supplied. Avoid claiming that lack of sales,
+views or buyer interest is known merely from time advertised.
 
-Stick to 2-3 SHORT sentences per vehicle, ideally 35-55 words, with a straightforward
-recommendation rather than heavy qualifications or a stack of numbers. Vary the actual advice
-based on the evidence. Do not invent the vehicle's condition, equipment, audience, margin,
-interest from buyers, ad results, or future sales. A listing disappearing from the dataset
-is NOT proof it sold; past listing behaviour does NOT prove an advertisement will work.
-Where evidence is thin, say simply 'There aren't many similar listings to compare with'
-when relevant, rather than announcing a 'low-confidence liquidity signal'.
-Observed listing age may be a minimum, not a verified original listing date.
+STYLE: Aim for 55-85 words, normally 3 sentences and at most 4. Start with the
+interpretation, not an empty label such as 'This is a credible candidate'.
+Use plain but precise language: 'stayed listed about three times as long as similar
+past ads' is better than 'stock-age pressure'; 'priced about 14% above comparable
+current ads' is better than 'price-position headwind'. 'Historical median' is fine
+if it clarifies a numerical comparison, but avoid abstract phrases like 'test reach',
+'commercial hypothesis', 'liquidity confidence' and 'retail proposition'.
+Use measured language: 'a limited ad could test whether more exposure helps' rather
+than 'an ad will revive this car'. Explain the meaningful WHY, not generic tactics
+about photos or changing copy unless actual evidence warrants checking the listing.
+Labels should summarize the DIFFERENT commercial takeaways, not all say 'Try a small ad'.
+Write naturally in Turkish or Russian when selected; do not leave English jargon in them.
 """.strip()
         response = _openai_post(payload={
             "model": OPENAI_MODEL,
