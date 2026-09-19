@@ -11234,6 +11234,136 @@ def api_guided_business_ad_recommendations():
         return jsonify({"success": False, "error": "BUSINESS_AD_RECOMMENDATIONS_UNAVAILABLE", "recommendations": []}), 503
 
 
+
+@app.route("/api/guided/business/ad-commentary", methods=["POST"])
+def api_guided_business_ad_commentary():
+    """Optional, evidence-grounded writing for the dealership ad shortlist.
+
+    Do not accept the user's suggested vehicle statistics as AI evidence: fetch
+    the same authenticated gallery's live ranked candidates on the server.
+    Advertising rank is deterministic; synthesis only explains the trade-offs.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        manager = get_access_manager()
+        context = _request_access_context(data)
+        g.otodeger_access_context = context
+        business_mode = _normalize_access_tier(data.get("access_tier") or data.get("tier")) == "BUSINESS"
+        if manager.enforcement_enabled:
+            if not business_mode or not context.business_entitled:
+                raise BusinessAccessRequired("An authorised Business account is required")
+            manager.activate_business_device(context)
+            company = str(context.org_name or "").strip()
+        elif context.business_entitled and business_mode and context.org_name:
+            company = str(context.org_name).strip()
+        else:
+            company = _resolve_business_company(
+                "", requested_company=str(data.get("business_company") or "").strip() or None,
+            )
+        if not company:
+            return jsonify({"success": False, "error": "BUSINESS_COMPANY_REQUIRED"}), 400
+
+        language = str(data.get("language") or "EN").strip().upper()
+        if language not in {"EN", "TR", "RU"}:
+            language = "EN"
+        try:
+            limit = max(1, min(int(data.get("limit") or 5), 5))
+        except (TypeError, ValueError):
+            limit = 5
+        candidates = _business_advertising_recommendations(company, limit=limit)
+        if not candidates:
+            return jsonify({"success": True, "recommendations": []})
+
+        def clean_number(value):
+            try:
+                number = float(value)
+                return number if math.isfinite(number) else None
+            except (ValueError, TypeError):
+                return None
+
+        evidence = []
+        for index, item in enumerate(candidates):
+            ask = clean_number(item.get("asking_price"))
+            median = clean_number(item.get("comparable_median_price"))
+            comp_count = clean_number(item.get("comparable_count"))
+            # A reported percentage can be in incompatible formats in upstream
+            # feeds. Calculate price deviation from the two actual asking prices.
+            price_gap = ((ask - median) / median * 100.0) if (
+                ask is not None and median is not None and median > 0
+                and comp_count is not None and comp_count > 0
+            ) else None
+            evidence.append({
+                "key": f"ad-{index + 1}",
+                "rank": index + 1,
+                "vehicle": " ".join(str(item.get(field) or "").strip()[:80] for field in ("year", "brand", "model", "category")).strip(),
+                "asking_price_gbp": ask,
+                "current_asking_vs_comparable_median_pct": price_gap,
+                "current_comparable_listings": int(comp_count) if comp_count is not None else None,
+                "current_comparable_median_gbp": median,
+                "observed_listing_age_days": clean_number(item.get("listing_age_days")),
+                "observed_listing_age_is_lower_bound": bool(item.get("listing_age_is_lower_bound")),
+                "historical_median_days_to_leave_market": clean_number(item.get("historical_median_days_to_exit")),
+                "historical_60_day_market_exit_fraction": clean_number(item.get("historical_exit60_rate")),
+                "historical_distinct_listing_count": clean_number(item.get("historical_distinct_listings")),
+                "historical_liquidity_confidence": str(item.get("liquidity_confidence") or "")[:20],
+                "comparable_evidence_confidence": str(item.get("comparable_confidence") or "")[:20],
+                "observed_historical_price_reduction_fraction": clean_number(item.get("historical_price_reduction_rate")),
+            })
+
+        lang_name = {"EN": "English", "TR": "Turkish", "RU": "Russian"}[language]
+        instructions = f"""
+You advise a vehicle dealership on WHERE TO SPEND ITS NEXT ADVERTISING BUDGET.
+Write a concise, differentiated commercial interpretation of the ranked shortlist in {lang_name}.
+Return ONLY valid JSON: {{"recommendations":[{{"key":"ad-1","label":"2-5 word distinction","text":"2-3 concise sentences"}}]}}.
+Return one entry for EACH supplied candidate in existing rank order. Preserve every key. Do not rerank or invent a new score or advertising performance data.
+
+IMPORTANT: The five evidence tiles underneath EACH paragraph already show asking price, listing age, asking-vs-market-median percentage, historical 60-day market-exit share and count of current comparables. Do not paraphrase these tiles one by one, recite all the figures, or use the same explanation for each car with changed numbers. Your task is INTERPRETATION and COMPARISON, not restatement.
+For each option, explain its SPECIFIC, distinctive case for promotion or for holding off. Compare it with at least one named SHORTLIST alternative when reliable data make a meaningful distinction. Translate each standout into an actionable advertising choice: promote a persuasive value proposition, test visibility on ageing but fairly priced stock, allow newer stock organic exposure first, target a niche audience when data are thin, or review a markedly high asking price before spending. A top rank does NOT mean that paid advertising necessarily helps; critically discuss if price, thin evidence or normal listing age makes a promotional campaign premature.
+Selectively cite one or two figures ONLY when they make a genuinely meaningful contrast (e.g. a 60-day exit share exceeds the next candidate by 12 percentage points, or stock age is 1.7 times the vehicle's own historical median). Make the actual comparison explicit. Do not exaggerate trivial differences or compare non-comparable measures; say nothing about a lead if the supporting figures are missing or thin. Historical market-exit metrics are NOT confirmed sales and do NOT measure ad performance, demand caused by promotion, or the probability of sale. Avoid sales promises, invented conversion/return-on-ad-spend predictions, and unsupported assumptions about vehicle condition or margins.
+`observed_listing_age_days` may be a lower bound: do not claim the true initial listing date. A small `current_comparable_listings` count means the pricing benchmark is thin, not necessarily scarce demand. For a vehicle priced materially ABOVE current comparables, consider whether price review should precede paid traffic. A vehicle BELOW the median may have an advertising-friendly price story, conditional on true comparability, but a low price alone does not establish a good purchase or sale. Do NOT assert advertising is better than repricing for every option.
+Write naturally like a perceptive dealership media adviser rather than a generic bot. Vary structure across five cards. Labels should describe each vehicle's REAL rationale (e.g. "Price story to promote", "Ageing stock: test reach", "Revisit price first", "Allow organic discovery", "Niche audience test") and not repeat "High priority" five times. Aim 35-65 words per paragraph. Use only the supplied evidence; no invented figures or other listings.
+""".strip()
+        response = _openai_post(payload={
+            "model": OPENAI_MODEL,
+            "reasoning": {"effort": "low"},
+            "max_output_tokens": 1600,
+            "instructions": instructions,
+            "input": json.dumps({"ranked_advertising_candidates": evidence}, ensure_ascii=False),
+        }, timeout=(2.0, 8.0))
+        response.raise_for_status()
+        generated = str(extract_response_text(response.json()) or "").strip()
+        if generated.startswith("```"):
+            generated = re.sub(r"^```(?:json)?\s*", "", generated, flags=re.IGNORECASE)
+            generated = re.sub(r"\s*```$", "", generated)
+        first, last = generated.find("{"), generated.rfind("}")
+        if first < 0 or last <= first:
+            raise ValueError("AD_COMMENTARY_INVALID_JSON")
+        parsed = json.loads(generated[first:last + 1])
+        raw = parsed.get("recommendations") if isinstance(parsed, dict) else None
+        if not isinstance(raw, list):
+            raise ValueError("AD_COMMENTARY_INVALID_SHAPE")
+        allowed = {candidate["key"] for candidate in evidence}
+        used = set()
+        final = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "").strip()
+            label = re.sub(r"\s+", " ", str(item.get("label") or "").strip())[:64]
+            text = re.sub(r"\s+", " ", str(item.get("text") or "").strip())[:900]
+            if key not in allowed or key in used or not text:
+                continue
+            final.append({"key": key, "label": label, "text": text})
+            used.add(key)
+        return jsonify({"success": True, "recommendations": final})
+    except AccessControlError as exc:
+        return _access_control_error_response(exc)
+    except AIUsageLimitExceeded as exc:
+        return jsonify({"success": False, "error": str(exc) or "AI_USAGE_LIMIT"}), 429
+    except Exception as exc:
+        print("GUIDED AD COMMENTARY SYNTHESIS FAILED:", repr(exc), flush=True)
+        return jsonify({"success": False, "error": "AD_COMMENTARY_UNAVAILABLE"}), 503
+
 @app.route("/api/business/galleries", methods=["GET"])
 def api_business_gallery_options():
     """Return gallery names that have Business intelligence coverage.
