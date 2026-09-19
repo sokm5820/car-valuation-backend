@@ -788,16 +788,28 @@ BUSINESS_ACTIVITY_VERSION = "11.0"
 
 
 def _load_assistant_csv_local_first(filename, url, timeout=25):
-    """Prefer repo-local intelligence files; fall back to GitHub if absent.
-
-    This removes an unnecessary network dependency on normal production boots while
-    preserving the existing refresh/fallback behaviour.
-    """
+    """Prefer repo-local intelligence files; fall back to configured remote URL."""
     local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
     if os.path.exists(local_path):
         return pd.read_csv(local_path, low_memory=False)
     if not str(url or "").strip():
         raise RuntimeError(f"PRIVATE_DATA_SOURCE_REQUIRED:{filename}")
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    return pd.read_csv(io.StringIO(response.text), low_memory=False)
+
+
+def _load_public_or_private_csv(filename, url, timeout=20):
+    """Preserve the existing live URL refresh in legacy mode.
+
+    With commercial enforcement enabled, the implicit public GitHub URL is
+    disabled; use the checked-in snapshot or an explicitly configured data URL.
+    This does NOT make a public GitHub repository private or ensure live updates.
+    """
+    if _DATA_SECURITY_ENFORCED:
+        return _load_assistant_csv_local_first(filename, url, timeout=timeout)
+    if not str(url or "").strip():
+        raise RuntimeError(f"DATA_SOURCE_NOT_CONFIGURED:{filename}")
     response = requests.get(url, timeout=timeout)
     response.raise_for_status()
     return pd.read_csv(io.StringIO(response.text), low_memory=False)
@@ -849,16 +861,11 @@ def load_buyer_intelligence():
     global buyer_model_df, buyer_category_df, BUYER_INTELLIGENCE_READY
 
     try:
-        model_r = requests.get(BUYER_MODEL_CSV_URL, timeout=20)
-        model_r.raise_for_status()
-        category_r = requests.get(BUYER_CATEGORY_CSV_URL, timeout=20)
-        category_r.raise_for_status()
-
-        new_model = pd.read_csv(
-            io.StringIO(model_r.text), low_memory=False
+        new_model = _load_public_or_private_csv(
+            "buyer_model_intelligence.csv", BUYER_MODEL_CSV_URL, timeout=20
         )
-        new_category = pd.read_csv(
-            io.StringIO(category_r.text), low_memory=False
+        new_category = _load_public_or_private_csv(
+            "buyer_category_intelligence.csv", BUYER_CATEGORY_CSV_URL, timeout=20
         )
 
         required_model = {
@@ -1109,9 +1116,19 @@ def load_business_activity_history():
     history supplies the pounds and vehicle identities behind those counts.
     """
     global business_activity_history_df, BUSINESS_ACTIVITY_HISTORY_READY
+    # This optional raw file is NOT part of the checked-in production CSVs.
+    # Do not repeatedly fetch the old, non-existent GitHub default (404). A
+    # deliberately configured private URL or a local file can enable it later.
+    local_history = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kktcarabam_daily.csv")
+    explicit_history_url = str(os.environ.get("BUSINESS_ACTIVITY_HISTORY_CSV_URL") or "").strip()
+    if not os.path.exists(local_history) and not explicit_history_url:
+        print("BUSINESS ACTIVITY HISTORY unavailable: configure a real source or provide kktcarabam_daily.csv")
+        if business_activity_history_df is None or business_activity_history_df.empty:
+            BUSINESS_ACTIVITY_HISTORY_READY = False
+        return
     try:
         frame = _load_assistant_csv_local_first(
-            "kktcarabam_daily.csv", BUSINESS_ACTIVITY_HISTORY_CSV_URL, timeout=45
+            "kktcarabam_daily.csv", explicit_history_url, timeout=45
         )
         lower = {str(col).strip().casefold(): col for col in frame.columns}
         aliases = {
@@ -1169,9 +1186,9 @@ def load_model_profiles():
     global model_profile_df, MODEL_PROFILE_READY, MODEL_PROFILE_LOOKUP
 
     try:
-        r = requests.get(BUYER_MODEL_PROFILE_CSV_URL, timeout=15)
-        r.raise_for_status()
-        new_profiles = pd.read_csv(io.StringIO(r.text), low_memory=False).fillna("")
+        new_profiles = _load_public_or_private_csv(
+            "buyer_model_profiles.csv", BUYER_MODEL_PROFILE_CSV_URL, timeout=15
+        ).fillna("")
         required = {
             "Brand", "Model", "VehicleType", "BodyStyle", "SizeClass",
             "Economy", "Luxury", "Comfort", "Performance", "Practicality",
@@ -1419,12 +1436,8 @@ def load_market_data():
     global market_df, MARKET_READY
 
     try:
-        r = requests.get(MARKET_CSV_URL, timeout=15)
-        r.raise_for_status()
-
-        new_market_df = pd.read_csv(
-            io.StringIO(r.text),
-            low_memory=False
+        new_market_df = _load_public_or_private_csv(
+            "market_base.csv", MARKET_CSV_URL, timeout=15
         )
 
         # -----------------------

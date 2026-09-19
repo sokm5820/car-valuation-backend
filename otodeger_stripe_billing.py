@@ -284,9 +284,20 @@ def checkout_status():
         session = _stripe().checkout.Session.retrieve(sid)
         if session.get("client_reference_id") != claims["sub"]:
             return _error("This checkout belongs to another account", 403)
+        recorded = False
+        plan = str((session.get("metadata") or {}).get("plan") or "")
         if session.get("payment_status") == "paid":
             _fulfill_checkout(session)
-        return jsonify({"success": True, "payment_status": session.get("payment_status")})
+            paid = read_paid_access(_redis(), str(claims["sub"]), str(claims.get("org_id") or ""))
+            if plan == "personal":
+                recorded = bool(paid["personal_until"])
+            elif plan == "personal_plus":
+                recorded = bool(paid["personal_plus_until"])
+            elif plan in {"business_monthly", "business_annual"}:
+                recorded = bool(paid["business_until"] and
+                                paid["business_subscription_id"] == session.get("subscription"))
+        return jsonify({"success": True, "payment_status": session.get("payment_status"),
+                        "plan": plan, "entitlement_recorded": recorded})
     except PermissionError as exc:
         return _error(exc, 401)
     except Exception as exc:

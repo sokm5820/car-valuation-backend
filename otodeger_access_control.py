@@ -809,15 +809,27 @@ class CommercialAccessManager:
             "device_seat_enforced": bool(self.enforcement_enabled),
             "stripe_payment_enforced": bool(self.enforcement_enabled and self.stripe_enforce_entitlements),
         })
-        if self.enforcement_enabled and self.stripe_enforce_entitlements and context.authenticated:
-            from otodeger_stripe_billing import read_paid_access
-            paid = read_paid_access(self.backend.redis, context.user_id,
-                                    context.org_id if context.gallery_verified else "")
-            payload["personal_paid_until"] = paid["personal_until"]
-            payload["personal_plus_paid_until"] = paid["personal_plus_until"]
-            payload["business_paid_until"] = paid["business_until"]
-            payload["business_subscription_active"] = bool(paid["business_until"])
-            payload["business_subscription_id"] = paid["business_subscription_id"]
+        # Read-only billing visibility in sandbox/legacy mode. This reports
+        # purchases, but does NOT turn on server-side entitlement enforcement.
+        # Never associate a paid record with legacy client-selected identities.
+        if (context.authenticated and context.source in {"clerk_session", "stripe_subscription"}
+                and self.has_shared_backend and os.getenv("STRIPE_SECRET_KEY")):
+            try:
+                from otodeger_stripe_billing import read_paid_access
+                paid = read_paid_access(self.backend.redis, context.user_id,
+                                        context.org_id if context.gallery_verified else "")
+                payload["personal_paid_until"] = paid["personal_until"]
+                payload["personal_plus_paid_until"] = paid["personal_plus_until"]
+                payload["business_paid_until"] = paid["business_until"]
+                payload["business_subscription_active"] = bool(paid["business_until"])
+                payload["business_subscription_id"] = paid["business_subscription_id"]
+                payload["billing_status_available"] = True
+            except Exception as exc:
+                if self.enforcement_enabled and self.stripe_enforce_entitlements:
+                    raise SecurityConfigurationError("Billing entitlement status unavailable") from exc
+                payload["billing_status_available"] = False
+        elif self.enforcement_enabled and self.stripe_enforce_entitlements and context.authenticated:
+            raise SecurityConfigurationError("Billing entitlement storage is not configured")
         if context.business_entitled:
             devices = set(self.backend.smembers(self._org_devices_key(context.org_id)))
             payload["seats_used"] = len(devices)
