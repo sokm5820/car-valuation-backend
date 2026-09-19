@@ -5386,39 +5386,106 @@ def _fast_compare_answer(message, language, filters, model_options):
     return intro + "\n\n" + "\n\n".join(sections) + "\n\n" + closing
 
 
+_LISTING_COLOUR_ROWS = [
+    ('Black', 'Siyah', 'Чёрный', ['siyah', 'black', 'черный', 'чёрный']),
+    ('White', 'Beyaz', 'Белый', ['beyaz', 'white', 'белый']),
+    ('Silver', 'Gümüş', 'Серебристый', ['gumus', 'silver', 'серебристый', 'серебро']),
+    ('Grey', 'Gri', 'Серый', ['gri', 'grey', 'gray', 'серый']),
+    ('Dark grey', 'Füme', 'Тёмно-серый', ['fume', 'füme', 'dark grey', 'dark gray', 'темно серый', 'тёмно серый', 'темно-серый', 'тёмно-серый', 'charcoal']),
+    ('Blue', 'Mavi', 'Синий', ['mavi', 'blue', 'синий', 'голубой']),
+    ('Navy blue', 'Lacivert', 'Тёмно-синий', ['lacivert', 'navy', 'navy blue', 'dark blue', 'темно синий', 'тёмно синий']),
+    ('Red', 'Kırmızı', 'Красный', ['kirmizi', 'red', 'красный']),
+    ('Burgundy', 'Bordo', 'Бордовый', ['bordo', 'burgundy', 'maroon', 'бордовый', 'бордо']),
+    ('Green', 'Yeşil', 'Зелёный', ['yesil', 'green', 'зеленый', 'зелёный']),
+    ('Yellow', 'Sarı', 'Жёлтый', ['sari', 'yellow', 'желтый', 'жёлтый']),
+    ('Beige', 'Bej', 'Бежевый', ['bej', 'beige', 'бежевый']),
+    ('Brown', 'Kahverengi', 'Коричневый', ['kahverengi', 'brown', 'коричневый']),
+    ('Orange', 'Turuncu', 'Оранжевый', ['turuncu', 'orange', 'оранжевый']),
+    ('Gold', 'Altın', 'Золотистый', ['altin', 'gold', 'golden', 'золотой', 'золотистый']),
+    ('Champagne', 'Şampanya', 'Шампань', ['sampanya', 'champagne', 'шампань']),
+    ('Purple', 'Mor', 'Фиолетовый', ['mor', 'purple', 'фиолетовый']),
+    ('Pink', 'Pembe', 'Розовый', ['pembe', 'pink', 'розовый']),
+    ('Cream', 'Krem', 'Кремовый', ['krem', 'cream', 'кремовый']),
+    ('Ivory', 'Fildişi', 'Слоновая кость', ['fildisi', 'ivory', 'слоновая кость']),
+    ('Bronze', 'Bronz', 'Бронзовый', ['bronz', 'bronze', 'бронзовый']),
+    ('Copper', 'Bakır', 'Медный', ['bakir', 'copper', 'медный']),
+    ('Anthracite', 'Antrasit', 'Антрацитовый', ['antrasit', 'anthracite', 'антрацит', 'антрацитовый']),
+    ('Khaki', 'Haki', 'Хаки', ['haki', 'khaki', 'хаки']),
+    ('Turquoise', 'Turkuaz', 'Бирюзовый', ['turkuaz', 'turquoise', 'бирюзовый']),
+    ('Ocean blue', 'Okyanus mavisi', 'Океанский синий', ['okyanus mavisi', 'mavi okyanus', 'ocean blue', 'oceanic blue', 'океанский синий']),
+    ('Parliament blue', 'Parlement mavisi', 'Сине-фиолетовый', ['parlement mavisi', 'mavi parlement', 'parliament blue', 'парламентский синий']),
+    ('Pearl white', 'İnci beyazı', 'Жемчужно-белый', ['inci beyaz', 'inci beyazi', 'sedef beyaz', 'sedef beyazi', 'pearl white', 'pearlescent white', 'жемчужно белый', 'жемчужно-белый']),
+    ('Other', 'Diğer', 'Другой', ['diger', 'other', 'другой', 'другое']),
+    ('Not specified', 'Belirtilmemiş', 'Не указан', ['belirtilmemis', 'belirsiz', 'unknown', 'not specified', 'unspecified', 'не указан', 'не указано', 'неизвестно']),
+]
+def _listing_attribute_key(value):
+    """Normalize Turkish dotted-I/diacritics and Russian ё consistently."""
+    import unicodedata
+    text = unicodedata.normalize("NFD", str(value or "").casefold())
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = text.replace("ı", "i").replace("ё", "е")
+    return re.sub(r"[^a-z0-9а-я]+", " ", text).strip()
+
+
+_LISTING_COLOUR_LOOKUP = {}
+for _en, _tr, _ru, _aliases in _LISTING_COLOUR_ROWS:
+    for _alias in (_en, _tr, _ru, *_aliases):
+        _LISTING_COLOUR_LOOKUP[_listing_attribute_key(_alias)] = {"EN": _en, "TR": _tr, "RU": _ru}
+
+
 def _localize_listing_value(value, field, language):
-    """Localize common structured market values without altering seller names."""
-    text = str(value or "").strip()
-    if not text or language == "TR":
+    """Translate structured listing attributes into the selected site language.
+
+    Never machine-translate individual dealer names, model/trim names or places:
+    those are proper names. An unknown proprietary paint name is returned as
+    supplied instead of being misrepresented as a guessed generic colour.
+    """
+    if value is None or (not isinstance(value, (list, tuple, dict)) and pd.isna(value)):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    language = language if language in {"EN", "TR", "RU"} else "EN"
+    key = _listing_attribute_key(text)
+
+    if field == "company":
+        individual = {"bireysel", "sahibinden", "individual", "individual seller", "private", "private seller", "частное лицо", "частный продавец"}
+        gallery = {"galeri", "gallery", "dealer", "dealership", "дилер", "автосалон"}
+        if key in individual:
+            return {"EN": "Individual seller", "TR": "Bireysel", "RU": "Частный продавец"}[language]
+        if key in gallery:
+            return {"EN": "Gallery", "TR": "Galeri", "RU": "Автосалон"}[language]
         return text
-    key = _normalize_vehicle_phrase(text)
-    if language == "EN":
-        maps = {
-            "transmission": {"otomatik": "Automatic", "manuel": "Manual"},
-            "company": {"bireysel": "Individual seller"},
-            "color": {
-                "siyah": "Black", "beyaz": "White", "gumus": "Silver",
-                "gri": "Grey", "fume": "Dark grey", "mavi": "Blue",
-                "kirmizi": "Red", "yesil": "Green", "sari": "Yellow",
-                "bej": "Beige", "kahverengi": "Brown", "turuncu": "Orange",
-                "lacivert": "Navy", "bordo": "Burgundy",
-                "mavi okyanus": "Ocean Blue", "mavi parlement": "Parliament Blue",
-                "inci beyaz": "Pearl White", "metalik gri": "Metallic Grey",
-                "koyu gri": "Dark Grey", "acik gri": "Light Grey"
-            },
-        }
-        return maps.get(field, {}).get(key, text)
-    if language == "RU":
-        maps = {
-            "transmission": {"otomatik": "автомат", "manuel": "механика"},
-            "company": {"bireysel": "частный продавец"},
-            "color": {
-                "siyah": "чёрный", "beyaz": "белый", "gumus": "серебристый",
-                "gri": "серый", "fume": "тёмно-серый", "mavi": "синий",
-                "kirmizi": "красный", "yesil": "зелёный", "sari": "жёлтый"
-            },
-        }
-        return maps.get(field, {}).get(key, text)
+    if field == "transmission":
+        if key in {"otomatik", "automatic", "автомат", "автоматическая"}:
+            return {"EN": "Automatic", "TR": "Otomatik", "RU": "Автомат"}[language]
+        if key in {"manuel", "manual", "manual transmission", "механика", "механическая"}:
+            return {"EN": "Manual", "TR": "Manuel", "RU": "Механика"}[language]
+        return text
+    if field == "color":
+        found = _LISTING_COLOUR_LOOKUP.get(key)
+        if found:
+            return found[language]
+        # One advertisement can contain two independent colours.
+        pieces = re.split(r"\s*(?:/|\+|,|\s+ve\s+|\s+and\s+|\s+и\s+)\s*", text, flags=re.I)
+        if len(pieces) > 1 and all(_listing_attribute_key(part) in _LISTING_COLOUR_LOOKUP for part in pieces):
+            return " / ".join(_LISTING_COLOUR_LOOKUP[_listing_attribute_key(part)][language] for part in pieces)
+        modifiers = [
+            (("metalik", "metallic", "металлик"), {"EN":"Metallic", "TR":"Metalik", "RU":"Металлик"}),
+            (("koyu", "dark", "темный", "тёмный", "темно", "тёмно"), {"EN":"Dark", "TR":"Koyu", "RU":"Тёмный"}),
+            (("acik", "açık", "light", "светлый", "светло"), {"EN":"Light", "TR":"Açık", "RU":"Светлый"}),
+            (("mat", "matte", "матовый"), {"EN":"Matte", "TR":"Mat", "RU":"Матовый"}),
+            (("inci", "sedef", "pearl", "pearlescent", "жемчужный"), {"EN":"Pearl", "TR":"İnci", "RU":"Жемчужный"}),
+        ]
+        for aliases, translation in modifiers:
+            for alias in aliases:
+                marker = _listing_attribute_key(alias)
+                prefix, suffix = marker + " ", " " + marker
+                base = key[len(prefix):] if key.startswith(prefix) else key[:-len(suffix)] if key.endswith(suffix) else ""
+                colour = _LISTING_COLOUR_LOOKUP.get(base)
+                if colour:
+                    label = colour[language]
+                    return f"{translation[language]} {label.lower() if language == 'RU' else label}"
     return text
 
 
@@ -11274,7 +11341,8 @@ def api_v10_decision_agent():
             requested_language = "TR"
         # Follow the language the user is actually writing when detectable;
         # browser preference remains the fallback for short/ambiguous turns.
-        language = detect_conversation_language(message, requested_language, None)
+        language = (requested_language if data.get("language_locked") is True
+                    else detect_conversation_language(message, requested_language, None))
         data["language"] = language
 
         if not message:
@@ -13847,7 +13915,7 @@ Writing rules:
 - `evidence_scope` tells you the scope of the HISTORICAL TURNOVER statistics. `EXACT_CATEGORY_YEAR` means they were rebuilt directly from distinct listing histories for the displayed Year + Brand + Model + Category. In this exact case, DO NOT waste words explaining the evidence level or saying that the statistics are exact; simply use the statistics naturally.
 - `MODEL_YEAR_FALLBACK` is used only when exact category-year turnover history is too thin. Do NOT expose the fallback methodology, sample counts or technical scope in the recommendation. If the thinner evidence materially matters to the commercial decision, express it only as a brief natural caution such as "the category-specific history is thinner here". Never imply that broader turnover figures are category-specific, and never pool different years.
 - `EXACT_THIN` means the exact category history is small. Do not explain sample mechanics or quote the sample-size caveat unless it materially affects the recommendation. If needed, simply say the historical signal is less established than the stronger-evidence options.
-- `CURRENT_MARKET_ONLY` means reliable historical turnover could not be established. Use current-market evidence only and avoid liquidity claims. A concise plain-English caution is enough; do not explain the data pipeline.
+- `CURRENT_MARKET_ONLY` means reliable historical turnover could not be established. Use current-market evidence only and avoid liquidity claims. A concise caution in the requested output language is enough; do not explain the data pipeline.
 - `exact_historical_distinct_listings` is the number of ALL distinct listing histories observed for the exact displayed Year + Brand + Model + Category across ALL asking-price levels. `turnover_sample_size`, the 60-day exit statistic, median observed exit time, and historical price-reduction rate are also calculated from the full available historical universe at the applicable evidence scope; the user's listing-price ceiling never filters them. `turnover_sample_size` may still be smaller than total history because censored histories are excluded. Do not conflate these two numbers. Prefer the turnover sample when explaining the reliability of a turnover percentage.
 - Usually leave `exact_historical_distinct_listings` to the evidence strip rather than quoting it in the prose. If you discuss how well-supported a turnover percentage is, use `turnover_sample_size`; never write as though every historical listing was necessarily eligible for the 60-day statistic.
 - `fallback_context` is internal support for judging confidence. Never reproduce its sample counts or methodology in the customer-facing prose.
