@@ -11319,6 +11319,7 @@ Return one entry for EACH supplied candidate in existing rank order. Preserve ev
 
 IMPORTANT: The five evidence tiles underneath EACH paragraph already show asking price, listing age, asking-vs-market-median percentage, historical 60-day market-exit share and count of current comparables. Do not paraphrase these tiles one by one, recite all the figures, or use the same explanation for each car with changed numbers. Your task is INTERPRETATION and COMPARISON, not restatement.
 For each option, explain its SPECIFIC, distinctive case for promotion or for holding off. Compare it with at least one named SHORTLIST alternative when reliable data make a meaningful distinction. Translate each standout into an actionable advertising choice: promote a persuasive value proposition, test visibility on ageing but fairly priced stock, allow newer stock organic exposure first, target a niche audience when data are thin, or review a markedly high asking price before spending. A top rank does NOT mean that paid advertising necessarily helps; critically discuss if price, thin evidence or normal listing age makes a promotional campaign premature.
+When several vehicles share the SAME dominant signal (for example, all have been listed about three times their own historical market-exit window), do NOT repeat a near-identical ageing-stock paragraph. Deliberately inspect other useful differences: whether the car is in a higher or lower advertised-price tier, whether its observed ageing pressure is materially higher relative to its OWN history, whether its pricing benchmark is thin, or whether its historical exit share differs materially. Explain how those differences would affect campaign framing, audience choice or whether a paid test is warranted. If their evidence is genuinely similar, say that it does not justify allocating different budgets and suggest a concrete vehicle-specific creative test; do not invent differences, ad ROI, condition, margin or buyer demographics.
 Selectively cite one or two figures ONLY when they make a genuinely meaningful contrast (e.g. a 60-day exit share exceeds the next candidate by 12 percentage points, or stock age is 1.7 times the vehicle's own historical median). Make the actual comparison explicit. Do not exaggerate trivial differences or compare non-comparable measures; say nothing about a lead if the supporting figures are missing or thin. Historical market-exit metrics are NOT confirmed sales and do NOT measure ad performance, demand caused by promotion, or the probability of sale. Avoid sales promises, invented conversion/return-on-ad-spend predictions, and unsupported assumptions about vehicle condition or margins.
 `observed_listing_age_days` may be a lower bound: do not claim the true initial listing date. A small `current_comparable_listings` count means the pricing benchmark is thin, not necessarily scarce demand. For a vehicle priced materially ABOVE current comparables, consider whether price review should precede paid traffic. A vehicle BELOW the median may have an advertising-friendly price story, conditional on true comparability, but a low price alone does not establish a good purchase or sale. Do NOT assert advertising is better than repricing for every option.
 Write naturally like a perceptive dealership media adviser rather than a generic bot. Vary structure across five cards. Labels should describe each vehicle's REAL rationale (e.g. "Price story to promote", "Ageing stock: test reach", "Revisit price first", "Allow organic discovery", "Niche audience test") and not repeat "High priority" five times. Aim 35-65 words per paragraph. Use only the supplied evidence; no invented figures or other listings.
@@ -11326,12 +11327,25 @@ Write naturally like a perceptive dealership media adviser rather than a generic
         response = _openai_post(payload={
             "model": OPENAI_MODEL,
             "reasoning": {"effort": "low"},
-            "max_output_tokens": 1600,
+            # Allow enough generation budget for five genuinely different analyses;
+            # the earlier 1,600-token/8-second ceiling commonly forced a silent
+            # fallback even though ranking and the report data were available.
+            "max_output_tokens": 4000,
             "instructions": instructions,
             "input": json.dumps({"ranked_advertising_candidates": evidence}, ensure_ascii=False),
-        }, timeout=(2.0, 8.0))
+        }, timeout=(3.0, 22.0))
+        if not response.ok:
+            try:
+                issue = response.json().get("error") or {}
+                code = issue.get("code") or issue.get("type") if isinstance(issue, dict) else "UNKNOWN"
+            except (ValueError, TypeError):
+                code = "UNKNOWN"
+            print("GUIDED AD COMMENTARY AI RESPONSE:", response.status_code, code, flush=True)
         response.raise_for_status()
-        generated = str(extract_response_text(response.json()) or "").strip()
+        payload = response.json()
+        if payload.get("status") == "incomplete":
+            print("GUIDED AD COMMENTARY AI INCOMPLETE:", payload.get("incomplete_details"), flush=True)
+        generated = str(extract_response_text(payload) or "").strip()
         if generated.startswith("```"):
             generated = re.sub(r"^```(?:json)?\s*", "", generated, flags=re.IGNORECASE)
             generated = re.sub(r"\s*```$", "", generated)
@@ -11353,9 +11367,18 @@ Write naturally like a perceptive dealership media adviser rather than a generic
             text = re.sub(r"\s+", " ", str(item.get("text") or "").strip())[:900]
             if key not in allowed or key in used or not text:
                 continue
-            final.append({"key": key, "label": label, "text": text})
+            position = int(key.split("-")[1]) - 1
+            final.append({
+                "key": key,
+                "label": label,
+                "text": text,
+                # Prevent stale/cross-order commentary being assigned to the wrong
+                # listing when separate evidence and AI requests finish in parallel.
+                "source_link": str(candidates[position].get("link") or ""),
+            })
             used.add(key)
-        return jsonify({"success": True, "recommendations": final})
+        print("GUIDED AD COMMENTARY RESULT:", len(final), "of", len(evidence), "vehicles", flush=True)
+        return jsonify({"success": bool(final), "recommendations": final})
     except AccessControlError as exc:
         return _access_control_error_response(exc)
     except AIUsageLimitExceeded as exc:
