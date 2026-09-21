@@ -801,6 +801,117 @@ class CommercialAccessManager:
         if identity_h > self.ai_identity_hour:
             raise UsageLimitReached("AI usage circuit breaker reached", retry_after=retry_i)
 
+    # A first free Personal report is issued once per verified Clerk identity.
+    # An active trial is restricted to its original task + selection payload.
+    # IMPORTANT: used-trial records require durable Redis storage before live launch.
+    _PERSONAL_REPORT_TASKS = frozenset({"NEXT_VEHICLE", "OFFER", "FAIR_PRICE", "VALUE"})
+    _PERSONAL_TRIAL_SECONDS = 30 * 60
+
+    def _trial_keys(self, user_id: str):
+        identity = _hash_key(user_id)
+        return (self._key("personal_report_trial", "used", identity),
+                self._key("personal_report_trial", "active", identity))
+
+    def _report_scope_hash(self, report_context: Any) -> str:
+        if not isinstance(report_context, dict):
+            raise AccessControlError("Missing report context")
+        task = str(report_context.get("task") or "").strip().upper()
+        answers = report_context.get("answers")
+        if task not in self._PERSONAL_REPORT_TASKS or not isinstance(answers, dict):
+            raise AccessControlError("Invalid Personal report context")
+        raw = json.dumps([task, answers], ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False)
+        if len(raw) > 16000:
+            raise AccessControlError("Report context is too large")
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def personal_trial_status(self, context: AccessContext) -> Dict[str, Any]:
+        if not context.authenticated or context.source not in {"clerk_session", "stripe_subscription"}:
+            return {"personal_trial_available": False, "personal_trial_active_until": 0}
+        if not self.has_shared_backend:
+            if self.enforcement_enabled and self.stripe_enforce_entitlements:
+                raise SecurityConfigurationError("Report trial storage is unavailable")
+            return {"personal_trial_available": False, "personal_trial_active_until": 0}
+        used_key, active_key = self._trial_keys(context.user_id)
+        try:
+            pipe = self.backend.redis.pipeline(transaction=False)
+            pipe.exists(used_key)
+            pipe.hgetall(active_key)
+            used, active = pipe.execute()
+            expires = int((active or {}).get("expires_at") or 0)
+            return {"personal_trial_available": not bool(used),
+                    "personal_trial_active_until": expires if expires > int(time.time()) else 0}
+        except Exception as exc:
+            raise SecurityConfigurationError("Report trial storage is unavailable") from exc
+
+    def start_personal_report_trial(self, context: AccessContext, report_context: Any) -> Dict[str, Any]:
+        if not (self.enforcement_enabled and self.stripe_enforce_entitlements):
+            raise SecurityConfigurationError("Personal report trial requires paid-access enforcement")
+        if not context.authenticated or context.source not in {"clerk_session", "stripe_subscription"}:
+            raise AuthenticationRequired("Sign in to start the report trial")
+        scope = self._report_scope_hash(report_context)
+        from otodeger_stripe_billing import read_paid_access
+        try:
+            paid = read_paid_access(self.backend.redis, context.user_id,
+                                    context.org_id if context.gallery_verified else "")
+            if (context.business_entitled or paid["personal_until"] or paid["personal_plus_until"]):
+                return {"success": True, "already_paid": True,
+                        **self.personal_trial_status(context)}
+            used_key, active_key = self._trial_keys(context.user_id)
+            expires = int(time.time()) + self._PERSONAL_TRIAL_SECONDS
+            issued = self.backend.redis.eval('''
+                if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+                redis.call('SET', KEYS[1], '1')
+                redis.call('HSET', KEYS[2], 'scope_hash', ARGV[1], 'expires_at', ARGV[2])
+                redis.call('EXPIRE', KEYS[2], ARGV[3])
+                return 1
+            ''', 2, used_key, active_key, scope, expires, self._PERSONAL_TRIAL_SECONDS)
+            if not issued:
+                raise AccessControlError("Personal report trial already used")
+            return {"success": True, "already_paid": False, "personal_trial_available": False,
+                    "personal_trial_active_until": expires}
+        except (AccessControlError, SecurityConfigurationError):
+            raise
+        except Exception as exc:
+            raise SecurityConfigurationError("Report trial storage is unavailable") from exc
+
+    def require_guided_report_access(self, context: AccessContext, report_context: Any,
+                                     *, business: bool = False,
+                                     actual_task: str = "", actual_answers: Any = None) -> None:
+        if not (self.enforcement_enabled and self.stripe_enforce_entitlements):
+            return  # Controlled owner-preview mode only; never use for public paid launch.
+        if not context.authenticated:
+            raise AuthenticationRequired("Sign in to view a full report")
+        if business:
+            if not context.business_entitled:
+                raise BusinessAccessRequired("An active Business subscription is required")
+            self.activate_business_device(context)
+            return
+        if context.business_entitled:
+            return
+        from otodeger_stripe_billing import read_paid_access
+        try:
+            paid = read_paid_access(self.backend.redis, context.user_id,
+                                    context.org_id if context.gallery_verified else "")
+            if paid["personal_until"] or paid["personal_plus_until"]:
+                return
+            # Do not accept client-declared report context as a substitute for
+            # the actual requested task/selection on the evidence endpoint.
+            expected_hash = self._report_scope_hash(report_context)
+            if actual_task:
+                if self._report_scope_hash({"task": actual_task, "answers": actual_answers}) != expected_hash:
+                    raise AccessControlError("Report selection does not match the free-trial report")
+            _, active_key = self._trial_keys(context.user_id)
+            record = self.backend.redis.hgetall(active_key)
+            if (int(record.get("expires_at") or 0) > int(time.time())
+                    and hmac.compare_digest(record.get("scope_hash") or "", expected_hash)):
+                return
+            raise AccessControlError("Purchase access or start your first free Personal report")
+        except (AccessControlError, SecurityConfigurationError):
+            raise
+        except Exception as exc:
+            raise SecurityConfigurationError("Report entitlement status unavailable") from exc
+
     def status_payload(self, context: AccessContext) -> Dict[str, Any]:
         payload = context.public_payload()
         payload.update({
@@ -830,6 +941,8 @@ class CommercialAccessManager:
                 payload["billing_status_available"] = False
         elif self.enforcement_enabled and self.stripe_enforce_entitlements and context.authenticated:
             raise SecurityConfigurationError("Billing entitlement storage is not configured")
+        if self.enforcement_enabled and self.stripe_enforce_entitlements:
+            payload.update(self.personal_trial_status(context))
         if context.business_entitled:
             devices = set(self.backend.smembers(self._org_devices_key(context.org_id)))
             payload["seats_used"] = len(devices)

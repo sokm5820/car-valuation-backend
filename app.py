@@ -11100,6 +11100,9 @@ def _business_activity_period_summary(company, period="30D", custom_from=None, c
 @app.route("/api/guided/business/activity-summary", methods=["POST"])
 def api_guided_business_activity_summary():
     """Return a period-over-period operating pulse for the selected gallery."""
+    denied = _guided_report_gate(business=True)
+    if denied is not None:
+        return denied
     try:
         data = request.get_json(silent=True) or {}
         manager = get_access_manager()
@@ -11153,6 +11156,9 @@ def api_guided_business_activity_summary():
 @app.route("/api/guided/business/inventory-pricing", methods=["POST"])
 def api_guided_business_inventory_pricing():
     """Return structured pricing priorities for the selected gallery's own stock."""
+    denied = _guided_report_gate(business=True)
+    if denied is not None:
+        return denied
     try:
         data = request.get_json(silent=True) or {}
         manager = get_access_manager()
@@ -11211,6 +11217,9 @@ def api_guided_business_ad_recommendations():
     entitlement. During owner-preview/shadow mode the existing gallery selector
     may supply a recognised company name for product testing.
     """
+    denied = _guided_report_gate(business=True)
+    if denied is not None:
+        return denied
     try:
         data = request.get_json(silent=True) or {}
         manager = get_access_manager()
@@ -11258,6 +11267,9 @@ def api_guided_business_ad_commentary():
     the same authenticated gallery's live ranked candidates on the server.
     Advertising rank is deterministic; synthesis only explains the trade-offs.
     """
+    denied = _guided_report_gate(business=True)
+    if denied is not None:
+        return denied
     try:
         data = request.get_json(silent=True) or {}
         manager = get_access_manager()
@@ -11495,6 +11507,48 @@ def api_access_status():
         return jsonify({"success": False, "error": "ACCESS_STATUS_UNAVAILABLE"}), 503
 
 
+@app.route("/api/access/personal/trial", methods=["POST"])
+def api_start_personal_report_trial():
+    """Issue exactly one account-bound trial for the selected Personal report."""
+    try:
+        data = request.get_json(silent=True) or {}
+        context = _request_access_context({})
+        payload = get_access_manager().start_personal_report_trial(context, data.get("report_context"))
+        return jsonify(payload)
+    except AccessControlError as exc:
+        return _access_control_error_response(exc)
+    except Exception as exc:
+        print("PERSONAL REPORT TRIAL ERROR:", repr(exc), flush=True)
+        return jsonify({"success": False, "error": "REPORT_TRIAL_UNAVAILABLE"}), 503
+
+
+def _guided_report_gate(data=None, *, business=False, actual_task="", actual_answers=None):
+    """Return an HTTP denial (or None) before any private report computation.
+
+    Public valuation routes /years, /brands, /models, /categories and
+    /get_valuation are deliberately NOT gated: otodeger.online must remain free.
+    """
+    try:
+        manager = get_access_manager()
+        if not (manager.enforcement_enabled and manager.stripe_enforce_entitlements):
+            return None
+        if data is None:
+            data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"success": False, "error": "INVALID_REPORT_REQUEST"}), 400
+        context = _request_access_context({})
+        manager.require_guided_report_access(
+            context, data.get("report_context"), business=business,
+            actual_task=actual_task, actual_answers=actual_answers,
+        )
+        return None
+    except AccessControlError as exc:
+        return _access_control_error_response(exc)
+    except Exception as exc:
+        print("GUIDED REPORT ACCESS ERROR:", repr(exc), flush=True)
+        return jsonify({"success": False, "error": "REPORT_ACCESS_UNAVAILABLE"}), 503
+
+
 @app.route("/api/access/business/activate", methods=["POST"])
 def api_activate_business_access():
     """Register/use the current device as one Business seat.
@@ -11576,6 +11630,11 @@ def api_v10_decision_agent():
         manager = get_access_manager()
         access_context = _request_access_context(data)
         g.otodeger_access_context = access_context
+        if str(data.get("conversation_id") or "").startswith("guided-report-"):
+            denied = _guided_report_gate(data,
+                                         business=(str(data.get("access_tier") or "").upper() == "BUSINESS"))
+            if denied is not None:
+                return denied
         requested_mode = _normalize_access_tier(data.get("access_tier") or data.get("tier"))
         requested_business = requested_mode == "BUSINESS"
 
@@ -12106,6 +12165,41 @@ try:
     _guided_market_index()
 except Exception as _guided_warm_error:
     print("Guided market index warmup deferred:", repr(_guided_warm_error), flush=True)
+
+
+@app.route("/api/guided/valuation-evidence", methods=["POST"])
+def api_guided_valuation_evidence():
+    """Authenticated, entitlement-gated valuation evidence for an AI full report.
+
+    The public /get_valuation endpoint remains unchanged for otodeger.online.
+    This report-specific route can return the same public market observations,
+    but an unpaid user cannot invoke it as an OtoDost full-report endpoint.
+    """
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "INVALID_REPORT_REQUEST"}), 400
+    report = data.get("report_context") or {}
+    if not isinstance(report, dict):
+        return jsonify({"success": False, "error": "INVALID_REPORT_REQUEST"}), 400
+    task = str(report.get("task") or "").strip().upper()
+    if task not in {"OFFER", "FAIR_PRICE", "VALUE", "BUSINESS_VALUE"}:
+        return jsonify({"success": False, "error": "INVALID_REPORT_TASK"}), 400
+    answers = report.get("answers")
+    if not isinstance(answers, dict):
+        return jsonify({"success": False, "error": "INVALID_REPORT_REQUEST"}), 400
+    denied = _guided_report_gate(data, business=(task == "BUSINESS_VALUE"),
+                                 actual_task=task if task != "BUSINESS_VALUE" else "",
+                                 actual_answers=answers)
+    if denied is not None:
+        return denied
+    try:
+        return jsonify(get_valuation(df, answers.get("year"), answers.get("brand"),
+                                     answers.get("model"),
+                                     None if answers.get("category") == "__ALL__"
+                                     else answers.get("category")))
+    except Exception as exc:
+        print("GUIDED VALUATION REPORT FAILED:", repr(exc), flush=True)
+        return jsonify({"success": False, "error": "GUIDED_VALUATION_UNAVAILABLE"}), 503
 
 
 @app.route("/api/guided/discovery/options", methods=["GET"])
@@ -13300,6 +13394,9 @@ def api_guided_stock_result():
     It is an eligibility ceiling only; once a combination qualifies, competition,
     pricing and turnover statistics use the full exact market for that vehicle.
     """
+    denied = _guided_report_gate(business=True)
+    if denied is not None:
+        return denied
     started = time.perf_counter()
     try:
         data = request.get_json(silent=True) or {}
@@ -13465,6 +13562,15 @@ def api_guided_discovery_result():
     This deliberately uses the same pre-normalised listing index as the chips, so
     the completed report cannot disagree with a path the selector just allowed.
     """
+    initial = request.get_json(silent=True) or {}
+    if not isinstance(initial, dict):
+        return jsonify({"success": False, "error": "INVALID_REPORT_REQUEST"}), 400
+    initial_task = str(initial.get("task") or "").strip().upper()
+    denied = _guided_report_gate(initial, business=(initial_task == "STOCK_PURCHASE"),
+                                 actual_task=initial_task,
+                                 actual_answers=initial.get("answers"))
+    if denied is not None:
+        return denied
     index = _guided_market_index()
     if index is None or index.empty:
         return jsonify({"success": False, "error": "GUIDED_OPTIONS_NOT_READY"}), 503
@@ -13816,6 +13922,9 @@ def api_guided_discovery_recommendations():
     This is AI-assistant-only. It does not call or modify the standalone
     OtoDeğer valuation routes or valuation calculations.
     """
+    denied = _guided_report_gate(business=False)
+    if denied is not None:
+        return denied
     try:
         allowed, retry_after = _assistant_request_allowed()
         if not allowed:
@@ -14062,6 +14171,9 @@ def api_guided_discovery_stock_recommendations():
     Active island listings are treated as SELL-SIDE COMPETITION, not sourcing
     inventory. The model only synthesizes the hard market statistics into advice.
     """
+    denied = _guided_report_gate(business=True)
+    if denied is not None:
+        return denied
     try:
         data = request.get_json(silent=True) or {}
         language = str(data.get("language") or "EN").strip().upper()
