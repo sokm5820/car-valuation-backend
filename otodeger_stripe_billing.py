@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from flask import Blueprint, jsonify, request, current_app
 
 billing = Blueprint("billing", __name__)
-
+idempotency_key="
 PLAN_CONFIG = {
     "personal": ("STRIPE_PRICE_PERSONAL", "payment", 24 * 3600, "PERSONAL"),
     "personal_plus": ("STRIPE_PRICE_PERSONAL_PLUS", "payment", 30 * 24 * 3600, "PERSONAL_PLUS"),
@@ -333,7 +333,7 @@ def start_checkout():
                     frontend = _frontend_url()
                     customer = stripe.Customer.create(
                         metadata={"otodost_clerk_user_id": user_id},
-                        idempotency_key="otodost-gallery-customer-" + _hash(user_id),
+                        idempotency_key="otodost-gallery-customer-reset1-" + _hash(user_id),
                     )
                     session = stripe.checkout.Session.create(
                         mode="setup", customer=customer.id,
