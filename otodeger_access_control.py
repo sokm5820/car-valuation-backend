@@ -585,7 +585,12 @@ class CommercialAccessManager:
             subscription_record = self.backend.redis.hgetall(
                 "assistant:stripe:v1:subscription:" + str(paid.get("business_subscription_id") or "")
             )
-            if authorized and subscription_record.get("gallery_name") == authorized and subscription_record.get("purchaser") == user_id:
+            from otodeger_stripe_billing import GALLERY_PLANS, _price_for
+            gallery_price_ids = {_price_for(plan) for plan in GALLERY_PLANS}
+            if (authorized and subscription_record.get("gallery_name") == authorized
+                    and subscription_record.get("purchaser") == user_id
+                    and subscription_record.get("price_id") in gallery_price_ids
+                    and subscription_record.get("price_id")):
                 return AccessContext(
                     authenticated=True, user_id=user_id, tier="BUSINESS", device_id=device_id,
                     org_id="gallery-user:" + _hash_key(user_id), org_name=authorized,

@@ -35,16 +35,18 @@ kwargs = base.subscriptions[-1]
 assert kwargs['cancel_at_period_end'] is True
 assert kwargs['metadata']['auto_renew'] == 'false'
 
-# For already-verified gallery + independent direct Checkout, Stripe's actual
+# For an Independent direct Checkout, Stripe's actual
 # subscription gets an end-of-term cancellation before the entitlement is synced.
+os.environ['STRIPE_PRICE_INDEPENDENT_MONTHLY'] = 'price_independent_test'
+stripe.Price.retrieve = lambda price_id: base.Obj(currency='try', unit_amount=349900 if price_id == 'price_independent_test' else 649900, recurring={'interval': 'month'})
 modified = []
 def fake_modify(sid, **kwargs):
     modified.append((sid, kwargs))
     return {
         'id': sid,
         'metadata': {'clerk_user_id': 'user_auto_off', 'billing_scope': 'user',
-                     'billing_subject': 'user_auto_off', 'auto_renew': 'false'},
-        'items': {'data': [{'price': {'id': 'price_test'}, 'current_period_end': 1_800_000_000}]},
+                     'billing_subject': 'user_auto_off', 'plan': 'business_independent_monthly', 'auto_renew': 'false'},
+        'items': {'data': [{'price': {'id': 'price_independent_test'}, 'current_period_end': 1_800_000_000}]},
         'customer': 'cus_auto', 'status': 'active', 'cancel_at_period_end': True,
     }
 stripe.Subscription.modify = fake_modify
@@ -52,8 +54,8 @@ redis.sadd = lambda key, member: redis.sets.setdefault(key, set()).add(member)
 billing._sync_subscription({
     'id': 'sub_auto_off_independent',
     'metadata': {'clerk_user_id': 'user_auto_off', 'billing_scope': 'user',
-                 'billing_subject': 'user_auto_off', 'auto_renew': 'false'},
-    'items': {'data': [{'price': {'id': 'price_test'}, 'current_period_end': 1_800_000_000}]},
+                 'billing_subject': 'user_auto_off', 'plan': 'business_independent_monthly', 'auto_renew': 'false'},
+    'items': {'data': [{'price': {'id': 'price_independent_test'}, 'current_period_end': 1_800_000_000}]},
     'status': 'active', 'customer': 'cus_auto', 'cancel_at_period_end': False,
 }, paid=False)
 assert modified == [('sub_auto_off_independent', {'cancel_at_period_end': True})], modified
@@ -66,7 +68,7 @@ base.claims['sub'] = 'independent_auto_off'
 created = []
 stripe.checkout.Session.create = lambda **kwargs: (created.append(kwargs) or base.Obj(id='cs_independent',url='https://checkout.stripe.com/independent'))
 base.fake_flask.request.get_json = lambda silent=True: {
-    'plan': 'business_monthly', 'business_scope': 'independent',
+    'plan': 'business_independent_monthly', 'business_scope': 'independent',
     'auto_renew': False,
 }
 response = billing.start_checkout()
