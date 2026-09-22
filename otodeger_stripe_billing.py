@@ -11,7 +11,7 @@ import os
 import time
 from urllib.parse import urlparse
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, current_app
 
 billing = Blueprint("billing", __name__)
 
@@ -111,12 +111,19 @@ def read_paid_access(redis_client, user_id, clerk_org_id=""):
                 continue
             if not _is_business_price(record.get("price_id")):
                 continue
-            if until > result["business_until"] or (scope == "org" and result["business_scope"] != "org"):
+            # A paid gallery-labelled subscription is displayed before any
+            # overlapping Independent subscription for this same user.
+            prefer_gallery = (scope == "user" and bool(record.get("gallery_name"))
+                              and result["business_scope"] != "org"
+                              and not result.get("business_gallery_name"))
+            if (until > result["business_until"] or prefer_gallery
+                    or (scope == "org" and result["business_scope"] != "org")) and not (result.get("business_gallery_name") and scope == "user" and not record.get("gallery_name")):
                 result.update({
                     "business_until": until,
                     "business_scope": scope,
                     "business_subscription_id": sid,
                     "business_customer_id": record.get("customer_id", ""),
+                    "business_gallery_name": record.get("gallery_name", ""),
                 })
         if result["business_scope"] == "org":
             break
@@ -173,6 +180,19 @@ def _sync_subscription(subscription, paid=False):
         return
     sid = subscription["id"]
     client = _redis()
+    if meta.get("gallery_name"):
+        from otodeger_gallery_approvals import approved_gallery, _row
+        row = _row(client, str(meta.get("gallery_request_id") or "")) if meta.get("gallery_request_id") else {}
+        if scope != "user" or approved_gallery(client, purchaser) != meta["gallery_name"]:
+            return
+        if meta.get("gallery_request_id") and (not row or row.get("user_id") != purchaser or row.get("gallery_name") != meta["gallery_name"] or row.get("status") in {"denied", "pending", "awaiting_setup", "awaiting_contact"}):
+            return
+
+    # When the purchaser disables Auto-Renew, schedule the subscription to end
+    # at the end of its PAID term. Stripe is authoritative for billing; a client
+    # toggle alone must never promise cancellation without this server update.
+    if meta.get("auto_renew", "true") == "false" and not subscription.get("cancel_at_period_end"):
+        subscription = _stripe().Subscription.modify(sid, cancel_at_period_end=True)
     old = client.hgetall(_subscription_key(sid))
     previous_until = int(old.get("paid_until") or 0)
     # On renewals only a paid invoice may extend the entitlement period.
@@ -181,6 +201,8 @@ def _sync_subscription(subscription, paid=False):
         "scope": scope, "subject": subject, "purchaser": purchaser,
         "price_id": items[0]["price"]["id"],
         "customer_id": subscription.get("customer") or "",
+        "gallery_name": str(meta.get("gallery_name") or ""),
+        "gallery_request_id": str(meta.get("gallery_request_id") or ""),
         "status": subscription.get("status") or "unknown",
         "paid_until": str(paid_until),
     }
@@ -203,6 +225,16 @@ def _fulfill_checkout(session):
 
 def _error(message, status=400):
     return jsonify({"success": False, "error": str(message)}), status
+
+
+def _frontend_url():
+    frontend = os.environ.get("APP_FRONTEND_URL", "http://localhost:5173").rstrip("/")
+    parsed = urlparse(frontend)
+    if parsed.scheme not in {"https", "http"} or not parsed.netloc:
+        raise RuntimeError("APP_FRONTEND_URL is invalid")
+    if parsed.scheme != "https" and parsed.hostname not in {"localhost", "127.0.0.1"}:
+        raise RuntimeError("A deployed checkout return URL must use HTTPS")
+    return frontend
 
 
 @billing.post("/api/billing/checkout")
@@ -229,19 +261,78 @@ def start_checkout():
 
         kwargs = {}
         if plan.startswith("business_"):
+            if "auto_renew" in data and type(data["auto_renew"]) is not bool:
+                return _error("Invalid Auto-Renew selection")
+            auto_renew = data.get("auto_renew", True) is True
             scope = str(data.get("business_scope") or "independent")
             if scope == "gallery":
+                from otodeger_gallery_approvals import approved_gallery, new_setup_request
+                selected_gallery = str(data.get("gallery_name") or "").strip()
+                if not selected_gallery or len(selected_gallery) > 160:
+                    return _error("Please select your gallery before continuing")
+                gallery_view = current_app.view_functions.get("api_business_gallery_options")
+                if gallery_view is None:
+                    return _error("Gallery directory is unavailable", 503)
+                gallery_response = gallery_view()
+                gallery_catalogue = gallery_response.get_json(silent=True) or {}
+                if not gallery_catalogue.get("success"):
+                    return _error("Gallery directory is temporarily unavailable", 503)
+                canonical = next((name for name in gallery_catalogue.get("galleries", []) if name == selected_gallery), "")
+                if not canonical:
+                    return _error("Please choose a gallery from the available options", 400)
+                # The displayed consent is fixed in this frontend. Refuse to
+                # save a card against a different Stripe amount/interval.
+                actual_price = stripe.Price.retrieve(price)
+                expected_amount, expected_interval = ((6499 * 100, "month") if plan == "business_monthly" else (49999 * 100, "year"))
+                if (actual_price.get("currency") != "try" or actual_price.get("unit_amount") != expected_amount
+                        or (actual_price.get("recurring") or {}).get("interval") != expected_interval):
+                    return _error("Business subscription pricing is not configured correctly; no payment has been requested", 503)
+                # Existing Clerk-organisation purchases are supported for already
+                # approved org administrators, without relaxing original mapping.
                 role = str(claims.get("org_role") or "").lower()
-                if not org_id or org_id not in manager.business_orgs or role not in {"admin", "owner", "org:admin"}:
-                    return _error("Gallery access requires an approved Clerk organisation and an admin account. Contact support before buying.", 409)
-                subject, billing_scope = org_id, "org"
+                org_company = str(manager.business_orgs.get(org_id, {}).get("name") or "") if org_id else ""
+                approved = approved_gallery(_redis(), user_id)
+                if approved and approved != selected_gallery:
+                    return _error("This account is verified for a different gallery. Contact support.", 409)
+                if org_company and org_company == selected_gallery and role in {"admin", "owner", "org:admin"}:
+                    subject, billing_scope = org_id, "org"
+                elif approved == selected_gallery:
+                    subject, billing_scope = user_id, "user"
+                    kwargs["gallery_name"] = selected_gallery  # moved to subscription metadata below
+                else:
+                    # SETUP-ONLY: customers can enter card details, but are not
+                    # charged and do not get any paid/gallery entitlement.
+                    if data.get("gallery_billing_consent") is not True:
+                        return _error("Please agree to the subscription price and future billing terms before saving payment details")
+                    if paid["business_until"]:
+                        return _error("You already have an active Business subscription", 409)
+                    frontend = _frontend_url()
+                    customer = stripe.Customer.create(
+                        metadata={"otodost_clerk_user_id": user_id},
+                        idempotency_key="otodost-gallery-customer-" + _hash(user_id),
+                    )
+                    session = stripe.checkout.Session.create(
+                        mode="setup", customer=customer.id,
+                        client_reference_id=user_id,
+                        metadata={"clerk_user_id": user_id, "plan": plan, "gallery_name": selected_gallery,
+                                  "gallery_billing_consent": "true", "auto_renew": str(auto_renew).lower()},
+                        payment_method_types=["card"],
+                        success_url=f"{frontend}/?checkout=gallery_setup&session_id={{CHECKOUT_SESSION_ID}}",
+                        cancel_url=f"{frontend}/?checkout=cancelled",
+                    )
+                    new_setup_request(_redis(), user_id=user_id, gallery_name=selected_gallery,
+                                      plan=plan, session=session, price_id=price, auto_renew=auto_renew)
+                    return jsonify({"success": True, "url": session.url, "flow": "gallery_setup", "auto_renew": auto_renew})
             elif scope == "independent":
                 subject, billing_scope = user_id, "user"
             else:
                 return _error("Unknown Business account type")
             if paid["business_until"]:
                 return _error("You already have an active Business subscription. Use Manage subscription to change it.", 409)
-            metadata = {"clerk_user_id": user_id, "billing_scope": billing_scope, "billing_subject": subject, "plan": plan}
+            metadata = {"clerk_user_id": user_id, "billing_scope": billing_scope,
+                        "billing_subject": subject, "plan": plan, "auto_renew": str(auto_renew).lower()}
+            if kwargs.pop("gallery_name", ""):
+                metadata["gallery_name"] = selected_gallery
             kwargs["subscription_data"] = {"metadata": metadata}
             mode = "subscription"
         else:
@@ -265,7 +356,7 @@ def start_checkout():
             payment_method_types=["card"],
             **kwargs,
         )
-        return jsonify({"success": True, "url": session.url})
+        return jsonify({"success": True, "url": session.url, "auto_renew": auto_renew if plan.startswith("business_") else None})
     except PermissionError as exc:
         return _error(exc, 401)
     except Exception as exc:
@@ -284,6 +375,11 @@ def checkout_status():
         session = _stripe().checkout.Session.retrieve(sid)
         if session.get("client_reference_id") != claims["sub"]:
             return _error("This checkout belongs to another account", 403)
+        if session.get("mode") == "setup":
+            from otodeger_gallery_approvals import complete_setup, _public
+            row = complete_setup(_redis(), _stripe(), session, str(claims["sub"]))
+            return jsonify({"success": True, "flow": "gallery_setup", "payment_status": "not_charged",
+                            "request": _public(row), "entitlement_recorded": False})
         recorded = False
         plan = str((session.get("metadata") or {}).get("plan") or "")
         if session.get("payment_status") == "paid":
@@ -347,7 +443,10 @@ def stripe_webhook():
             parent = obj.get("parent") or {}
             sub_id = obj.get("subscription") or (parent.get("subscription_details") or {}).get("subscription")
             if sub_id:
-                _sync_subscription(_stripe().Subscription.retrieve(sub_id), paid=True)
+                subscription = _stripe().Subscription.retrieve(sub_id)
+                _sync_subscription(subscription, paid=True)
+                from otodeger_gallery_approvals import mark_gallery_invoice_paid
+                mark_gallery_invoice_paid(subscription)
         elif kind in {"customer.subscription.updated", "customer.subscription.deleted"}:
             # Webhook delivery may be out of order: use Stripe's current state.
             _sync_subscription(_stripe().Subscription.retrieve(obj["id"]), paid=False)
