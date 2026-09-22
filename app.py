@@ -29,7 +29,6 @@ from otodeger_access_control import (
 )
 from otodeger_fx import FXUnavailable, normalize_message_currency, conversion_note
 from otodeger_stripe_billing import billing as stripe_billing_blueprint
-from otodeger_gallery_approvals import gallery_approvals as gallery_approvals_blueprint
 
 # AI interpreter configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -41,7 +40,6 @@ from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 app.register_blueprint(stripe_billing_blueprint)
-app.register_blueprint(gallery_approvals_blueprint)
 
 # Restrict browser origins and explicitly allow credentials/device identity.
 # CORS is not an authentication boundary, but a wildcard origin is unnecessary
