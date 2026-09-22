@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from flask import Blueprint, jsonify, request, current_app
 
 billing = Blueprint("billing", __name__)
-idempotency_key="
+
 PLAN_CONFIG = {
     "personal": ("STRIPE_PRICE_PERSONAL", "payment", 24 * 3600, "PERSONAL"),
     "personal_plus": ("STRIPE_PRICE_PERSONAL_PLUS", "payment", 30 * 24 * 3600, "PERSONAL_PLUS"),
@@ -200,12 +200,15 @@ def _sync_subscription(subscription, paid=False):
         return
     sid = subscription["id"]
     client = _redis()
-    if meta.get("gallery_name"):
-        from otodeger_gallery_approvals import approved_gallery, _row
-        row = _row(client, str(meta.get("gallery_request_id") or "")) if meta.get("gallery_request_id") else {}
-        if scope != "user" or approved_gallery(client, purchaser) != meta["gallery_name"]:
+    # Gallery intelligence is sold for a single publicly listed gallery, not
+    # restricted to its owner. The validated gallery selected at checkout is
+    # bound to the subscription; no manual approval or saved-card setup is used.
+    if plan in GALLERY_PLANS:
+        # Preserve existing organisation subscriptions. New direct-checkout
+        # Gallery subscriptions are always user-scoped to one selected gallery.
+        if scope == "user" and (subject != purchaser or not meta.get("gallery_name")):
             return
-        if meta.get("gallery_request_id") and (not row or row.get("user_id") != purchaser or row.get("gallery_name") != meta["gallery_name"] or row.get("status") in {"denied", "pending", "awaiting_setup", "awaiting_contact"}):
+        if scope == "org" and meta.get("gallery_name"):
             return
 
     # When the purchaser disables Auto-Renew, schedule the subscription to end
@@ -297,10 +300,9 @@ def start_checkout():
                     or (actual_price.get("recurring") or {}).get("interval") != expected_interval):
                 return _error("Business subscription pricing is not configured correctly; no payment has been requested", 503)
             if scope == "gallery":
-                from otodeger_gallery_approvals import approved_gallery, new_setup_request
                 selected_gallery = str(data.get("gallery_name") or "").strip()
                 if not selected_gallery or len(selected_gallery) > 160:
-                    return _error("Please select your gallery before continuing")
+                    return _error("Please select a gallery before continuing")
                 gallery_view = current_app.view_functions.get("api_business_gallery_options")
                 if gallery_view is None:
                     return _error("Gallery directory is unavailable", 503)
@@ -311,42 +313,11 @@ def start_checkout():
                 canonical = next((name for name in gallery_catalogue.get("galleries", []) if name == selected_gallery), "")
                 if not canonical:
                     return _error("Please choose a gallery from the available options", 400)
-                # Existing Clerk-organisation purchases are supported for already
-                # approved org administrators, without relaxing original mapping.
-                role = str(claims.get("org_role") or "").lower()
-                org_company = str(manager.business_orgs.get(org_id, {}).get("name") or "") if org_id else ""
-                approved = approved_gallery(_redis(), user_id)
-                if approved and approved != selected_gallery:
-                    return _error("This account is verified for a different gallery. Contact support.", 409)
-                if org_company and org_company == selected_gallery and role in {"admin", "owner", "org:admin"}:
-                    subject, billing_scope = org_id, "org"
-                elif approved == selected_gallery:
-                    subject, billing_scope = user_id, "user"
-                    kwargs["gallery_name"] = selected_gallery  # moved to subscription metadata below
-                else:
-                    # SETUP-ONLY: customers can enter card details, but are not
-                    # charged and do not get any paid/gallery entitlement.
-                    if data.get("gallery_billing_consent") is not True:
-                        return _error("Please agree to the subscription price and future billing terms before saving payment details")
-                    if paid["business_until"]:
-                        return _error("You already have an active Business subscription", 409)
-                    frontend = _frontend_url()
-                    customer = stripe.Customer.create(
-                        metadata={"otodost_clerk_user_id": user_id},
-                        idempotency_key="otodost-gallery-customer-reset1-" + _hash(user_id),
-                    )
-                    session = stripe.checkout.Session.create(
-                        mode="setup", customer=customer.id,
-                        client_reference_id=user_id,
-                        metadata={"clerk_user_id": user_id, "plan": plan, "gallery_name": selected_gallery,
-                                  "gallery_billing_consent": "true", "auto_renew": str(auto_renew).lower()},
-                        payment_method_types=["card"],
-                        success_url=f"{frontend}/?checkout=gallery_setup&session_id={{CHECKOUT_SESSION_ID}}",
-                        cancel_url=f"{frontend}/?checkout=cancelled",
-                    )
-                    new_setup_request(_redis(), user_id=user_id, gallery_name=selected_gallery,
-                                      plan=plan, session=session, price_id=price, auto_renew=auto_renew)
-                    return jsonify({"success": True, "url": session.url, "flow": "gallery_setup", "auto_renew": auto_renew})
+                # Direct paid checkout, identical to Independent: no setup-only
+                # session, phone form, manual approval, or deferred charge.
+                # The gallery is fixed in the server-owned subscription record.
+                selected_gallery = canonical
+                subject, billing_scope = user_id, "user"
             elif scope == "independent":
                 if data.get("gallery_name"):
                     return _error("Independent subscriptions cannot select a gallery", 400)
@@ -357,7 +328,7 @@ def start_checkout():
                 return _error("You already have an active Business subscription. Use Manage subscription to change it.", 409)
             metadata = {"clerk_user_id": user_id, "billing_scope": billing_scope,
                         "billing_subject": subject, "plan": plan, "auto_renew": str(auto_renew).lower()}
-            if kwargs.pop("gallery_name", ""):
+            if scope == "gallery":
                 metadata["gallery_name"] = selected_gallery
             kwargs["subscription_data"] = {"metadata": metadata}
             mode = "subscription"
@@ -402,10 +373,8 @@ def checkout_status():
         if session.get("client_reference_id") != claims["sub"]:
             return _error("This checkout belongs to another account", 403)
         if session.get("mode") == "setup":
-            from otodeger_gallery_approvals import complete_setup, _public
-            row = complete_setup(_redis(), _stripe(), session, str(claims["sub"]))
-            return jsonify({"success": True, "flow": "gallery_setup", "payment_status": "not_charged",
-                            "request": _public(row), "entitlement_recorded": False})
+            # Retired manual-review flow; no new setup sessions are created.
+            return _error("The old gallery checkout is no longer supported. Please start a new purchase.", 410)
         recorded = False
         plan = str((session.get("metadata") or {}).get("plan") or "")
         if session.get("payment_status") == "paid":
@@ -471,8 +440,6 @@ def stripe_webhook():
             if sub_id:
                 subscription = _stripe().Subscription.retrieve(sub_id)
                 _sync_subscription(subscription, paid=True)
-                from otodeger_gallery_approvals import mark_gallery_invoice_paid
-                mark_gallery_invoice_paid(subscription)
         elif kind in {"customer.subscription.updated", "customer.subscription.deleted"}:
             # Webhook delivery may be out of order: use Stripe's current state.
             _sync_subscription(_stripe().Subscription.retrieve(obj["id"]), paid=False)

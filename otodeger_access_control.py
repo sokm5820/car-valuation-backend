@@ -576,30 +576,29 @@ class CommercialAccessManager:
             )
 
         if paid and paid["business_until"] and paid["business_scope"] == "user":
-            # An individually approved purchaser may view only their one
-            # gallery's data, and only while the matching gallery-labelled
-            # Stripe subscription is paid. Independent subscriptions NEVER
-            # inherit gallery access simply because the user was approved.
-            from otodeger_gallery_approvals import approved_gallery
-            authorized = approved_gallery(self.backend.redis, user_id)
+            # A paid Gallery subscription grants intelligence for only its
+            # selected, server-recorded gallery. No owner/employee verification:
+            # all supported source data is publicly listed. Independent plans
+            # must never inherit gallery-specific access.
             subscription_record = self.backend.redis.hgetall(
                 "assistant:stripe:v1:subscription:" + str(paid.get("business_subscription_id") or "")
             )
             from otodeger_stripe_billing import GALLERY_PLANS, _price_for
             gallery_price_ids = {_price_for(plan) for plan in GALLERY_PLANS}
-            if (authorized and subscription_record.get("gallery_name") == authorized
+            selected_gallery = str(subscription_record.get("gallery_name") or "").strip()
+            if (selected_gallery and subscription_record.get("scope") == "user"
+                    and subscription_record.get("subject") == user_id
                     and subscription_record.get("purchaser") == user_id
                     and subscription_record.get("price_id") in gallery_price_ids
                     and subscription_record.get("price_id")):
                 return AccessContext(
                     authenticated=True, user_id=user_id, tier="BUSINESS", device_id=device_id,
-                    org_id="gallery-user:" + _hash_key(user_id), org_name=authorized,
-                    org_role="owner", seat_limit=1, source="stripe_subscription",
-                    gallery_verified=True,
+                    org_id="gallery-user:" + _hash_key(user_id), org_name=selected_gallery,
+                    org_role="subscriber", seat_limit=1, source="stripe_subscription",
+                    gallery_verified=True,  # Compatibility: paid gallery scope, NOT identity verification.
                 )
-            # Independent Business access has *no* right to select a gallery's
-            # private company-specific dataset. Gallery data requires a mapped,
-            # verified Clerk organisation above.
+            # Independent Business access never inherits the paid, gallery-
+            # specific tools. It remains independent market intelligence only.
             return AccessContext(
                 authenticated=True, user_id=user_id, tier="BUSINESS", device_id=device_id,
                 org_id=f"independent:{user_id}", org_name="Independent Business",
@@ -1073,9 +1072,6 @@ class CommercialAccessManager:
             raise SecurityConfigurationError("Billing entitlement storage is not configured")
         if self.enforcement_enabled and self.stripe_enforce_entitlements:
             payload.update(self.personal_trial_status(context))
-        if context.authenticated and self.has_shared_backend:
-            from otodeger_gallery_approvals import approved_gallery
-            payload["approved_gallery"] = approved_gallery(self.backend.redis, context.user_id)
         if context.business_entitled:
             devices = set(self.backend.smembers(self._org_devices_key(context.org_id)))
             payload["seats_used"] = len(devices)
