@@ -65,7 +65,7 @@ def _row(redis, request_id):
 def _public(row, admin=False):
     fields = ("request_id", "gallery_name", "plan", "status", "contact_method", "created_at", "payment_status")
     if admin:
-        fields += ("user_id", "phone_claimed", "checkout_session", "approved_by", "verified_phone", "review_note", "subscription_id", "price_id")
+        fields += ("user_id", "name_claimed", "phone_claimed", "checkout_session", "approved_by", "verified_phone", "review_note", "subscription_id", "price_id")
     return {k: row.get(k, "") for k in fields}
 
 
@@ -81,7 +81,7 @@ def new_setup_request(redis, *, user_id, gallery_name, plan, session, price_id, 
         "request_id": request_id, "user_id": user_id, "gallery_name": gallery_name,
         "plan": plan, "price_id": price_id, "checkout_session": session.id,
         "auto_renew": "true" if auto_renew else "false", "status": "awaiting_setup",
-        "contact_method": "", "phone_claimed": "", "created_at": str(int(time.time())),
+        "contact_method": "", "name_claimed": "", "phone_claimed": "", "created_at": str(int(time.time())),
         "payment_status": "not_charged", "subscription_id": "",
     }
     pipe = redis.pipeline(transaction=True)
@@ -153,9 +153,10 @@ def submit_contact():
         if not row or row.get("user_id") != claims["sub"]:
             return jsonify({"error": "Request not found"}), 404
         method = str(data.get("method") or "").lower()
+        name = str(data.get("name") or "").strip()
         phone = str(data.get("phone") or "").strip()
-        if method not in {"whatsapp", "phone"} or (method == "phone" and not re.fullmatch(r"\+?[0-9\s()\-]{7,26}", phone)) or (method == "whatsapp" and phone and not re.fullmatch(r"\+?[0-9\s()\-]{7,26}", phone)):
-            return jsonify({"error": "Enter a valid contact number"}), 400
+        if method != "phone" or len(name) < 2 or len(name) > 120 or re.search(r"[\x00-\x1f\x7f]", name) or not re.fullmatch(r"\+?[0-9\s()\-]{7,26}", phone):
+            return jsonify({"error": "Enter your full name and a valid phone number"}), 400
         if row.get("status") == "pending":
             return jsonify({"success": True, "request": _public(row)})
         if row.get("status") != "awaiting_contact":
@@ -164,7 +165,7 @@ def submit_contact():
         # must independently compare the actual WhatsApp sender or call back a
         # number obtained from the gallery's public profile.
         redis.hset(_key("request", rid), mapping={
-            "contact_method": method, "phone_claimed": phone, "status": "pending",
+            "contact_method": method, "name_claimed": name, "phone_claimed": phone, "status": "pending",
             "submitted_at": str(int(time.time())),
         })
         redis.zadd(_key("pending"), {rid: int(time.time())})

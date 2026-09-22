@@ -104,10 +104,21 @@ except PermissionError: pass
 row=gallery.complete_setup(redis,stripe,session,'user_a')
 assert row['status']=='awaiting_contact'
 
-# Even a valid-looking, user-typed phone number does NOT verify an account.
-fake_flask.request.get_json=lambda silent=True: {'request_id':rid,'method':'phone','phone':'+905551112233'}
+# The applicant must provide both a name and phone before review can begin.
+fake_flask.request.get_json=lambda silent=True: {'request_id':rid,'method':'phone','name':'','phone':'+905551112233'}
+r=gallery.submit_contact()
+assert r[1] == 400 and gallery._row(redis,rid)['status'] == 'awaiting_contact'
+fake_flask.request.get_json=lambda silent=True: {'request_id':rid,'method':'phone','name':'Gallery Applicant','phone':'bad'}
+r=gallery.submit_contact()
+assert r[1] == 400 and gallery._row(redis,rid)['status'] == 'awaiting_contact'
+
+# Applicant-supplied details NEVER verify an account or initiate a payment.
+fake_flask.request.get_json=lambda silent=True: {'request_id':rid,'method':'phone','name':'Gallery Applicant','phone':'+905551112233'}
 r=gallery.submit_contact()
 assert r['success'] and gallery._row(redis,rid)['status']=='pending'
+assert gallery._row(redis,rid)['name_claimed']=='Gallery Applicant'
+assert gallery._public(gallery._row(redis,rid),admin=True)['name_claimed']=='Gallery Applicant'
+assert 'name_claimed' not in gallery._public(gallery._row(redis,rid)), 'Do not expose the applicant name via customer status endpoint'
 assert not gallery.approved_gallery(redis,'user_a') and not subscriptions
 
 # No customer may approve themselves, regardless of their browser payload.
@@ -142,4 +153,4 @@ assert r['success'] and len(subscriptions)==1 and gallery.approved_gallery(redis
 assert r['charged'] is False and r['status']=='payment_action_required', 'Payment is not guaranteed until Stripe confirms first invoice'
 r=gallery.admin_decision()
 assert len(subscriptions)==1,'Cannot double-subscribe via repeated approval'
-print('PASS: 10 offline gallery privacy, consent and no-charge-on-denial checks')
+print('PASS: gallery contact name/phone validation, admin visibility and existing no-charge-on-denial checks')

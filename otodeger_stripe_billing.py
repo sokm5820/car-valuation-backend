@@ -20,6 +20,17 @@ PLAN_CONFIG = {
     "personal_plus": ("STRIPE_PRICE_PERSONAL_PLUS", "payment", 30 * 24 * 3600, "PERSONAL_PLUS"),
     "business_monthly": ("STRIPE_PRICE_BUSINESS_MONTHLY", "subscription", 0, "BUSINESS"),
     "business_annual": ("STRIPE_PRICE_BUSINESS_ANNUAL", "subscription", 0, "BUSINESS"),
+    "business_independent_monthly": ("STRIPE_PRICE_INDEPENDENT_MONTHLY", "subscription", 0, "BUSINESS"),
+    "business_independent_annual": ("STRIPE_PRICE_INDEPENDENT_ANNUAL", "subscription", 0, "BUSINESS"),
+}
+# Gallery prices are NOT interchangeable with Independent prices.
+GALLERY_PLANS = frozenset({"business_monthly", "business_annual"})
+INDEPENDENT_PLANS = frozenset({"business_independent_monthly", "business_independent_annual"})
+EXPECTED_BUSINESS_PRICES = {
+    "business_monthly": (6499 * 100, "month"),
+    "business_annual": (49999 * 100, "year"),
+    "business_independent_monthly": (3499 * 100, "month"),
+    "business_independent_annual": (29999 * 100, "year"),
 }
 SCOPE = "assistant:stripe:v1"
 
@@ -80,7 +91,7 @@ def _period_end(sub):
 
 
 def _is_business_price(price_id):
-    return price_id in {_price_for("business_monthly"), _price_for("business_annual")}
+    return bool(price_id) and price_id in { _price_for(plan) for plan in EXPECTED_BUSINESS_PRICES }
 
 
 def read_paid_access(redis_client, user_id, clerk_org_id=""):
@@ -178,6 +189,15 @@ def _sync_subscription(subscription, paid=False):
     items = subscription.get("items", {}).get("data", [])
     if len(items) != 1 or not _is_business_price(items[0].get("price", {}).get("id")):
         return
+    plan = meta.get("plan")
+    actual_price_id = items[0].get("price", {}).get("id")
+    # Do not grant a Gallery subscription for an Independent price or vice versa.
+    if plan not in EXPECTED_BUSINESS_PRICES or _price_for(plan) != actual_price_id:
+        return
+    if plan in INDEPENDENT_PLANS and (scope != "user" or meta.get("gallery_name")):
+        return
+    if plan in GALLERY_PLANS and scope == "user" and not meta.get("gallery_name"):
+        return
     sid = subscription["id"]
     client = _redis()
     if meta.get("gallery_name"):
@@ -264,7 +284,18 @@ def start_checkout():
             if "auto_renew" in data and type(data["auto_renew"]) is not bool:
                 return _error("Invalid Auto-Renew selection")
             auto_renew = data.get("auto_renew", True) is True
-            scope = str(data.get("business_scope") or "independent")
+            scope = str(data.get("business_scope") or "")
+            if (scope == "gallery" and plan not in GALLERY_PLANS) or (scope == "independent" and plan not in INDEPENDENT_PLANS):
+                return _error("The selected Business type does not match its subscription price", 400)
+            if scope not in {"gallery", "independent"}:
+                return _error("Please select a Business account type", 400)
+            # Verify the exact Stripe product amount and recurring interval before
+            # presenting ANY Business checkout, never trust a client-supplied price.
+            actual_price = stripe.Price.retrieve(price)
+            expected_amount, expected_interval = EXPECTED_BUSINESS_PRICES[plan]
+            if (actual_price.get("currency") != "try" or actual_price.get("unit_amount") != expected_amount
+                    or (actual_price.get("recurring") or {}).get("interval") != expected_interval):
+                return _error("Business subscription pricing is not configured correctly; no payment has been requested", 503)
             if scope == "gallery":
                 from otodeger_gallery_approvals import approved_gallery, new_setup_request
                 selected_gallery = str(data.get("gallery_name") or "").strip()
@@ -280,13 +311,6 @@ def start_checkout():
                 canonical = next((name for name in gallery_catalogue.get("galleries", []) if name == selected_gallery), "")
                 if not canonical:
                     return _error("Please choose a gallery from the available options", 400)
-                # The displayed consent is fixed in this frontend. Refuse to
-                # save a card against a different Stripe amount/interval.
-                actual_price = stripe.Price.retrieve(price)
-                expected_amount, expected_interval = ((6499 * 100, "month") if plan == "business_monthly" else (49999 * 100, "year"))
-                if (actual_price.get("currency") != "try" or actual_price.get("unit_amount") != expected_amount
-                        or (actual_price.get("recurring") or {}).get("interval") != expected_interval):
-                    return _error("Business subscription pricing is not configured correctly; no payment has been requested", 503)
                 # Existing Clerk-organisation purchases are supported for already
                 # approved org administrators, without relaxing original mapping.
                 role = str(claims.get("org_role") or "").lower()
@@ -324,6 +348,8 @@ def start_checkout():
                                       plan=plan, session=session, price_id=price, auto_renew=auto_renew)
                     return jsonify({"success": True, "url": session.url, "flow": "gallery_setup", "auto_renew": auto_renew})
             elif scope == "independent":
+                if data.get("gallery_name"):
+                    return _error("Independent subscriptions cannot select a gallery", 400)
                 subject, billing_scope = user_id, "user"
             else:
                 return _error("Unknown Business account type")
@@ -389,7 +415,7 @@ def checkout_status():
                 recorded = bool(paid["personal_until"])
             elif plan == "personal_plus":
                 recorded = bool(paid["personal_plus_until"])
-            elif plan in {"business_monthly", "business_annual"}:
+            elif plan in EXPECTED_BUSINESS_PRICES:
                 recorded = bool(paid["business_until"] and
                                 paid["business_subscription_id"] == session.get("subscription"))
         return jsonify({"success": True, "payment_status": session.get("payment_status"),
