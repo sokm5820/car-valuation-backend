@@ -35,6 +35,8 @@ import json
 import os
 import secrets
 import threading
+import requests
+from urllib.parse import quote
 import time
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
@@ -574,6 +576,22 @@ class CommercialAccessManager:
             )
 
         if paid and paid["business_until"] and paid["business_scope"] == "user":
+            # An individually approved purchaser may view only their one
+            # gallery's data, and only while the matching gallery-labelled
+            # Stripe subscription is paid. Independent subscriptions NEVER
+            # inherit gallery access simply because the user was approved.
+            from otodeger_gallery_approvals import approved_gallery
+            authorized = approved_gallery(self.backend.redis, user_id)
+            subscription_record = self.backend.redis.hgetall(
+                "assistant:stripe:v1:subscription:" + str(paid.get("business_subscription_id") or "")
+            )
+            if authorized and subscription_record.get("gallery_name") == authorized and subscription_record.get("purchaser") == user_id:
+                return AccessContext(
+                    authenticated=True, user_id=user_id, tier="BUSINESS", device_id=device_id,
+                    org_id="gallery-user:" + _hash_key(user_id), org_name=authorized,
+                    org_role="owner", seat_limit=1, source="stripe_subscription",
+                    gallery_verified=True,
+                )
             # Independent Business access has *no* right to select a gallery's
             # private company-specific dataset. Gallery data requires a mapped,
             # verified Clerk organisation above.
@@ -803,7 +821,8 @@ class CommercialAccessManager:
 
     # A first free Personal report is issued once per verified Clerk identity.
     # An active trial is restricted to its original task + selection payload.
-    # IMPORTANT: used-trial records require durable Redis storage before live launch.
+    # A server-only Clerk private-metadata marker durably records trial usage.
+    # Redis still stores the short-lived, selection-bound report unlock.
     _PERSONAL_REPORT_TASKS = frozenset({"NEXT_VEHICLE", "OFFER", "FAIR_PRICE", "VALUE"})
     _PERSONAL_TRIAL_SECONDS = 30 * 60
 
@@ -811,6 +830,59 @@ class CommercialAccessManager:
         identity = _hash_key(user_id)
         return (self._key("personal_report_trial", "used", identity),
                 self._key("personal_report_trial", "active", identity))
+
+    def _trial_sync_key(self, user_id: str) -> str:
+        return self._key("personal_report_trial", "clerk_synced", _hash_key(user_id))
+
+    def _clerk_trial_used(self, user_id: str) -> bool:
+        """Durable, server-only source of truth across browsers and Redis restarts.
+
+        Never rely on sessionStorage, the browser, or a non-persistent Redis key
+        alone to decide whether a Clerk account has spent its free trial.
+        """
+        if not self.clerk_secret_key:
+            raise SecurityConfigurationError("Clerk trial ledger is not configured")
+        try:
+            res = requests.get(
+                f"https://api.clerk.com/v1/users/{quote(user_id, safe='')}",
+                headers={"Authorization": f"Bearer {self.clerk_secret_key}"},
+                timeout=6,
+            )
+            res.raise_for_status()
+            record = res.json()
+            if not isinstance(record, dict) or record.get("id") != user_id:
+                raise ValueError("Clerk user identity mismatch")
+            metadata = record.get("private_metadata") or {}
+            if not isinstance(metadata, dict):
+                raise ValueError("Invalid Clerk private metadata")
+            return bool(metadata.get("otodost_personal_report_trial_used_v1"))
+        except Exception as exc:
+            raise SecurityConfigurationError("Could not verify the account trial ledger") from exc
+
+    def _mark_clerk_trial_used(self, user_id: str) -> None:
+        """Write the permanent marker BEFORE activating the temporary report pass.
+
+        A remote write failure denies the trial rather than risk issuing an
+        additional free report when Redis restarts. Only backend API access to
+        Clerk private_metadata is accepted as proof of previous trial usage.
+        """
+        if not self.clerk_secret_key:
+            raise SecurityConfigurationError("Clerk trial ledger is not configured")
+        try:
+            res = requests.patch(
+                f"https://api.clerk.com/v1/users/{quote(user_id, safe='')}/metadata",
+                headers={"Authorization": f"Bearer {self.clerk_secret_key}"},
+                json={"private_metadata": {"otodost_personal_report_trial_used_v1": int(time.time())}},
+                timeout=6,
+            )
+            res.raise_for_status()
+            record = res.json()
+            if not isinstance(record, dict) or record.get("id") != user_id or not (
+                (record.get("private_metadata") or {}).get("otodost_personal_report_trial_used_v1")
+            ):
+                raise ValueError("Clerk trial marker was not confirmed")
+        except Exception as exc:
+            raise SecurityConfigurationError("Could not record account trial usage") from exc
 
     def _report_scope_hash(self, report_context: Any) -> str:
         if not isinstance(report_context, dict):
@@ -833,16 +905,43 @@ class CommercialAccessManager:
                 raise SecurityConfigurationError("Report trial storage is unavailable")
             return {"personal_trial_available": False, "personal_trial_active_until": 0}
         used_key, active_key = self._trial_keys(context.user_id)
+        sync_key = self._trial_sync_key(context.user_id)
         try:
             pipe = self.backend.redis.pipeline(transaction=False)
             pipe.exists(used_key)
             pipe.hgetall(active_key)
-            used, active = pipe.execute()
+            pipe.exists(sync_key)
+            used, active, synced = pipe.execute()
             expires = int((active or {}).get("expires_at") or 0)
-            return {"personal_trial_available": not bool(used),
-                    "personal_trial_active_until": expires if expires > int(time.time()) else 0}
         except Exception as exc:
             raise SecurityConfigurationError("Report trial storage is unavailable") from exc
+
+        # Migrate already-consumed Redis trials before launch. If the Clerk API
+        # is down, stay fail-closed and retry on the next account status request.
+        if used and not synced:
+            try:
+                if not self._clerk_trial_used(context.user_id):
+                    self._mark_clerk_trial_used(context.user_id)
+                self.backend.redis.set(sync_key, "1")
+            except Exception:
+                return {"personal_trial_available": False,
+                        "personal_trial_active_until": expires if expires > int(time.time()) else 0,
+                        "trial_verification_available": False}
+        if used:
+            return {"personal_trial_available": False,
+                    "personal_trial_active_until": expires if expires > int(time.time()) else 0,
+                    "trial_verification_available": True}
+
+        try:
+            # Redis may have restarted. Always consult Clerk before offering a
+            # new free report even if its used marker is missing in Redis.
+            spent = self._clerk_trial_used(context.user_id)
+        except SecurityConfigurationError:
+            return {"personal_trial_available": False, "personal_trial_active_until": 0,
+                    "trial_verification_available": False}
+        return {"personal_trial_available": not spent,
+                "personal_trial_active_until": 0,
+                "trial_verification_available": True}
 
     def start_personal_report_trial(self, context: AccessContext, report_context: Any) -> Dict[str, Any]:
         if not (self.enforcement_enabled and self.stripe_enforce_entitlements):
@@ -857,7 +956,27 @@ class CommercialAccessManager:
             if (context.business_entitled or paid["personal_until"] or paid["personal_plus_until"]):
                 return {"success": True, "already_paid": True,
                         **self.personal_trial_status(context)}
-            used_key, active_key = self._trial_keys(context.user_id)
+        except Exception as exc:
+            raise SecurityConfigurationError("Billing entitlement status unavailable") from exc
+
+        used_key, active_key = self._trial_keys(context.user_id)
+        sync_key = self._trial_sync_key(context.user_id)
+        lock_key = self._key("personal_report_trial", "issue_lock", _hash_key(context.user_id))
+        lock_token = secrets.token_hex(16)
+        try:
+            if not self.backend.set_nx(lock_key, lock_token, 45):
+                raise AccessControlError("Trial verification is already in progress. Please try again")
+        except AccessControlError:
+            raise
+        except Exception as exc:
+            raise SecurityConfigurationError("Report trial storage is unavailable") from exc
+        try:
+            if self.backend.redis.exists(used_key) or self._clerk_trial_used(context.user_id):
+                raise AccessControlError("Personal report trial already used")
+
+            # This private Clerk marker survives incognito, other devices and
+            # non-persistent Redis restarts. It is not client-editable.
+            self._mark_clerk_trial_used(context.user_id)
             expires = int(time.time()) + self._PERSONAL_TRIAL_SECONDS
             issued = self.backend.redis.eval('''
                 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
@@ -868,12 +987,18 @@ class CommercialAccessManager:
             ''', 2, used_key, active_key, scope, expires, self._PERSONAL_TRIAL_SECONDS)
             if not issued:
                 raise AccessControlError("Personal report trial already used")
+            self.backend.redis.set(sync_key, "1")
             return {"success": True, "already_paid": False, "personal_trial_available": False,
                     "personal_trial_active_until": expires}
         except (AccessControlError, SecurityConfigurationError):
             raise
         except Exception as exc:
             raise SecurityConfigurationError("Report trial storage is unavailable") from exc
+        finally:
+            try:
+                self.backend.compare_delete(lock_key, lock_token)
+            except Exception:
+                pass  # Distributed lock expires automatically if Redis is down.
 
     def require_guided_report_access(self, context: AccessContext, report_context: Any,
                                      *, business: bool = False,
@@ -943,6 +1068,9 @@ class CommercialAccessManager:
             raise SecurityConfigurationError("Billing entitlement storage is not configured")
         if self.enforcement_enabled and self.stripe_enforce_entitlements:
             payload.update(self.personal_trial_status(context))
+        if context.authenticated and self.has_shared_backend:
+            from otodeger_gallery_approvals import approved_gallery
+            payload["approved_gallery"] = approved_gallery(self.backend.redis, context.user_id)
         if context.business_entitled:
             devices = set(self.backend.smembers(self._org_devices_key(context.org_id)))
             payload["seats_used"] = len(devices)
