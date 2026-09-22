@@ -29,8 +29,8 @@ INDEPENDENT_PLANS = frozenset({"business_independent_monthly", "business_indepen
 EXPECTED_BUSINESS_PRICES = {
     "business_monthly": (6499 * 100, "month"),
     "business_annual": (49999 * 100, "year"),
-    "business_independent_monthly": (3499 * 100, "month"),
-    "business_independent_annual": (29999 * 100, "year"),
+    "business_independent_monthly": (3999 * 100, "month"),
+    "business_independent_annual": (34999 * 100, "year"),
 }
 SCOPE = "assistant:stripe:v1"
 
