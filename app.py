@@ -49,7 +49,7 @@ _ALLOWED_ORIGINS = [
     for value in str(
         os.environ.get(
             "ALLOWED_WEB_ORIGINS",
-            "https://otodeger.online,https://www.otodeger.online,http://localhost:5173",
+            "https://otodeger.online,https://www.otodeger.online,https://otodost.online,https://www.otodost.online,http://localhost:5173",
         )
     ).split(",")
     if value.strip()
