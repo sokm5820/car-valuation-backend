@@ -357,6 +357,11 @@ class CommercialAccessManager:
             "http://localhost:5173,https://otodeger.online,https://www.otodeger.online",
         )
         self.personal_plus_users = set(_env_csv("OTODEGER_PERSONAL_PLUS_USERS"))
+        self.full_access_emails = {
+            email.strip().casefold()
+            for email in _env_csv("OTODEGER_FULL_ACCESS_EMAILS")
+            if email.strip()
+        }
         self.business_orgs = self._load_business_orgs(_env_json_object("OTODEGER_BUSINESS_ORGS_JSON"))
         self.stripe_enforce_entitlements = str(os.getenv("STRIPE_ENFORCE_ENTITLEMENTS", "false")).strip().lower() in {"1", "true", "yes"}
 
@@ -543,6 +548,24 @@ class CommercialAccessManager:
         user_id = _safe_identifier(claims.get("sub"))
         if not user_id:
             raise AuthenticationRequired("Clerk session does not contain a user id")
+
+        # Complimentary full-access accounts are managed by email in Render.
+        # The email claim is supplied by Clerk's signed session token, so the
+        # browser cannot grant itself access by sending a client-side tier value.
+        email = str(claims.get("primaryEmail") or "").strip().casefold()
+        if email and email in self.full_access_emails:
+            return AccessContext(
+                authenticated=True,
+                user_id=user_id,
+                tier="BUSINESS",
+                device_id=device_id,
+                org_id=f"full-access:{_hash_key(user_id)}",
+                org_name="Full Access",
+                org_role="owner",
+                seat_limit=999,
+                source="clerk_session",
+                gallery_verified=True,
+            )
 
         clerk_org_id = _safe_identifier(claims.get("org_id"))
         role = str(claims.get("org_role") or "member").strip().lower()[:40]
